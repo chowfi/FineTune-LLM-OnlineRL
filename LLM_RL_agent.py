@@ -81,6 +81,43 @@ def training_log_llm_output(file, num_episode, round, llm_output):
     f.write(f"Episode {num_episode} round {round}: response: {llm_output}\n")
 
 
+# ─── FEN-like board representation ───
+
+PIECE_ID_TO_FEN = {
+    1: 'K', 2: 'A', 3: 'A', 4: 'E', 5: 'E',
+    6: 'H', 7: 'H', 8: 'R', 9: 'R',
+    10: 'C', 11: 'C',
+    12: 'P', 13: 'P', 14: 'P', 15: 'P', 16: 'P',
+}
+
+def board_to_fen(state):
+    """Convert 10x9 numpy board to a FEN-like string.
+    Uppercase = ally pieces, lowercase = enemy pieces, digits = empty squares.
+    Rows separated by '/'.
+    """
+    rows = []
+    for row in state:
+        fen_row = ''
+        empty = 0
+        for cell in row:
+            cell = int(cell)
+            if cell == 0:
+                empty += 1
+            else:
+                if empty > 0:
+                    fen_row += str(empty)
+                    empty = 0
+                piece_id = abs(cell)
+                char = PIECE_ID_TO_FEN.get(piece_id, '?')
+                if cell < 0:
+                    char = char.lower()
+                fen_row += char
+        if empty > 0:
+            fen_row += str(empty)
+        rows.append(fen_row)
+    return '/'.join(rows)
+
+
 # ─── Lightweight GRPO trainer for online RL ───
 
 class GRPOTrainerOnline:
@@ -314,10 +351,18 @@ class Agent(ABC):
 
         if (input_token_length + 200) >= self.max_input_token:
           training_log_token_truncate('chinese_chess_token_truncate_log', num_episode=episode, round=round, input_token_length=input_token_length)
-          self.current_llm_input = [
-            {"role": "system", "content": self.get_system_prompt()}
-          ]
-          self.current_llm_input += [{"role": "user", "content": message}]
+          while len(self.current_llm_input) > 2:
+              self.current_llm_input.pop(1)
+              if (len(self.current_llm_input) > 1
+                      and self.current_llm_input[1]["role"] == "assistant"):
+                  self.current_llm_input.pop(1)
+              prompt = self.tokenizer.apply_chat_template(
+                  self.current_llm_input, tokenize=False, add_generation_prompt=True
+              )
+              check = self.tokenizer(prompt, return_tensors="pt")
+              if len(check.input_ids[0]) + 200 < self.max_input_token:
+                  break
+          inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
 
         response = self.llm(self.current_llm_input)
         print(f"Round {round} LLM Response: {response}")
@@ -334,6 +379,9 @@ class Agent(ABC):
             corrected_response = response
 
         query_ids = inputs.input_ids[0].cpu()
+        max_train_ctx = 4096
+        if len(query_ids) > max_train_ctx:
+            query_ids = query_ids[-max_train_ctx:]
         response_ids = self.tokenizer(corrected_response, return_tensors="pt").input_ids[0]
         self.current_episode_turn_data.append((query_ids, response_ids))
 
@@ -368,7 +416,10 @@ class Agent(ABC):
         self.current_episode_turn_data = []
 
         if train:
-            return self.grpo_trainer.train_step()
+            all_stats = {}
+            while self.grpo_trainer.buffer_size() >= self.grpo_trainer.batch_size:
+                all_stats = self.grpo_trainer.train_step()
+            return all_stats
 
         return {}
 
@@ -377,32 +428,33 @@ class ChineseChessAgent(Agent):
     def get_system_prompt(self) -> str:
         return (
             "You are an expert Chinese Chess (Xiangqi) player. Your goal is to capture the enemy General.\n\n"
-            "BOARD: A 10x9 numpy array where positive integers are your pieces, negative integers are enemy pieces, and 0 is empty.\n\n"
-            "PIECE IDS (your pieces):\n"
-            "  1=General, 2=Advisor_1, 3=Advisor_2, 4=Elephant_1, 5=Elephant_2,\n"
-            "  6=Horse_1, 7=Horse_2, 8=Chariot_1, 9=Chariot_2, 10=Cannon_1, 11=Cannon_2,\n"
-            "  12=Soldier_1, 13=Soldier_2, 14=Soldier_3, 15=Soldier_4, 16=Soldier_5\n\n"
-            "Each turn you will see the board and a list of your legal moves. "
-            "Pick one and respond with ONLY the action in this exact format:\n"
+            "BOARD: A FEN-like string for the 10x9 board. Rows are separated by '/'. "
+            "Uppercase = your pieces, lowercase = enemy pieces, digits = consecutive empty squares.\n\n"
+            "PIECE LETTERS AND IDS:\n"
+            "  K(1)=General, A(2,3)=Advisors, E(4,5)=Elephants,\n"
+            "  H(6,7)=Horses, R(8,9)=Chariots, C(10,11)=Cannons, P(12-16)=Soldiers\n\n"
+            "LEGAL MOVES are listed as: id/Letter:(row,col)>(row,col)\n\n"
+            "Respond with ONLY the action in this exact format:\n"
             "Action: piece_id, (start_row, start_col), (end_row, end_col)\n\n"
             "Example: Action: 8, (9, 0), (5, 0)\n"
-            "This moves Chariot_1 (piece 8) from row 9 col 0 to row 5 col 0.\n\n"
-            "STRATEGY TIPS: Protect your General, control the center, use Chariots aggressively, "
+            "This moves a Chariot (piece 8) from row 9 col 0 to row 5 col 0.\n\n"
+            "STRATEGY: Protect your General, control the center, use Chariots aggressively, "
             "and look for captures."
         )
 
     def format_observation(self, observation: gym.core.ObsType, env: gym.Env = None) -> str:
-        message = f"The current board looks like this:\n{observation}\n"
+        fen = board_to_fen(observation)
+        message = f"Board: {fen}\n"
         if env is not None:
             legal_actions = np.where(env.ally_actions == 1)[0]
-            move_lines = []
+            move_strs = []
             for a in legal_actions:
                 pid, start, end = action_space_to_move(a)
-                name = PIECE_ID_TO_NAME[pid] if pid < len(PIECE_ID_TO_NAME) else f"Piece_{pid}"
-                move_lines.append(
-                    f"  {pid} ({name}): ({start[0]}, {start[1]}) -> ({end[0]}, {end[1]})"
+                letter = PIECE_ID_TO_FEN.get(pid, '?')
+                move_strs.append(
+                    f"{pid}/{letter}:({start[0]},{start[1]})>({end[0]},{end[1]})"
                 )
-            message += "\nYour legal moves:\n" + "\n".join(move_lines)
+            message += "Moves:\n" + "\n".join(move_strs)
         return message
 
     def extract_action(self, response: str, env: gym.Env) -> gym.core.ActType:
@@ -431,7 +483,7 @@ class ChineseChessAgent(Agent):
 # Setup
 # ═══════════════════════════════════════════════════════════════
 
-max_input_token = 4096
+max_input_token = 16384
 
 hyperparams = {
     "model_name": "Qwen/Qwen2.5-7B-Instruct",
@@ -442,11 +494,11 @@ hyperparams = {
     "lora/bias": "none",
     "lora/task_type": "CAUSAL_LM",
     "load_in_8bit": True,
-    "grpo/batch_size": 8,
+    "grpo/batch_size": 4,
     "grpo/lr": 1e-5,
     "grpo/beta": 0.1,
     "seed": 42069,
-    "episodes": 200,
+    "episodes": 500,
     "generate/max_new_tokens": 50,
     "generate/do_sample": True,
     "generate/top_p": 0.6,
@@ -534,7 +586,8 @@ ally_wins, enemy_wins, truncated_game = 0, 0, 0
 episode_lengths, ally_rewards, enemy_rewards, winning_rewards = [], [], [], []
 training_errors = []
 
-for episode in trange(1, hyperparams["episodes"] + 1):
+try:
+  for episode in trange(1, hyperparams["episodes"] + 1):
     observation = env.reset()
     round, done = 1, False
     current_ally_rewards, current_enemy_rewards = 0, 0
@@ -609,7 +662,22 @@ for episode in trange(1, hyperparams["episodes"] + 1):
     wandb.log(episode_stats)
 
     if episode % gap_size == 0:
-      print(f"Episode {episode} ended. Ally Wins: {ally_wins}, Enemy Wins: {enemy_wins}, Truncated Game: {truncated_game} ")
+      win_rate = calculate_win_rate(ally_wins, episode)
+      enemy_win_rate = calculate_win_rate(enemy_wins, episode)
+      trunc_rate = calculate_win_rate(truncated_game, episode)
+      print(f"\n--- Episode {episode} Summary ---")
+      print(f"Ally Wins: {ally_wins} ({win_rate:.1f}%) | Enemy Wins: {enemy_wins} ({enemy_win_rate:.1f}%) | Truncated: {truncated_game} ({trunc_rate:.1f}%)")
+      print(f"Buffer size: {ally_agent.grpo_trainer.buffer_size()}")
+      print(f"----------------------------")
+
+except Exception as e:
+  import traceback
+  print("\n" + "=" * 60)
+  print("TRAINING CRASHED — traceback below")
+  print("=" * 60)
+  traceback.print_exc()
+  print("=" * 60)
+  input("Press Enter to exit...")
 
 env.close()
 
