@@ -17,9 +17,9 @@ import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
-from gym_xiangqi.constants import ALLY, ENEMY, PIECE_ID_TO_NAME, PIECE_POINTS
+from gym_xiangqi.constants import ALLY, PIECE_ID_TO_NAME, PIECE_POINTS
 from gym_xiangqi.utils import action_space_to_move, move_to_action_space
-
+from gym_xiangqi.agents import RandomAgent
 # ─── Evaluation metrics ───
 
 def calculate_win_rate(wins, total_games):
@@ -59,6 +59,62 @@ def plot_episode_rewards(ally_rewards, enemy_rewards, window_size=3, ally="Greed
     plt.ylabel('Cumulative Reward')
     plt.legend()
     plt.grid(True)
+    plt.show()
+
+
+def plot_grpo_diagnostics(
+    ally_win_rate_cumulative,
+    batch_reward_std_per_episode,
+    trained_turn_fraction,
+    window_size=5,
+):
+    """Cumulative ally win %, GRPO batch reward std (pre-norm), fraction of ally turns with gradients."""
+    episodes = np.arange(1, len(ally_win_rate_cumulative) + 1)
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+
+    axes[0].plot(episodes, ally_win_rate_cumulative, color="tab:blue", label="Cumulative ally win %")
+    if len(ally_win_rate_cumulative) >= window_size:
+        ma = np.convolve(
+            ally_win_rate_cumulative, np.ones(window_size) / window_size, mode="valid"
+        )
+        axes[0].plot(
+            range(window_size, len(ally_win_rate_cumulative) + 1),
+            ma,
+            color="tab:orange",
+            label=f"{window_size}-ep MA",
+        )
+    axes[0].set_ylabel("Ally win rate (%)")
+    axes[0].set_title("Cumulative ally win rate")
+    axes[0].legend()
+    axes[0].grid(True)
+
+    std_arr = np.asarray(batch_reward_std_per_episode, dtype=float)
+    std_masked = np.ma.masked_invalid(std_arr)
+    axes[1].plot(episodes, std_masked, color="tab:green", alpha=0.85, label="Mean σ if multi-step ep")
+    axes[1].set_ylabel("Batch reward σ (pre-norm)")
+    axes[1].set_title("GRPO: std of raw rewards in each update batch")
+    axes[1].legend()
+    axes[1].grid(True)
+
+    axes[2].plot(episodes, trained_turn_fraction, color="tab:purple", label="Trained / ally turns")
+    if len(trained_turn_fraction) >= window_size:
+        ma_t = np.convolve(
+            trained_turn_fraction, np.ones(window_size) / window_size, mode="valid"
+        )
+        axes[2].plot(
+            range(window_size, len(trained_turn_fraction) + 1),
+            ma_t,
+            color="tab:brown",
+            label=f"{window_size}-ep MA",
+        )
+    axes[2].set_xlabel("Episode")
+    axes[2].set_ylabel("Fraction")
+    axes[2].set_ylim(0, 1.05)
+    axes[2].set_title("Non-random (trained) ally turns / total ally turns")
+    axes[2].legend()
+    axes[2].grid(True)
+
+    plt.tight_layout()
     plt.show()
 
 
@@ -183,8 +239,9 @@ class GRPOTrainerOnline:
         self.buffer["rewards"] = self.buffer["rewards"][self.batch_size :]
 
         rewards_t = torch.tensor(rewards_batch, dtype=torch.float32)
-        if rewards_t.std() > 1e-4:
-            advantages = (rewards_t - rewards_t.mean()) / (rewards_t.std() + 1e-8)
+        reward_std_before_norm = float(rewards_t.std().item())
+        if reward_std_before_norm > 1e-4:
+            advantages = (rewards_t - rewards_t.mean()) / (reward_std_before_norm + 1e-8)
         else:
             advantages = rewards_t - rewards_t.mean()
 
@@ -232,6 +289,7 @@ class GRPOTrainerOnline:
             "grpo/mean_advantage": advantages.mean().item(),
             "grpo/mean_kl": total_kl_val / n,
             "grpo/mean_reward": rewards_t.mean().item(),
+            "grpo/batch_reward_std": reward_std_before_norm,
         }
         return stats
 
@@ -304,7 +362,9 @@ class Agent(ABC):
         pass
 
     @abstractmethod
-    def format_observation(self, observation: gym.core.ObsType, env: gym.Env = None) -> str:
+    def format_observation(
+        self, observation: gym.core.ObsType, env: gym.Env = None, ally_turn_index: int = 0
+    ) -> str:
         pass
 
     @abstractmethod
@@ -336,8 +396,8 @@ class Agent(ABC):
         )
         return outputs[0]
 
-    def act(self, observation, episode, round, env):
-        message = self.format_observation(observation, env)
+    def act(self, observation, episode, round, env, ally_turn_index: int = 0):
+        message = self.format_observation(observation, env, ally_turn_index=ally_turn_index)
         self.current_episode_messages += [{"role": "user", "content": message}]
         self.current_llm_input += [{"role": "user", "content": message}]
 
@@ -383,7 +443,7 @@ class Agent(ABC):
         if len(query_ids) > max_train_ctx:
             query_ids = query_ids[-max_train_ctx:]
         response_ids = self.tokenizer(corrected_response, return_tensors="pt").input_ids[0]
-        self.current_episode_turn_data.append((query_ids, response_ids))
+        self.current_episode_turn_data.append((query_ids, response_ids, is_random))
 
         self.current_episode_messages += [{"role": "assistant", "content": corrected_response}]
         self.current_llm_input += [{"role": "assistant", "content": corrected_response}]
@@ -403,8 +463,9 @@ class Agent(ABC):
             else:
                 distributed_rewards = rewards[:len(turns)]
 
-            for (q, r), rew in zip(turns, distributed_rewards):
-                self.grpo_trainer.add_to_buffer(q, r, rew)
+            for (q, r, was_random), rew in zip(turns, distributed_rewards):
+                if not was_random:
+                    self.grpo_trainer.add_to_buffer(q, r, rew)
 
         self.current_episode_messages = [
             {"role": "system", "content": self.get_system_prompt()}
@@ -417,8 +478,16 @@ class Agent(ABC):
 
         if train:
             all_stats = {}
+            batch_reward_stds = []
             while self.grpo_trainer.buffer_size() >= self.grpo_trainer.batch_size:
-                all_stats = self.grpo_trainer.train_step()
+                step_stats = self.grpo_trainer.train_step()
+                all_stats = step_stats
+                br = step_stats.get("grpo/batch_reward_std")
+                if br is not None and np.isfinite(br):
+                    batch_reward_stds.append(br)
+            if batch_reward_stds:
+                all_stats["grpo/batch_reward_std_mean"] = float(np.mean(batch_reward_stds))
+                all_stats["grpo/grpo_train_steps"] = len(batch_reward_stds)
             return all_stats
 
         return {}
@@ -428,33 +497,63 @@ class ChineseChessAgent(Agent):
     def get_system_prompt(self) -> str:
         return (
             "You are an expert Chinese Chess (Xiangqi) player. Your goal is to capture the enemy General.\n\n"
-            "BOARD: A FEN-like string for the 10x9 board. Rows are separated by '/'. "
-            "Uppercase = your pieces, lowercase = enemy pieces, digits = consecutive empty squares.\n\n"
-            "PIECE LETTERS AND IDS:\n"
-            "  K(1)=General, A(2,3)=Advisors, E(4,5)=Elephants,\n"
-            "  H(6,7)=Horses, R(8,9)=Chariots, C(10,11)=Cannons, P(12-16)=Soldiers\n\n"
-            "LEGAL MOVES are listed as: id/Letter:(row,col)>(row,col)\n\n"
-            "Respond with ONLY the action in this exact format:\n"
+            "BOARD: A 10x9 numpy array where positive integers are your pieces, "
+            "negative integers are enemy pieces, and 0 is empty.\n\n"
+            "PIECE IDS (your pieces):\n"
+            "  1=General, 2=Advisor_1, 3=Advisor_2, 4=Elephant_1, 5=Elephant_2,\n"
+            "  6=Horse_1, 7=Horse_2, 8=Chariot_1, 9=Chariot_2, 10=Cannon_1, 11=Cannon_2,\n"
+            "  12=Soldier_1, 13=Soldier_2, 14=Soldier_3, 15=Soldier_4, 16=Soldier_5\n\n"
+            "Each turn you will see the board and a list of your legal moves. "
+            "Pick one and respond with ONLY the action in this exact format:\n"
             "Action: piece_id, (start_row, start_col), (end_row, end_col)\n\n"
             "Example: Action: 8, (9, 0), (5, 0)\n"
-            "This moves a Chariot (piece 8) from row 9 col 0 to row 5 col 0.\n\n"
-            "STRATEGY: Protect your General, control the center, use Chariots aggressively, "
-            "and look for captures."
+            "This moves Chariot_1 (piece 8) from row 9 col 0 to row 5 col 0.\n\n"
+            "GENERAL (piece 1): In the opening and early middlegame, do NOT shuffle the General "
+            "for small steps or vague 'safety'. Keep it in the palace unless you must escape check, "
+            "block an immediate mating threat, or no developing move (chariot, horse, cannon, soldier) "
+            "is reasonable.\n\n"
+            "STRATEGY TIPS: Protect your General without moving it unnecessarily; control the center; "
+            "develop Chariots, Horses, and Cannons early; look for captures with those pieces."
         )
 
-    def format_observation(self, observation: gym.core.ObsType, env: gym.Env = None) -> str:
-        fen = board_to_fen(observation)
-        message = f"Board: {fen}\n"
+    # First N ally moves in an episode: extra nudge + list non-General moves before General moves.
+    EARLY_GAME_ALLY_MOVES = 25
+
+    def format_observation(
+        self, observation: gym.core.ObsType, env: gym.Env = None, ally_turn_index: int = 0
+    ) -> str:
+        message = f"The current board looks like this:\n{observation}\n"
         if env is not None:
             legal_actions = np.where(env.ally_actions == 1)[0]
-            move_strs = []
+            lines_in_env_order = []
+            non_general_lines = []
+            general_lines = []
             for a in legal_actions:
                 pid, start, end = action_space_to_move(a)
-                letter = PIECE_ID_TO_FEN.get(pid, '?')
-                move_strs.append(
-                    f"{pid}/{letter}:({start[0]},{start[1]})>({end[0]},{end[1]})"
+                name = PIECE_ID_TO_NAME[pid] if pid < len(PIECE_ID_TO_NAME) else 'UNKNOWN'
+                line = (
+                    f"  {pid} ({name}): ({start[0]}, {start[1]}) -> ({end[0]}, {end[1]})"
                 )
-            message += "Moves:\n" + "\n".join(move_strs)
+                lines_in_env_order.append(line)
+                if pid == 1:
+                    general_lines.append(line)
+                else:
+                    non_general_lines.append(line)
+            # Early game: list non-General moves first so the model sees developing options first.
+            if ally_turn_index < self.EARLY_GAME_ALLY_MOVES:
+                ordered = non_general_lines + general_lines
+            else:
+                ordered = lines_in_env_order
+            message += "Your legal moves:\n" + "\n".join(ordered)
+            if (
+                ally_turn_index < self.EARLY_GAME_ALLY_MOVES
+                and general_lines
+                and non_general_lines
+            ):
+                message += (
+                    "\n\n(Early game — prefer a move that is NOT piece 1 General unless you are in "
+                    "check or must block an immediate threat.)"
+                )
         return message
 
     def extract_action(self, response: str, env: gym.Env) -> gym.core.ActType:
@@ -494,8 +593,8 @@ hyperparams = {
     "lora/bias": "none",
     "lora/task_type": "CAUSAL_LM",
     "load_in_8bit": True,
-    "grpo/batch_size": 4,
-    "grpo/lr": 1e-5,
+    "grpo/batch_size": 8,
+    "grpo/lr": 2e-6,
     "grpo/beta": 0.1,
     "seed": 42069,
     "episodes": 500,
@@ -566,7 +665,7 @@ grpo_trainer = GRPOTrainerOnline(
 
 gap_size = 10
 env = gym.make(hyperparams["env"])
-enemy_agent = GreedyAgent()
+enemy_agent = RandomAgent()
 ally_agent = ChineseChessAgent(
     model,
     tokenizer,
@@ -584,17 +683,37 @@ ally_agent = ChineseChessAgent(
 
 ally_wins, enemy_wins, truncated_game = 0, 0, 0
 episode_lengths, ally_rewards, enemy_rewards, winning_rewards = [], [], [], []
+series_ally_win_rate_cumulative = []
+series_batch_reward_std = []
+series_trained_turn_fraction = []
 training_errors = []
+# Random fallback = model output did not match a legal move; env uses random legal move.
+lifetime_ally_turns = 0
+lifetime_random_fallback = 0
+lifetime_act_failures = 0
 
 try:
   for episode in trange(1, hyperparams["episodes"] + 1):
     observation = env.reset()
     round, done = 1, False
     current_ally_rewards, current_enemy_rewards = 0, 0
+    episode_ally_turns = 0
+    episode_random_fallback = 0
+    episode_act_failures = 0
 
     while not done:
         if env.turn == ALLY:
-          random, ally_action, llm_output = ally_agent.act(observation, episode, round, env)
+          used_random_fallback, ally_action, llm_output = ally_agent.act(
+              observation, episode, round, env, ally_turn_index=episode_ally_turns
+          )
+          if ally_action is None:
+            episode_act_failures += 1
+            lifetime_act_failures += 1
+            print(f"WARNING Episode {episode} Round {round}: act() returned None")
+          else:
+            episode_ally_turns += 1
+            if used_random_fallback:
+              episode_random_fallback += 1
           _, ally_reward, done, info = env.step(ally_action)
           current_ally_rewards += ally_reward
           ally_agent.assign_reward(ally_reward)
@@ -602,14 +721,14 @@ try:
           move = action_space_to_move(ally_action)
           piece = PIECE_ID_TO_NAME[move[0]]
           print(f"Episode: {episode} Round: {round}")
-          print(f"Ally made the move {piece} from {move[1]} to {move[2]}. Reward: {ally_reward}. Random {random}")
+          print(f"Ally made the move {piece} from {move[1]} to {move[2]}. Reward: {ally_reward}. Random {used_random_fallback}")
           print("================")
 
           if episode % gap_size == 0:
             print(f"\nEpisode {episode}, Round {round}")
             move = action_space_to_move(ally_action)
             piece = PIECE_ID_TO_NAME[move[0]]
-            print(f"Ally made the move {piece} from {move[1]} to {move[2]}. Reward: {ally_reward}. Is Ally's move random: {random}")
+            print(f"Ally made the move {piece} from {move[1]} to {move[2]}. Reward: {ally_reward}. Is Ally's move random: {used_random_fallback}")
             print("================")
             training_log_llm_output("chinese_chess_llm_output_log", episode, round, llm_output)
 
@@ -648,17 +767,54 @@ try:
     ally_rewards.append(current_ally_rewards)
     enemy_rewards.append(current_enemy_rewards)
 
+    lifetime_ally_turns += episode_ally_turns
+    lifetime_random_fallback += episode_random_fallback
+    random_rate_episode = (
+        100.0 * episode_random_fallback / episode_ally_turns if episode_ally_turns else 0.0
+    )
+    random_rate_lifetime = (
+        100.0 * lifetime_random_fallback / lifetime_ally_turns if lifetime_ally_turns else 0.0
+    )
+
+    trained_turn_fraction = (
+        (episode_ally_turns - episode_random_fallback) / episode_ally_turns
+        if episode_ally_turns
+        else 0.0
+    )
+
     episode_stats = {
             "episode": episode,
+            "episode_length": round,
             "total_return": current_ally_rewards + current_enemy_rewards,
             "ally_return": current_ally_rewards,
             "enemy_return": current_enemy_rewards,
             "message_ct": len(ally_agent.current_episode_messages),
             "episode_messages": ally_agent.current_episode_messages,
+            "ally_wins": ally_wins,
+            "enemy_wins": enemy_wins,
+            "truncated_games": truncated_game,
+            "ally_win_rate": calculate_win_rate(ally_wins, episode),
+            "enemy_win_rate": calculate_win_rate(enemy_wins, episode),
+            "truncated_rate": calculate_win_rate(truncated_game, episode),
+            "ally_turns_episode": episode_ally_turns,
+            "random_fallback_episode": episode_random_fallback,
+            "random_move_rate_episode": random_rate_episode,
+            "random_move_rate_lifetime": random_rate_lifetime,
+            "act_failures_episode": episode_act_failures,
+            "act_failures_lifetime": lifetime_act_failures,
+            "trained_turn_fraction": trained_turn_fraction,
         }
 
     train_stats = ally_agent.terminate_episode()
     episode_stats.update(train_stats)
+
+    series_ally_win_rate_cumulative.append(episode_stats["ally_win_rate"])
+    series_trained_turn_fraction.append(trained_turn_fraction)
+    br_std_ep = train_stats.get("grpo/batch_reward_std_mean")
+    if br_std_ep is None:
+        br_std_ep = train_stats.get("grpo/batch_reward_std")
+    series_batch_reward_std.append(br_std_ep if br_std_ep is not None else float("nan"))
+
     wandb.log(episode_stats)
 
     if episode % gap_size == 0:
@@ -667,6 +823,12 @@ try:
       trunc_rate = calculate_win_rate(truncated_game, episode)
       print(f"\n--- Episode {episode} Summary ---")
       print(f"Ally Wins: {ally_wins} ({win_rate:.1f}%) | Enemy Wins: {enemy_wins} ({enemy_win_rate:.1f}%) | Truncated: {truncated_game} ({trunc_rate:.1f}%)")
+      print(f"Random fallback (last ep): {episode_random_fallback}/{episode_ally_turns} ({random_rate_episode:.1f}%) | Lifetime: {random_rate_lifetime:.1f}%")
+      print(
+          f"Trained-turn fraction: {trained_turn_fraction:.3f} | "
+          f"GRPO batch reward σ (pre-norm, mean this ep): "
+          f"{train_stats.get('grpo/batch_reward_std_mean', train_stats.get('grpo/batch_reward_std', 'n/a'))}"
+      )
       print(f"Buffer size: {ally_agent.grpo_trainer.buffer_size()}")
       print(f"----------------------------")
 
@@ -689,5 +851,11 @@ print(f"Average Winning Reward per Episode: {average_reward(winning_rewards)}")
 print(f"Average Episode Length: {average_episode_length(episode_lengths)}")
 print(f"Ally Reward Variability: {reward_variability(ally_rewards)}")
 print(f"Enemy Reward Variability: {reward_variability(enemy_rewards)}")
-plot_episode_lengths(episode_lengths, ally="LLM-Agent", enemy="Greedy")
-plot_episode_rewards(ally_rewards, enemy_rewards, ally="LLM-Agent", enemy="Greedy")
+plot_episode_lengths(episode_lengths, ally="LLM-Agent", enemy="Random")
+plot_episode_rewards(ally_rewards, enemy_rewards, ally="LLM-Agent", enemy="Random")
+if series_ally_win_rate_cumulative:
+    plot_grpo_diagnostics(
+        series_ally_win_rate_cumulative,
+        series_batch_reward_std,
+        series_trained_turn_fraction,
+    )
