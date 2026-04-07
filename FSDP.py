@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.checkpoint.state_dict import set_model_state_dict, get_model_state_dict, StateDictOptions
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--mixed-precision", action="store_true")
@@ -64,5 +65,30 @@ if args.mixed_precision:
     for param in model.parameters(recurse=False):
         assert param.dtype == torch.bfloat16
     model.reshard()
+
+# model_state_dict = get_model_state_dict(
+#     model=model,
+#     options=StateDictOptions(
+#         full_state_dict=True,
+#         cpu_offload=True,
+#     )
+# )
+# torch.save(model_state_dict, "model_state_dict.pt")
+
+full_sd = torch.load(
+    "model_state_dict.pt",
+    mmap=True,
+    weights_only=True,
+    map_location='cpu',
+)
+
+set_model_state_dict(
+    model=model,
+    model_state_dict=full_sd,
+    options=StateDictOptions(
+        full_state_dict=True,
+        broadcast_from_rank0=True,
+    ),
+)
 
 dist.destroy_process_group()
