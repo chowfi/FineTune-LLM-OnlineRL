@@ -897,7 +897,7 @@ model.resize_token_embeddings(len(tokenizer))
 
 for layer in model.base_model.model.model.layers:
     fully_shard(layer, mesh=mesh, **fsdp_kwargs)
-fully_shard(model, mesh=mesh, **fsdp_kwargs)
+fully_shard(model.base_model.model, mesh=mesh, **fsdp_kwargs)
 
 # ─── (Optional) Load a previously-saved full state dict into the sharded model ───
 # Uncomment if you have a model_state_dict.pt to restore. rank 0 reads the file
