@@ -832,12 +832,22 @@ else:
     wandb.init(mode="disabled")
 
 # ─── Load model on CPU (FSDP will handle sharding across devices) ───
+# Rank 0 downloads/caches the model first; other ranks wait then load from cache.
 
-model = AutoModelForCausalLM.from_pretrained(
-    hyperparams["model_name"],
-    dtype=torch.bfloat16,
-    low_cpu_mem_usage=True,
-)
+if rank == 0:
+    model = AutoModelForCausalLM.from_pretrained(
+        hyperparams["model_name"],
+        dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    )
+dist.barrier()
+if rank != 0:
+    model = AutoModelForCausalLM.from_pretrained(
+        hyperparams["model_name"],
+        dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    )
+dist.barrier()
 device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
 
 # ─── Apply LoRA (new) or load saved adapter (resume) ───
