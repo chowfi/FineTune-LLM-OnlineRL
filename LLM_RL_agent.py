@@ -383,7 +383,7 @@ class Agent(ABC):
     ):
         if generate_config_dict is None:
             generate_config_dict = {
-                "max_new_tokens": 32,
+                "max_new_tokens": 16,
                 "do_sample": True,
                 "top_p": 0.6,
                 "top_k": 0,
@@ -639,7 +639,7 @@ class ChineseChessAgent(Agent):
 # Setup
 # ═══════════════════════════════════════════════════════════════
 
-max_input_token = 16000
+max_input_token = 14000
 
 hyperparams = {
     "model_name": "Qwen/Qwen2.5-7B-Instruct",
