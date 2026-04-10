@@ -777,20 +777,19 @@ class ChineseChessAgent(Agent):
 # Setup
 # ═══════════════════════════════════════════════════════════════
 
-max_input_token = 14000
+max_input_token = 8192
 
 hyperparams = {
-    "model_name": "Qwen/Qwen2.5-7B-Instruct",
+    "model_name": "Qwen/Qwen2.5-14B-Instruct",
     "env": "gym_xiangqi:xiangqi-v0",
-    "lora/r": 16,
-    "lora/lora_alpha": 32,
+    "lora/r": 32,
+    "lora/lora_alpha": 64,
     "lora/lora_dropout": 0.05,
     "lora/bias": "none",
     "lora/task_type": "CAUSAL_LM",
-    # False: FP16 on GPU (more VRAM, avoids bitsandbytes CUDA paths / timeouts)
     "load_in_8bit": False,
     "grpo/batch_size": 8,
-    "grpo/lr": 2e-6,
+    "grpo/lr": 1e-6,
     "grpo/beta": 0.1,
     "seed": 42069,
     "episodes": 500,
@@ -888,7 +887,6 @@ model.resize_token_embeddings(len(tokenizer))
 
 for layer in model.base_model.model.model.layers:
     fully_shard(layer, mesh=mesh, **fsdp_kwargs)
-fully_shard(model.base_model.model, mesh=mesh, **fsdp_kwargs)
 fully_shard(model, mesh=mesh, **fsdp_kwargs)
 
 # ─── (Optional) Load a previously-saved full state dict into the sharded model ───
