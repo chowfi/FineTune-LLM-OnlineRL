@@ -63,6 +63,42 @@ if args.mixed_precision:
         )
     }
 
+# ─── Distributed helpers: broadcast arbitrary data from rank 0 ───
+
+def broadcast_tensor(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+    """Broadcast a tensor from src to all ranks (in-place)."""
+    tensor = tensor.contiguous().cuda()
+    dist.broadcast(tensor, src=src)
+    return tensor
+
+def broadcast_int(value: int, src: int = 0) -> int:
+    t = torch.tensor([value], dtype=torch.long, device="cuda")
+    dist.broadcast(t, src=src)
+    return t.item()
+
+def broadcast_bool(value: bool, src: int = 0) -> bool:
+    return bool(broadcast_int(int(value), src=src))
+
+def broadcast_input_ids(input_ids: Optional[torch.Tensor], attention_mask: Optional[torch.Tensor], src: int = 0):
+    """Broadcast tokenized inputs from rank 0 to all ranks.
+    Rank 0 passes the real tensors; other ranks pass None and receive them."""
+    if rank == src:
+        seq_len = input_ids.size(1)
+    else:
+        seq_len = 0
+    seq_len = broadcast_int(seq_len, src=src)
+
+    if rank == src:
+        ids = input_ids.long().cuda()
+        mask = attention_mask.long().cuda()
+    else:
+        ids = torch.zeros(1, seq_len, dtype=torch.long, device="cuda")
+        mask = torch.zeros(1, seq_len, dtype=torch.long, device="cuda")
+
+    dist.broadcast(ids, src=src)
+    dist.broadcast(mask, src=src)
+    return ids, mask
+
 
 class GreedyEnemyAgent:
     """
@@ -338,19 +374,61 @@ class GRPOTrainerOnline:
         token_log_probs = log_probs.gather(1, response_ids.to(self.device).unsqueeze(1)).squeeze(1)
         return token_log_probs.sum()
 
+    def _broadcast_buffer_batch(self):
+        """Rank 0 pops a batch from its buffer and broadcasts to all ranks.
+        Returns (query_ids_batch, response_ids_batch, rewards_tensor) on every rank."""
+        if rank == 0:
+            query_ids_batch = self.buffer["query_ids"][: self.batch_size]
+            response_ids_batch = self.buffer["response_ids"][: self.batch_size]
+            rewards_batch = self.buffer["rewards"][: self.batch_size]
+            self.buffer["query_ids"] = self.buffer["query_ids"][self.batch_size :]
+            self.buffer["response_ids"] = self.buffer["response_ids"][self.batch_size :]
+            self.buffer["rewards"] = self.buffer["rewards"][self.batch_size :]
+            n = len(query_ids_batch)
+        else:
+            n = 0
+
+        n = broadcast_int(n)
+
+        synced_queries = []
+        synced_responses = []
+        for i in range(n):
+            if rank == 0:
+                q_len = query_ids_batch[i].numel()
+                r_len = response_ids_batch[i].numel()
+            else:
+                q_len, r_len = 0, 0
+            q_len = broadcast_int(q_len)
+            r_len = broadcast_int(r_len)
+
+            if rank == 0:
+                q = query_ids_batch[i].long().cuda()
+                r = response_ids_batch[i].long().cuda()
+            else:
+                q = torch.zeros(q_len, dtype=torch.long, device="cuda")
+                r = torch.zeros(r_len, dtype=torch.long, device="cuda")
+            dist.broadcast(q, src=0)
+            dist.broadcast(r, src=0)
+            synced_queries.append(q.cpu())
+            synced_responses.append(r.cpu())
+
+        if rank == 0:
+            rewards_t = torch.tensor(rewards_batch, dtype=torch.float32).cuda()
+        else:
+            rewards_t = torch.zeros(n, dtype=torch.float32, device="cuda")
+        dist.broadcast(rewards_t, src=0)
+        rewards_t = rewards_t.cpu()
+
+        return synced_queries, synced_responses, rewards_t
+
     def train_step(self):
-        if self.buffer_size() < self.batch_size:
+        """GRPO update — all ranks must call this together so FSDP collectives stay in sync."""
+        should_train = broadcast_bool(self.buffer_size() >= self.batch_size if rank == 0 else False)
+        if not should_train:
             return {}
 
-        query_ids_batch = self.buffer["query_ids"][: self.batch_size]
-        response_ids_batch = self.buffer["response_ids"][: self.batch_size]
-        rewards_batch = self.buffer["rewards"][: self.batch_size]
+        query_ids_batch, response_ids_batch, rewards_t = self._broadcast_buffer_batch()
 
-        self.buffer["query_ids"] = self.buffer["query_ids"][self.batch_size :]
-        self.buffer["response_ids"] = self.buffer["response_ids"][self.batch_size :]
-        self.buffer["rewards"] = self.buffer["rewards"][self.batch_size :]
-
-        rewards_t = torch.tensor(rewards_batch, dtype=torch.float32)
         reward_std_before_norm = float(rewards_t.std().item())
         if reward_std_before_norm > 1e-4:
             advantages = (rewards_t - rewards_t.mean()) / (reward_std_before_norm + 1e-8)
@@ -451,19 +529,27 @@ class Agent(ABC):
     def extract_action(self, response: str, env: gym.Env) -> Tuple[bool, Any]:
         pass
 
-    def llm(self, messages: List[Dict[str, str]]) -> str:
-        prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        context_len = inputs['attention_mask'].size(1)
+    def llm(self, messages: Optional[List[Dict[str, str]]] = None) -> str:
+        """Run model.generate() across all FSDP ranks.
+        Rank 0 tokenizes *messages* and broadcasts input_ids/attention_mask.
+        Other ranks pass messages=None and receive the broadcast."""
+        if rank == 0:
+            prompt = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = self.tokenizer(prompt, return_tensors="pt")
+            ids_bcast, mask_bcast = broadcast_input_ids(inputs.input_ids, inputs.attention_mask)
+        else:
+            ids_bcast, mask_bcast = broadcast_input_ids(None, None)
+
+        context_len = mask_bcast.size(1)
         self.model.eval()
         if hasattr(self.model, "gradient_checkpointing_disable"):
             self.model.gradient_checkpointing_disable()
         with torch.no_grad():
             generate_ids = self.model.generate(
-                inputs=inputs.input_ids,
-                attention_mask=inputs.attention_mask,
+                inputs=ids_bcast,
+                attention_mask=mask_bcast,
                 **{
                     key.split("/")[-1]: value
                     for key, value in self.generate_config_dict.items()
@@ -478,70 +564,86 @@ class Agent(ABC):
         return outputs[0]
 
     def act(self, observation, episode, round, env, ally_turn_index: int = 0):
-        message = self.format_observation(observation, env, ally_turn_index=ally_turn_index)
-        self.current_episode_messages += [{"role": "user", "content": message}]
-        self.current_llm_input += [{"role": "user", "content": message}]
+        """Rank 0 formats the prompt and extracts the action from the response.
+        All ranks participate in model.generate() via self.llm().
+        Non-rank-0 callers should pass observation=None, env=None."""
 
-        prompt = self.tokenizer.apply_chat_template(
-            self.current_llm_input, tokenize=False, add_generation_prompt=True
-        )
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        input_token_length = len(inputs.input_ids[0])
+        if rank == 0:
+            message = self.format_observation(observation, env, ally_turn_index=ally_turn_index)
+            self.current_episode_messages += [{"role": "user", "content": message}]
+            self.current_llm_input += [{"role": "user", "content": message}]
 
-        print(f"[Ep {episode} Rd {round}] LLM Prompt: {prompt}")
-
-        if (input_token_length + 200) >= self.max_input_token:
-            training_log_token_truncate(
-                "chinese_chess_token_truncate_log",
-                num_episode=episode,
-                round=round,
-                input_token_length=input_token_length,
+            prompt = self.tokenizer.apply_chat_template(
+                self.current_llm_input, tokenize=False, add_generation_prompt=True
             )
-            while len(self.current_llm_input) > 2:
-                self.current_llm_input.pop(1)
-                if (
-                    len(self.current_llm_input) > 1
-                    and self.current_llm_input[1]["role"] == "assistant"
-                ):
-                    self.current_llm_input.pop(1)
-                prompt = self.tokenizer.apply_chat_template(
-                    self.current_llm_input, tokenize=False, add_generation_prompt=True
+            inputs = self.tokenizer(prompt, return_tensors="pt")
+            input_token_length = len(inputs.input_ids[0])
+
+            print(f"[Ep {episode} Rd {round}] LLM Prompt: {prompt}")
+
+            if (input_token_length + 200) >= self.max_input_token:
+                training_log_token_truncate(
+                    "chinese_chess_token_truncate_log",
+                    num_episode=episode,
+                    round=round,
+                    input_token_length=input_token_length,
                 )
-                check = self.tokenizer(prompt, return_tensors="pt")
-                if len(check.input_ids[0]) + 200 < self.max_input_token:
-                    break
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+                while len(self.current_llm_input) > 2:
+                    self.current_llm_input.pop(1)
+                    if (
+                        len(self.current_llm_input) > 1
+                        and self.current_llm_input[1]["role"] == "assistant"
+                    ):
+                        self.current_llm_input.pop(1)
+                    prompt = self.tokenizer.apply_chat_template(
+                        self.current_llm_input, tokenize=False, add_generation_prompt=True
+                    )
+                    check = self.tokenizer(prompt, return_tensors="pt")
+                    if len(check.input_ids[0]) + 200 < self.max_input_token:
+                        break
+                inputs = self.tokenizer(prompt, return_tensors="pt")
 
-        response = self.llm(self.current_llm_input)
-        print(f"[Ep {episode} Rd {round}] LLM Response: {response}")
-
-        try:
-            is_random, action = self.extract_action(response, env)
-        except Exception as e:
-            return None, None, response
-
-        if is_random:
-            piece_id, start, end = action_space_to_move(action)
-            corrected_response = f"Action: {piece_id}, ({start[0]}, {start[1]}), ({end[0]}, {end[1]})"
+        # All ranks call generate together (rank 0 broadcasts input_ids inside llm())
+        if rank == 0:
+            response = self.llm(self.current_llm_input)
         else:
-            corrected_response = response
+            response = self.llm(None)
 
-        query_ids = inputs.input_ids[0].cpu()
-        max_train_ctx = 4096
-        if len(query_ids) > max_train_ctx:
-            query_ids = query_ids[-max_train_ctx:]
-        response_ids = self.tokenizer(corrected_response, return_tensors="pt").input_ids[0]
-        self.current_episode_turn_data.append((query_ids, response_ids, is_random))
+        # Only rank 0 extracts the action and manages episode state
+        if rank == 0:
+            print(f"[Ep {episode} Rd {round}] LLM Response: {response}")
 
-        self.current_episode_messages += [{"role": "assistant", "content": corrected_response}]
-        self.current_llm_input += [{"role": "assistant", "content": corrected_response}]
-        return is_random, action, response
+            try:
+                is_random, action = self.extract_action(response, env)
+            except Exception as e:
+                return None, None, response
+
+            if is_random:
+                piece_id, start, end = action_space_to_move(action)
+                corrected_response = f"Action: {piece_id}, ({start[0]}, {start[1]}), ({end[0]}, {end[1]})"
+            else:
+                corrected_response = response
+
+            query_ids = inputs.input_ids[0].cpu()
+            max_train_ctx = 4096
+            if len(query_ids) > max_train_ctx:
+                query_ids = query_ids[-max_train_ctx:]
+            response_ids = self.tokenizer(corrected_response, return_tensors="pt").input_ids[0]
+            self.current_episode_turn_data.append((query_ids, response_ids, is_random))
+
+            self.current_episode_messages += [{"role": "assistant", "content": corrected_response}]
+            self.current_llm_input += [{"role": "assistant", "content": corrected_response}]
+            return is_random, action, response
+
+        # Non-rank-0: return dummy values (caller should not use them)
+        return None, None, None
 
     def assign_reward(self, reward):
         self.current_episode_rewards.append(reward)
 
     def terminate_episode(self, train=True):
-        if train and self.current_episode_turn_data:
+        """End an episode. Only rank 0 manages the buffer; all ranks call train_step together."""
+        if rank == 0 and train and self.current_episode_turn_data:
             rewards = self.current_episode_rewards
             turns = self.current_episode_turn_data
 
@@ -567,8 +669,12 @@ class Agent(ABC):
         if train:
             all_stats = {}
             batch_reward_stds = []
-            while self.grpo_trainer.buffer_size() >= self.grpo_trainer.batch_size:
+            # All ranks enter the loop together; train_step broadcasts a
+            # should_train flag so every rank exits at the same iteration.
+            while True:
                 step_stats = self.grpo_trainer.train_step()
+                if not step_stats:
+                    break
                 all_stats = step_stats
                 br = step_stats.get("grpo/batch_reward_std")
                 if br is not None and np.isfinite(br):
@@ -858,7 +964,7 @@ grpo_trainer = GRPOTrainerOnline(
 gap_size = 10
 
 env = None
-if not _infer_only:
+if rank == 0 and not _infer_only:
     _record_video = bool(hyperparams.get("record_video", False))
     _record_dir = hyperparams.get("record_video_dir", "./video")
     _record_every = int(hyperparams.get("record_video_every_n", 10))
@@ -897,8 +1003,8 @@ if not _infer_only:
                 "(episode_trigger uses the wrapper's internal episode index, not your training loop counter)."
             )
 
-enemy_agent_random = RandomAgent()
-enemy_agent_greedy = GreedyEnemyAgent()
+enemy_agent_random = RandomAgent() if rank == 0 else None
+enemy_agent_greedy = GreedyEnemyAgent() if rank == 0 else None
 _greedy_start = int(hyperparams.get("enemy/mix_greedy_start_episode", 80))
 _greedy_p = float(
     hyperparams.get(
@@ -930,70 +1036,102 @@ def _env_turn(e) -> int:
     raise RuntimeError("Could not find .turn on env (RecordVideo / Xiangqi)")
 
 
+_INFER_SIGNAL_ALLY_TURN = 1
+_INFER_SIGNAL_GAME_DONE = 2
+_INFER_SIGNAL_ALL_DONE = 3
+
+
 def run_inference_record_videos(
     infer_ally_agent: ChineseChessAgent,
-    infer_enemy_random: RandomAgent,
-    infer_enemy_greedy: GreedyEnemyAgent,
+    infer_enemy_random: Optional[RandomAgent],
+    infer_enemy_greedy: Optional[GreedyEnemyAgent],
 ) -> None:
-    """Load is already done; play N games with RecordVideo (no GRPO updates)."""
+    """Inference with RecordVideo. Rank 0 drives the env; all ranks participate in generate()."""
     num_games = max(1, int(hyperparams.get("inference/num_games", 1)))
     video_dir = hyperparams.get("inference/video_dir", "./video_inference")
     enemy_kind = (hyperparams.get("inference/enemy", "random") or "random").strip().lower()
-    if enemy_kind not in ("random", "greedy"):
-        print(f"[inference] Unknown inference/enemy={enemy_kind!r}; using random")
-        enemy_kind = "random"
 
-    if RecordVideo is None:
-        raise RuntimeError(
-            "inference/record_only requires RecordVideo (gym>=0.26 or gymnasium with RecordVideo)."
+    infer_env = None
+    if rank == 0:
+        if enemy_kind not in ("random", "greedy"):
+            print(f"[inference] Unknown inference/enemy={enemy_kind!r}; using random")
+            enemy_kind = "random"
+        if RecordVideo is None:
+            raise RuntimeError(
+                "inference/record_only requires RecordVideo (gym>=0.26 or gymnasium with RecordVideo)."
+            )
+        os.makedirs(video_dir, exist_ok=True)
+        try:
+            infer_env = gym.make(hyperparams["env"], render_mode="rgb_array")
+        except Exception as e:
+            raise RuntimeError(
+                f"inference recording needs render_mode='rgb_array'. ({e!r})"
+            ) from e
+        infer_env = RecordVideo(
+            infer_env, video_dir,
+            episode_trigger=lambda episode_id, cap=num_games: episode_id < cap,
+            name_prefix="xiangqi_infer",
+        )
+        print(
+            f"[inference] Recording up to {num_games} game(s), opponent={enemy_kind!r} -> {video_dir!r}"
         )
 
-    os.makedirs(video_dir, exist_ok=True)
-    try:
-        infer_env = gym.make(hyperparams["env"], render_mode="rgb_array")
-    except Exception as e:
-        raise RuntimeError(
-            f"inference recording needs render_mode='rgb_array'. ({e!r})"
-        ) from e
-
-    infer_env = RecordVideo(
-        infer_env,
-        video_dir,
-        episode_trigger=lambda episode_id, cap=num_games: episode_id < cap,
-        name_prefix="xiangqi_infer",
-    )
-
-    print(
-        f"[inference] Recording up to {num_games} game(s), opponent={enemy_kind!r} -> {video_dir!r}"
-    )
     model.eval()
 
     for game in range(1, num_games + 1):
-        raw_obs = infer_env.reset()
-        observation = raw_obs[0] if isinstance(raw_obs, tuple) else raw_obs
-        round_idx, done = 1, False
-        ally_reward = enemy_reward = 0.0
-        use_greedy = enemy_kind == "greedy"
-        _ep_opponent = "GreedyEnemy" if use_greedy else "RandomEnemy"
-        print(f"[inference game {game}/{num_games}] Opponent: {_ep_opponent}")
+        if rank == 0:
+            raw_obs = infer_env.reset()
+            observation = raw_obs[0] if isinstance(raw_obs, tuple) else raw_obs
+            round_idx, done = 1, False
+            ally_reward = enemy_reward = 0.0
+            use_greedy = enemy_kind == "greedy"
+            _ep_opponent = "GreedyEnemy" if use_greedy else "RandomEnemy"
+            print(f"[inference game {game}/{num_games}] Opponent: {_ep_opponent}")
+            episode_ally_turns = episode_random_fallback = episode_act_failures = 0
+            current_ally_rewards = current_enemy_rewards = 0.0
 
-        episode_ally_turns = episode_random_fallback = episode_act_failures = 0
-        current_ally_rewards = current_enemy_rewards = 0.0
+        while True:
+            if rank == 0:
+                # Run enemy turns
+                while not done and _env_turn(infer_env) != ALLY:
+                    enemy_action = (
+                        infer_enemy_greedy.move(infer_env)
+                        if use_greedy
+                        else infer_enemy_random.move(infer_env)
+                    )
+                    step_out = infer_env.step(enemy_action)
+                    if len(step_out) == 5:
+                        observation, enemy_reward, terminated, truncated, _ = step_out
+                        done = bool(terminated or truncated)
+                    else:
+                        observation, enemy_reward, done, _ = step_out
+                    current_enemy_rewards += enemy_reward
+                    _log_env_step(game, round_idx, f"Enemy ({_ep_opponent})", enemy_action, enemy_reward)
+                    round_idx += 1
+                    if round_idx >= 200:
+                        print(f"[inference g{game} Rd {round_idx}] hit 200-round cap. Opponent={_ep_opponent}")
+                        done = True
 
-        while not done:
-            if _env_turn(infer_env) == ALLY:
+                signal = _INFER_SIGNAL_GAME_DONE if done else _INFER_SIGNAL_ALLY_TURN
+            else:
+                signal = 0
+
+            signal = broadcast_int(signal)
+            if signal == _INFER_SIGNAL_GAME_DONE:
+                break
+
+            # All ranks participate in generate
+            if rank == 0:
                 used_random_fallback, ally_action, llm_output = infer_ally_agent.act(
-                    observation,
-                    game,
-                    round_idx,
-                    infer_env,
-                    ally_turn_index=episode_ally_turns,
+                    observation, game, round_idx, infer_env, ally_turn_index=episode_ally_turns,
                 )
+            else:
+                infer_ally_agent.act(None, game, 0, None, ally_turn_index=0)
+
+            if rank == 0:
                 if ally_action is None:
                     episode_act_failures += 1
-                    print(
-                        f"[infer g{game} Rd {round_idx}] WARNING act() returned None"
-                    )
+                    print(f"[infer g{game} Rd {round_idx}] WARNING act() returned None")
                 else:
                     episode_ally_turns += 1
                     if used_random_fallback:
@@ -1007,57 +1145,28 @@ def run_inference_record_videos(
                 current_ally_rewards += ally_reward
                 infer_ally_agent.assign_reward(ally_reward)
                 if ally_action is not None:
-                    _log_env_step(
-                        game,
-                        round_idx,
-                        "Ally action",
-                        ally_action,
-                        ally_reward,
-                        random_fallback=used_random_fallback,
-                    )
-            else:
-                enemy_action = (
-                    infer_enemy_greedy.move(infer_env)
-                    if use_greedy
-                    else infer_enemy_random.move(infer_env)
-                )
-                step_out = infer_env.step(enemy_action)
-                if len(step_out) == 5:
-                    observation, enemy_reward, terminated, truncated, _ = step_out
-                    done = bool(terminated or truncated)
-                else:
-                    observation, enemy_reward, done, _ = step_out
-                current_enemy_rewards += enemy_reward
-                _log_env_step(
-                    game,
-                    round_idx,
-                    f"Enemy ({_ep_opponent})",
-                    enemy_action,
-                    enemy_reward,
-                )
+                    _log_env_step(game, round_idx, "Ally action", ally_action, ally_reward,
+                                  random_fallback=used_random_fallback)
+                round_idx += 1
+                if round_idx >= 200 and not done:
+                    print(f"[inference g{game} Rd {round_idx}] hit 200-round cap. Opponent={_ep_opponent}")
+                    done = True
 
-            round_idx += 1
-            if round_idx >= 200:
-                print(
-                    f"[inference g{game} Rd {round_idx}] hit 200-round cap. Opponent={_ep_opponent}"
-                )
-                done = True
-
-        outcome = (
-            "enemy_win"
-            if enemy_reward == 100
-            else "ally_win"
-            if ally_reward == 100
-            else "other/trunc"
-        )
-        print(
-            f"[inference game {game}/{num_games}] done: {outcome} "
-            f"(ally_ret={current_ally_rewards:.1f}, enemy_ret={current_enemy_rewards:.1f}, rounds={round_idx})"
-        )
+        if rank == 0:
+            outcome = (
+                "enemy_win" if enemy_reward == 100
+                else "ally_win" if ally_reward == 100
+                else "other/trunc"
+            )
+            print(
+                f"[inference game {game}/{num_games}] done: {outcome} "
+                f"(ally_ret={current_ally_rewards:.1f}, enemy_ret={current_enemy_rewards:.1f}, rounds={round_idx})"
+            )
         infer_ally_agent.terminate_episode(train=False)
 
-    infer_env.close()
-    print(f"[inference] Finished. Videos under {video_dir!r}")
+    if rank == 0:
+        infer_env.close()
+        print(f"[inference] Finished. Videos under {video_dir!r}")
 
 
 def _log_env_step(ep, rd, side, action_idx, step_reward, **extra):
@@ -1074,6 +1183,12 @@ def _log_env_step(ep, rd, side, action_idx, step_reward, **extra):
 
 
 # ─── Training loop ───
+# Rank 0 drives the gym environment. Before every model.generate() call,
+# rank 0 broadcasts a signal so ALL ranks participate in the FSDP collective.
+# Enemy turns, env stepping, logging, and metrics are rank-0 only.
+
+_SIGNAL_ALLY_TURN = 1
+_SIGNAL_EPISODE_DONE = 2
 
 if _infer_only:
     run_inference_record_videos(ally_agent, enemy_agent_random, enemy_agent_greedy)
@@ -1085,40 +1200,86 @@ if not _infer_only:
     series_batch_reward_std = []
     series_trained_turn_fraction = []
     lifetime_ally_turns = lifetime_random_fallback = lifetime_act_failures = 0
-    
+
     if rank == 0 and hyperparams.get("metrics/clear_csv_on_start", True):
         reset_episode_metrics_csv(EPISODE_METRICS_CSV)
         print(f"[metrics] Cleared {EPISODE_METRICS_CSV!r} for this run.\n")
-    
+
     try:
-        for episode in trange(1, hyperparams["episodes"] + 1):
-            observation = env.reset()
-            round_idx, done = 1, False
-            current_ally_rewards = current_enemy_rewards = 0.0
-            episode_ally_turns = episode_random_fallback = episode_act_failures = 0
-            episode_hit_round_cap = False
-            episode_enemy_greedy_turns = episode_enemy_random_turns = 0
-            if episode >= _greedy_start:
-                use_greedy_for_episode = random.random() < _greedy_p
-            else:
-                use_greedy_for_episode = False
-            _ep_opponent = "GreedyEnemy" if use_greedy_for_episode else "RandomEnemy"
-            _ep_mix_note = (
-                ""
-                if episode >= _greedy_start
-                else f" | greedy mix Random↔Greedy from ep {_greedy_start}"
-            )
-            print(f"[Ep {episode}] Opponent (full episode): {_ep_opponent}{_ep_mix_note}")
-    
-            while not done:
-                if env.turn == ALLY:
+        for episode in (trange(1, hyperparams["episodes"] + 1) if rank == 0 else range(1, hyperparams["episodes"] + 1)):
+
+            # --- Rank 0: reset env, pick enemy policy ---
+            if rank == 0:
+                observation = env.reset()
+                round_idx, done = 1, False
+                current_ally_rewards = current_enemy_rewards = 0.0
+                episode_ally_turns = episode_random_fallback = episode_act_failures = 0
+                episode_hit_round_cap = False
+                episode_enemy_greedy_turns = episode_enemy_random_turns = 0
+                ally_reward = enemy_reward = 0.0
+                if episode >= _greedy_start:
+                    use_greedy_for_episode = random.random() < _greedy_p
+                else:
+                    use_greedy_for_episode = False
+                _ep_opponent = "GreedyEnemy" if use_greedy_for_episode else "RandomEnemy"
+                _ep_mix_note = (
+                    ""
+                    if episode >= _greedy_start
+                    else f" | greedy mix Random↔Greedy from ep {_greedy_start}"
+                )
+                print(f"[Ep {episode}] Opponent (full episode): {_ep_opponent}{_ep_mix_note}")
+
+            # --- Game loop: rank 0 steps env, all ranks sync on ally turns ---
+            while True:
+                if rank == 0:
+                    # Run enemy turns until it's ally's turn or game ends
+                    while not done and env.turn != ALLY:
+                        if use_greedy_for_episode:
+                            enemy_action = enemy_agent_greedy.move(env)
+                            episode_enemy_greedy_turns += 1
+                        else:
+                            enemy_action = enemy_agent_random.move(env)
+                            episode_enemy_random_turns += 1
+                        observation, enemy_reward, done, _ = env.step(enemy_action)
+                        current_enemy_rewards += enemy_reward
+                        _log_env_step(
+                            episode, round_idx, f"Enemy ({_ep_opponent})",
+                            enemy_action, enemy_reward,
+                        )
+                        round_idx += 1
+                        if round_idx >= 200:
+                            print(
+                                f"[Ep {episode} Rd {round_idx}] "
+                                f"Episode reached 200 rounds, stopping. Opponent={_ep_opponent}"
+                            )
+                            done = True
+                            truncated_game += 1
+                            episode_hit_round_cap = True
+
+                    # Broadcast signal: ally turn or episode done
+                    if done:
+                        signal = _SIGNAL_EPISODE_DONE
+                    else:
+                        signal = _SIGNAL_ALLY_TURN
+                else:
+                    signal = 0
+
+                signal = broadcast_int(signal)
+
+                if signal == _SIGNAL_EPISODE_DONE:
+                    break
+
+                # --- All ranks: participate in model.generate() via act() ---
+                if rank == 0:
                     used_random_fallback, ally_action, llm_output = ally_agent.act(
-                        observation,
-                        episode,
-                        round_idx,
-                        env,
+                        observation, episode, round_idx, env,
                         ally_turn_index=episode_ally_turns,
                     )
+                else:
+                    ally_agent.act(None, episode, 0, None, ally_turn_index=0)
+
+                # --- Rank 0: step env with the chosen action ---
+                if rank == 0:
                     if ally_action is None:
                         episode_act_failures += 1
                         lifetime_act_failures += 1
@@ -1132,102 +1293,83 @@ if not _infer_only:
                     ally_agent.assign_reward(ally_reward)
                     if ally_action is not None:
                         _log_env_step(
-                            episode,
-                            round_idx,
-                            "Ally action",
-                            ally_action,
-                            ally_reward,
+                            episode, round_idx, "Ally action",
+                            ally_action, ally_reward,
                             random_fallback=used_random_fallback,
                         )
-                    if rank == 0 and episode % gap_size == 0 and ally_action is not None:
+                    if episode % gap_size == 0 and ally_action is not None:
                         training_log_llm_output(
                             "chinese_chess_llm_output_log", episode, round_idx, llm_output
                         )
-                else:
-                    if use_greedy_for_episode:
-                        enemy_action = enemy_agent_greedy.move(env)
-                        episode_enemy_greedy_turns += 1
-                    else:
-                        enemy_action = enemy_agent_random.move(env)
-                        episode_enemy_random_turns += 1
-                    observation, enemy_reward, done, _ = env.step(enemy_action)
-                    current_enemy_rewards += enemy_reward
-                    _log_env_step(
-                        episode,
-                        round_idx,
-                        f"Enemy ({_ep_opponent})",
-                        enemy_action,
-                        enemy_reward,
-                    )
-    
-                round_idx += 1
-                if round_idx >= 200:
-                    print(
-                        f"[Ep {episode} Rd {round_idx}] "
-                        f"Episode reached 200 rounds, stopping to prevent infinite loop. "
-                        f"Opponent={_ep_opponent}"
-                    )
-                    done = True
-                    truncated_game += 1
-                    episode_hit_round_cap = True
-    
-            episode_lengths.append(round_idx)
-            if enemy_reward == 100:
-                enemy_wins += 1
-                winning_rewards.append(current_enemy_rewards)
-            elif ally_reward == 100:
-                ally_wins += 1
-                winning_rewards.append(current_ally_rewards)
-    
-            ally_rewards.append(current_ally_rewards)
-            enemy_rewards.append(current_enemy_rewards)
-    
-            lifetime_ally_turns += episode_ally_turns
-            lifetime_random_fallback += episode_random_fallback
-            random_rate_episode = (
-                100.0 * episode_random_fallback / episode_ally_turns if episode_ally_turns else 0.0
-            )
-            random_rate_lifetime = (
-                100.0 * lifetime_random_fallback / lifetime_ally_turns
-                if lifetime_ally_turns
-                else 0.0
-            )
-            trained_turn_fraction = (
-                (episode_ally_turns - episode_random_fallback) / episode_ally_turns
-                if episode_ally_turns
-                else 0.0
-            )
-    
-            episode_stats = {
-                "episode": episode,
-                "episode_length": round_idx,
-                "total_return": current_ally_rewards + current_enemy_rewards,
-                "ally_return": current_ally_rewards,
-                "enemy_return": current_enemy_rewards,
-                "message_ct": len(ally_agent.current_episode_messages),
-                "episode_messages": ally_agent.current_episode_messages,
-                "ally_wins": ally_wins,
-                "enemy_wins": enemy_wins,
-                "truncated_games": truncated_game,
-                "ally_win_rate": calculate_win_rate(ally_wins, episode),
-                "enemy_win_rate": calculate_win_rate(enemy_wins, episode),
-                "truncated_rate": calculate_win_rate(truncated_game, episode),
-                "ally_turns_episode": episode_ally_turns,
-                "random_fallback_episode": episode_random_fallback,
-                "random_move_rate_episode": random_rate_episode,
-                "random_move_rate_lifetime": random_rate_lifetime,
-                "act_failures_episode": episode_act_failures,
-                "act_failures_lifetime": lifetime_act_failures,
-                "trained_turn_fraction": trained_turn_fraction,
-                "enemy_greedy_turns": episode_enemy_greedy_turns,
-                "enemy_random_turns": episode_enemy_random_turns,
-                "enemy_policy": "greedy" if use_greedy_for_episode else "random",
-            }
-    
+                    round_idx += 1
+                    if round_idx >= 200 and not done:
+                        print(
+                            f"[Ep {episode} Rd {round_idx}] "
+                            f"Episode reached 200 rounds, stopping. Opponent={_ep_opponent}"
+                        )
+                        done = True
+                        truncated_game += 1
+                        episode_hit_round_cap = True
+
+            # --- End of episode: all ranks call terminate_episode (synced train_step) ---
             train_stats = ally_agent.terminate_episode()
-            episode_stats.update(train_stats)
-    
+
+            # --- Rank 0: bookkeeping, logging, checkpointing ---
             if rank == 0:
+                episode_lengths.append(round_idx)
+                if enemy_reward == 100:
+                    enemy_wins += 1
+                    winning_rewards.append(current_enemy_rewards)
+                elif ally_reward == 100:
+                    ally_wins += 1
+                    winning_rewards.append(current_ally_rewards)
+
+                ally_rewards.append(current_ally_rewards)
+                enemy_rewards.append(current_enemy_rewards)
+
+                lifetime_ally_turns += episode_ally_turns
+                lifetime_random_fallback += episode_random_fallback
+                random_rate_episode = (
+                    100.0 * episode_random_fallback / episode_ally_turns if episode_ally_turns else 0.0
+                )
+                random_rate_lifetime = (
+                    100.0 * lifetime_random_fallback / lifetime_ally_turns
+                    if lifetime_ally_turns
+                    else 0.0
+                )
+                trained_turn_fraction = (
+                    (episode_ally_turns - episode_random_fallback) / episode_ally_turns
+                    if episode_ally_turns
+                    else 0.0
+                )
+
+                episode_stats = {
+                    "episode": episode,
+                    "episode_length": round_idx,
+                    "total_return": current_ally_rewards + current_enemy_rewards,
+                    "ally_return": current_ally_rewards,
+                    "enemy_return": current_enemy_rewards,
+                    "message_ct": len(ally_agent.current_episode_messages),
+                    "episode_messages": ally_agent.current_episode_messages,
+                    "ally_wins": ally_wins,
+                    "enemy_wins": enemy_wins,
+                    "truncated_games": truncated_game,
+                    "ally_win_rate": calculate_win_rate(ally_wins, episode),
+                    "enemy_win_rate": calculate_win_rate(enemy_wins, episode),
+                    "truncated_rate": calculate_win_rate(truncated_game, episode),
+                    "ally_turns_episode": episode_ally_turns,
+                    "random_fallback_episode": episode_random_fallback,
+                    "random_move_rate_episode": random_rate_episode,
+                    "random_move_rate_lifetime": random_rate_lifetime,
+                    "act_failures_episode": episode_act_failures,
+                    "act_failures_lifetime": lifetime_act_failures,
+                    "trained_turn_fraction": trained_turn_fraction,
+                    "enemy_greedy_turns": episode_enemy_greedy_turns,
+                    "enemy_random_turns": episode_enemy_random_turns,
+                    "enemy_policy": "greedy" if use_greedy_for_episode else "random",
+                }
+                episode_stats.update(train_stats)
+
                 append_episode_metrics_csv(
                     EPISODE_METRICS_CSV,
                     episode=episode,
@@ -1242,27 +1384,26 @@ if not _infer_only:
                     train_stats=train_stats,
                     enemy_policy="greedy" if use_greedy_for_episode else "random",
                 )
-    
-            series_ally_win_rate_cumulative.append(episode_stats["ally_win_rate"])
-            series_trained_turn_fraction.append(trained_turn_fraction)
-            br_std_ep = train_stats.get("grpo/batch_reward_std_mean")
-            if br_std_ep is None:
-                br_std_ep = train_stats.get("grpo/batch_reward_std")
-            series_batch_reward_std.append(
-                br_std_ep if br_std_ep is not None else float("nan")
-            )
-    
-            if rank == 0:
+
+                series_ally_win_rate_cumulative.append(episode_stats["ally_win_rate"])
+                series_trained_turn_fraction.append(trained_turn_fraction)
+                br_std_ep = train_stats.get("grpo/batch_reward_std_mean")
+                if br_std_ep is None:
+                    br_std_ep = train_stats.get("grpo/batch_reward_std")
+                series_batch_reward_std.append(
+                    br_std_ep if br_std_ep is not None else float("nan")
+                )
+
                 wandb.log(episode_stats)
-    
+
             if _ckpt_every > 0 and episode % _ckpt_every == 0:
                 save_lora_checkpoint(
                     os.path.join(_ckpt_root, f"ep_{episode}"),
                     episode,
                     label=f"every_{_ckpt_every}",
                 )
-    
-            if episode % gap_size == 0:
+
+            if rank == 0 and episode % gap_size == 0:
                 wr = calculate_win_rate(ally_wins, episode)
                 ewr = calculate_win_rate(enemy_wins, episode)
                 tr = calculate_win_rate(truncated_game, episode)
@@ -1290,14 +1431,14 @@ if not _infer_only:
                     f"mean_rew={train_stats.get('grpo/mean_reward', 'n/a')}"
                 )
                 print("-" * 60)
-    
-        if episode_lengths:
+
+        if rank == 0 and episode_lengths:
             save_lora_checkpoint(
                 os.path.join(_ckpt_root, "final"),
                 len(episode_lengths),
                 label="normal_completion",
             )
-    
+
     except Exception:
         if rank == 0:
             print("\n" + "=" * 60)
