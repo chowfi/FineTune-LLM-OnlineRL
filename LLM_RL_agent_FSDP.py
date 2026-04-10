@@ -27,6 +27,13 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import wandb
 from peft import LoraConfig, PeftModel, get_peft_model
+import peft.tuners.tuners_utils as _peft_tuner_utils
+
+# PEFT's BaseTuner.forward() calls self.model.forward() directly, which
+# bypasses __call__() and therefore skips FSDP's pre-forward hooks.
+# Patch it to use __call__() so FSDP can unshard parameters before the forward pass.
+_peft_tuner_utils.BaseTuner.forward = lambda self, *args, **kwargs: self.model(*args, **kwargs)
+
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.checkpoint.state_dict import (
