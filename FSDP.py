@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-from torch.distributed.checkpoint.state_dict import set_model_state_dict, get_model_state_dict, StateDictOptions
+from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--mixed-precision", action="store_true")

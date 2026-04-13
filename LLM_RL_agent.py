@@ -485,7 +485,7 @@ class Agent(ABC):
 
         try:
             is_random, action = self.extract_action(response, env)
-        except Exception as e:
+        except Exception:
             return None, None, response
 
         if is_random:

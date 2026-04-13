@@ -54,3 +54,8 @@ override-dependencies = [
     "transformers==5.3.0",
     "trl==0.29.0",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.10",
+]

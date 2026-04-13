@@ -22,7 +22,6 @@ except ImportError:
         RecordVideo = None  # type: ignore
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import wandb
@@ -37,10 +36,10 @@ _peft_tuner_utils.BaseTuner.forward = lambda self, *args, **kwargs: self.model(*
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.checkpoint.state_dict import (
-    set_model_state_dict, get_model_state_dict, StateDictOptions,
+    get_model_state_dict, StateDictOptions,
 )
 from tqdm import trange
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from gym_xiangqi.agents import RandomAgent
 from gym_xiangqi.constants import ALLY, PIECE_ID_TO_NAME, PIECE_POINTS
@@ -622,7 +621,7 @@ class Agent(ABC):
 
             try:
                 is_random, action = self.extract_action(response, env)
-            except Exception as e:
+            except Exception:
                 return None, None, response
 
             if is_random:
