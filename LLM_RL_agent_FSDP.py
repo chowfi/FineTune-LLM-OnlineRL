@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import time
 import traceback
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,7 +42,6 @@ from torch.distributed.checkpoint.state_dict import (
 from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from gym_xiangqi.agents import RandomAgent
 from gym_xiangqi.constants import ALLY, PIECE_ID_TO_NAME, PIECE_POINTS
 from gym_xiangqi.utils import action_space_to_move, move_to_action_space
 
@@ -133,6 +133,55 @@ class GreedyEnemyAgent:
             elif score == best_score:
                 best_actions.append(int(a))
         return int(random.choice(best_actions))
+
+
+# ─── Reward shaping ───
+
+def compute_shaped_reward(
+    board_before: np.ndarray,
+    ally_action: int,
+    env_step_reward: float,
+    scale: float = 0.1,
+) -> float:
+    """Dense per-turn reward: env step reward + scaled value of captured piece."""
+    _, _, end = action_space_to_move(ally_action)
+    target = int(board_before[end[0]][end[1]])
+    capture_value = PIECE_POINTS[abs(target)] if target < 0 else 0.0
+    return env_step_reward + scale * capture_value
+
+
+def distribute_terminal_bonus(
+    terminal_reward: float,
+    num_turns: int,
+    gamma: float = 0.99,
+) -> List[float]:
+    """Discounted terminal bonus: later turns get more credit."""
+    if num_turns <= 0:
+        return []
+    return [terminal_reward * (gamma ** (num_turns - 1 - i)) for i in range(num_turns)]
+
+
+def describe_enemy_move(
+    board_before: np.ndarray,
+    board_after: np.ndarray,
+    enemy_action: int,
+) -> str:
+    """One-line text description of what the enemy just did."""
+    pid, start, end = action_space_to_move(enemy_action)
+    enemy_name = PIECE_ID_TO_NAME[abs(pid)] if abs(pid) < len(PIECE_ID_TO_NAME) else "UNKNOWN"
+    target = int(board_before[end[0]][end[1]])
+    if target > 0:
+        captured_name = PIECE_ID_TO_NAME[target] if target < len(PIECE_ID_TO_NAME) else "UNKNOWN"
+        return (
+            f"Enemy moved {enemy_name} from ({start[0]},{start[1]}) to "
+            f"({end[0]},{end[1]}), capturing your {captured_name}."
+        )
+    return (
+        f"Enemy moved {enemy_name} from ({start[0]},{start[1]}) to "
+        f"({end[0]},{end[1]})."
+    )
+
+
 # ─── Evaluation metrics ───
 
 def calculate_win_rate(wins, total_games):
@@ -261,6 +310,11 @@ _EPISODE_METRICS_FIELDNAMES = [
     "grpo_batch_reward_std_mean",
     "grpo_batch_reward_std_last",
     "grpo_train_steps",
+    "mfu",
+    "hfu",
+    "mfu_achieved_tflops",
+    "hfu_achieved_tflops",
+    "mfu_step_time_sec",
 ]
 
 
@@ -314,6 +368,11 @@ def append_episode_metrics_csv(
         "grpo_batch_reward_std_mean": _fmt_metric(ts.get("grpo/batch_reward_std_mean")),
         "grpo_batch_reward_std_last": _fmt_metric(ts.get("grpo/batch_reward_std")),
         "grpo_train_steps": _fmt_metric(ts.get("grpo/grpo_train_steps")),
+        "mfu": _fmt_metric(ts.get("mfu/mfu")),
+        "hfu": _fmt_metric(ts.get("mfu/hfu")),
+        "mfu_achieved_tflops": _fmt_metric(ts.get("mfu/mfu_achieved_tflops")),
+        "hfu_achieved_tflops": _fmt_metric(ts.get("mfu/hfu_achieved_tflops")),
+        "mfu_step_time_sec": _fmt_metric(ts.get("mfu/step_time_sec")),
     }
     file_exists = os.path.isfile(filepath)
     with open(filepath, "a", newline="", encoding="utf-8") as f:
@@ -327,6 +386,159 @@ def reset_episode_metrics_csv(filepath: str) -> None:
     """Overwrite metrics CSV with header only (call once per training run)."""
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=_EPISODE_METRICS_FIELDNAMES).writeheader()
+
+
+# ─── MFU (Model FLOPs Utilization) profiling ───
+
+_GPU_PEAK_TFLOPS: Dict[str, Dict[str, float]] = {
+    "5090": {"bf16": 209.5, "fp32": 104.8, "fp16": 209.5},
+    "5080": {"bf16": 112.0, "fp32": 56.0,  "fp16": 112.0},
+    "4090": {"bf16": 330.0, "fp32": 82.6,  "fp16": 330.0},
+    "4080": {"bf16": 200.0, "fp32": 48.7,  "fp16": 200.0},
+    "3090": {"bf16": 142.0, "fp32": 35.6,  "fp16": 142.0},
+    "3080": {"bf16": 119.0, "fp32": 29.8,  "fp16": 119.0},
+    "h100": {"bf16": 989.0, "fp32": 67.0,  "fp16": 989.0},
+    "h200": {"bf16": 989.0, "fp32": 67.0,  "fp16": 989.0},
+    "a100": {"bf16": 312.0, "fp32": 19.5,  "fp16": 312.0},
+    "a6000": {"bf16": 155.0, "fp32": 38.7, "fp16": 155.0},
+    "a40":  {"bf16": 150.0, "fp32": 37.4,  "fp16": 150.0},
+    "l40s": {"bf16": 362.0, "fp32": 91.6,  "fp16": 362.0},
+    "l40":  {"bf16": 181.0, "fp32": 90.5,  "fp16": 181.0},
+    "a5000": {"bf16": 65.6, "fp32": 27.8,  "fp16": 65.6},
+    "v100": {"bf16": 125.0, "fp32": 15.7,  "fp16": 125.0},
+}
+
+
+def _get_gpu_peak_tflops(device_index: int = 0, dtype_str: str = "bf16") -> float:
+    """Theoretical peak Tensor-Core TFLOPS for ``dtype_str`` (without sparsity).
+
+    ``dtype_str`` should be ``"bf16"``, ``"fp16"``, or ``"fp32"`` to match
+    the compute dtype used in forward/backward.
+    Falls back to 50 TFLOPS if the GPU is unrecognised.
+    """
+    if not torch.cuda.is_available():
+        return 0.0
+    name = torch.cuda.get_device_name(device_index).lower()
+    for key, peaks in _GPU_PEAK_TFLOPS.items():
+        if key in name:
+            return peaks.get(dtype_str, peaks.get("bf16", 50.0))
+    return 50.0
+
+
+def _resolve_compute_dtype_str(mp_policy: Optional[MixedPrecisionPolicy]) -> str:
+    """Determine the dtype string (``"bf16"``/``"fp16"``/``"fp32"``) that
+    matrix multiplies actually run in, given the FSDP mixed-precision policy.
+
+    If ``mp_policy`` is ``None`` or has no ``param_dtype``, the model was loaded
+    in BF16 (see ``AutoModelForCausalLM.from_pretrained(..., dtype=torch.bfloat16)``)
+    so the compute dtype defaults to ``"bf16"``.
+    """
+    if mp_policy is None:
+        return "bf16"
+    dt = getattr(mp_policy, "param_dtype", None)
+    if dt is None:
+        return "bf16"
+    _MAP = {torch.bfloat16: "bf16", torch.float16: "fp16", torch.float32: "fp32"}
+    return _MAP.get(dt, "bf16")
+
+
+class MFUTracker:
+    """Track MFU and HFU per GRPO training step.
+
+    Per sample with sequence length T, P = all params, P_t = trainable (LoRA):
+
+    MFU (theoretical minimum FLOPs — no recomputation):
+        ref forward  (no grad, LoRA off) : 2 · P · T
+        policy forward    (with grad)    : 2 · P · T
+        backward: activation grads       : 2 · P · T
+        backward: weight grads (LoRA)    : 2 · P_t · T
+        ─────────────────────────────────────────
+        MFU total ≈ 6·P·T   (since P_t << P)
+
+    HFU (actual hardware FLOPs — includes gradient-checkpoint recomputation):
+        Same as above, plus the recomputed forward pass during backward
+        triggered by gradient_checkpointing_enable():
+        checkpoint recomputation         : +2 · P · T
+        ─────────────────────────────────────────
+        HFU total ≈ 8·P·T
+
+    MFU = MFU_flops / (elapsed · peak)
+    HFU = HFU_flops / (elapsed · peak)
+    """
+
+    def __init__(self, model, device_index: int = 0,
+                 mp_policy: Optional[MixedPrecisionPolicy] = None,
+                 gradient_checkpointing: bool = True):
+        self.total_params = sum(p.numel() for p in model.parameters())
+        self.trainable_params = sum(
+            p.numel() for p in model.parameters() if p.requires_grad
+        )
+        self.gradient_checkpointing = gradient_checkpointing
+        dtype_str = _resolve_compute_dtype_str(mp_policy)
+        self.dtype_str = dtype_str
+        self.gpu_peak_tflops = _get_gpu_peak_tflops(device_index, dtype_str)
+        self.gpu_peak_flops = self.gpu_peak_tflops * 1e12
+        self._history: List[Dict[str, float]] = []
+
+    def compute(self, total_tokens: int, elapsed_sec: float,
+                num_fwd_per_sample: int = 2) -> Dict[str, float]:
+        """Return MFU and HFU metrics for one train_step.
+
+        Args:
+            total_tokens: sum of (query + response) lengths across every
+                          sample in the batch.
+            elapsed_sec:  wall-clock seconds for the train step
+                          (cuda-synchronised on both ends).
+            num_fwd_per_sample: forward passes per sample (2 = ref + policy).
+        """
+        if elapsed_sec <= 0 or total_tokens <= 0:
+            return {}
+
+        P, P_t, T = self.total_params, self.trainable_params, total_tokens
+
+        fwd_flops = num_fwd_per_sample * 2 * P * T
+        bwd_act_grad_flops = 2 * P * T
+        bwd_weight_grad_flops = 2 * P_t * T
+        mfu_flops = fwd_flops + bwd_act_grad_flops + bwd_weight_grad_flops
+
+        recompute_flops = (2 * P * T) if self.gradient_checkpointing else 0
+        hfu_flops = mfu_flops + recompute_flops
+
+        mfu_achieved = (mfu_flops / elapsed_sec) / 1e12
+        hfu_achieved = (hfu_flops / elapsed_sec) / 1e12
+        mfu = (mfu_flops / elapsed_sec) / self.gpu_peak_flops if self.gpu_peak_flops > 0 else 0.0
+        hfu = (hfu_flops / elapsed_sec) / self.gpu_peak_flops if self.gpu_peak_flops > 0 else 0.0
+
+        stats: Dict[str, float] = {
+            "mfu/mfu": mfu,
+            "mfu/hfu": hfu,
+            "mfu/mfu_achieved_tflops": mfu_achieved,
+            "mfu/hfu_achieved_tflops": hfu_achieved,
+            "mfu/peak_tflops": self.gpu_peak_tflops,
+            "mfu/dtype": self.dtype_str,
+            "mfu/total_tokens_step": total_tokens,
+            "mfu/step_time_sec": elapsed_sec,
+        }
+        self._history.append(stats)
+        return stats
+
+    def summary(self) -> Dict[str, float]:
+        """Aggregate MFU and HFU across all recorded steps."""
+        if not self._history:
+            return {}
+        mfus = [h["mfu/mfu"] for h in self._history]
+        hfus = [h["mfu/hfu"] for h in self._history]
+        m_tfs = [h["mfu/mfu_achieved_tflops"] for h in self._history]
+        h_tfs = [h["mfu/hfu_achieved_tflops"] for h in self._history]
+        return {
+            "mfu/lifetime_mean_mfu": float(np.mean(mfus)),
+            "mfu/lifetime_median_mfu": float(np.median(mfus)),
+            "mfu/lifetime_mean_hfu": float(np.mean(hfus)),
+            "mfu/lifetime_median_hfu": float(np.median(hfus)),
+            "mfu/lifetime_mean_mfu_tflops": float(np.mean(m_tfs)),
+            "mfu/lifetime_mean_hfu_tflops": float(np.mean(h_tfs)),
+            "mfu/lifetime_steps_profiled": len(self._history),
+        }
 
 
 # ─── Lightweight GRPO trainer for online RL ───
@@ -345,7 +557,8 @@ class GRPOTrainerOnline:
       4. Loss = -mean(advantage * response_log_prob) + beta * KL
     """
 
-    def __init__(self, model, tokenizer, device, batch_size=8, lr=1e-5, beta=0.1, max_grad_norm=1.0):
+    def __init__(self, model, tokenizer, device, batch_size=8, lr=1e-5, beta=0.1, max_grad_norm=1.0,
+                 mp_policy: Optional[MixedPrecisionPolicy] = None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -359,6 +572,12 @@ class GRPOTrainerOnline:
 
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
+
+        _grad_ckpt = getattr(model, "is_gradient_checkpointing", False)
+        self.mfu_tracker = MFUTracker(
+            model, device.index or 0, mp_policy=mp_policy,
+            gradient_checkpointing=_grad_ckpt,
+        )
 
         self.buffer = {"query_ids": [], "response_ids": [], "rewards": []}
 
@@ -441,6 +660,13 @@ class GRPOTrainerOnline:
         else:
             advantages = rewards_t - rewards_t.mean()
 
+        total_tokens = sum(
+            q.numel() + r.numel()
+            for q, r in zip(query_ids_batch, response_ids_batch)
+        )
+        torch.cuda.synchronize()
+        _mfu_t0 = time.perf_counter()
+
         self.model.train()
         self.optimizer.zero_grad()
 
@@ -478,6 +704,12 @@ class GRPOTrainerOnline:
         )
         self.optimizer.step()
 
+        torch.cuda.synchronize()
+        _mfu_elapsed = time.perf_counter() - _mfu_t0
+        mfu_stats = self.mfu_tracker.compute(
+            total_tokens, _mfu_elapsed, num_fwd_per_sample=2,
+        )
+
         torch.cuda.empty_cache()
 
         stats = {
@@ -487,6 +719,7 @@ class GRPOTrainerOnline:
             "grpo/mean_reward": rewards_t.mean().item(),
             "grpo/batch_reward_std": reward_std_before_norm,
         }
+        stats.update(mfu_stats)
         return stats
 
 
@@ -519,7 +752,9 @@ class Agent(ABC):
             {"role": "system", "content": self.get_system_prompt()}
         ]
         self.current_episode_rewards = []
+        self.current_episode_shaped_rewards = []
         self.current_episode_turn_data = []
+        self.last_enemy_move_desc: Optional[str] = None
 
     @abstractmethod
     def get_system_prompt(self) -> str:
@@ -527,7 +762,8 @@ class Agent(ABC):
 
     @abstractmethod
     def format_observation(
-        self, observation: gym.core.ObsType, env: gym.Env = None, ally_turn_index: int = 0
+        self, observation: gym.core.ObsType, env: gym.Env = None, ally_turn_index: int = 0,
+        enemy_move_desc: Optional[str] = None,
     ) -> str:
         pass
 
@@ -575,7 +811,11 @@ class Agent(ABC):
         Non-rank-0 callers should pass observation=None, env=None."""
 
         if rank == 0:
-            message = self.format_observation(observation, env, ally_turn_index=ally_turn_index)
+            message = self.format_observation(
+                observation, env, ally_turn_index=ally_turn_index,
+                enemy_move_desc=self.last_enemy_move_desc,
+            )
+            self.last_enemy_move_desc = None
             self.current_episode_messages += [{"role": "user", "content": message}]
             self.current_llm_input += [{"role": "user", "content": message}]
 
@@ -627,8 +867,10 @@ class Agent(ABC):
             if is_random:
                 piece_id, start, end = action_space_to_move(action)
                 corrected_response = f"Action: {piece_id}, ({start[0]}, {start[1]}), ({end[0]}, {end[1]})"
+                assistant_msg = f"(system override: random move) {corrected_response}"
             else:
                 corrected_response = response
+                assistant_msg = corrected_response
 
             query_ids = inputs.input_ids[0].cpu()
             max_train_ctx = 4096
@@ -637,31 +879,37 @@ class Agent(ABC):
             response_ids = self.tokenizer(corrected_response, return_tensors="pt").input_ids[0]
             self.current_episode_turn_data.append((query_ids, response_ids, is_random))
 
-            self.current_episode_messages += [{"role": "assistant", "content": corrected_response}]
-            self.current_llm_input += [{"role": "assistant", "content": corrected_response}]
+            self.current_episode_messages += [{"role": "assistant", "content": assistant_msg}]
+            self.current_llm_input += [{"role": "assistant", "content": assistant_msg}]
             return is_random, action, response
 
         # Non-rank-0: return dummy values (caller should not use them)
         return None, None, None
 
-    def assign_reward(self, reward):
-        self.current_episode_rewards.append(reward)
+    def set_enemy_move_desc(self, desc: str):
+        self.last_enemy_move_desc = desc
 
-    def terminate_episode(self, train=True):
+    def assign_reward(self, reward: float, shaped_reward: Optional[float] = None):
+        self.current_episode_rewards.append(reward)
+        self.current_episode_shaped_rewards.append(
+            shaped_reward if shaped_reward is not None else reward
+        )
+
+    def terminate_episode(self, train=True, gamma: float = 0.99):
         """End an episode. Only rank 0 manages the buffer; all ranks call train_step together."""
         if rank == 0 and train and self.current_episode_turn_data:
-            rewards = self.current_episode_rewards
             turns = self.current_episode_turn_data
+            shaped = self.current_episode_shaped_rewards[:len(turns)]
+            raw = self.current_episode_rewards
 
-            if all(r == 0 for r in rewards[:-1]) and len(rewards) > 0:
-                per_turn = rewards[-1] / max(len(turns), 1)
-                distributed_rewards = [per_turn] * len(turns)
-            else:
-                distributed_rewards = rewards[:len(turns)]
+            terminal_reward = raw[-1] if raw else 0.0
+            terminal_bonus = distribute_terminal_bonus(terminal_reward, len(turns), gamma)
 
-            for (q, r, was_random), rew in zip(turns, distributed_rewards):
+            for i, ((q, r, was_random), bonus) in enumerate(zip(turns, terminal_bonus)):
                 if not was_random:
-                    self.grpo_trainer.add_to_buffer(q, r, rew)
+                    per_turn = shaped[i] if i < len(shaped) else 0.0
+                    combined = per_turn + bonus
+                    self.grpo_trainer.add_to_buffer(q, r, combined)
 
         self.current_episode_messages = [
             {"role": "system", "content": self.get_system_prompt()}
@@ -670,13 +918,15 @@ class Agent(ABC):
             {"role": "system", "content": self.get_system_prompt()}
         ]
         self.current_episode_rewards = []
+        self.current_episode_shaped_rewards = []
         self.current_episode_turn_data = []
+        self.last_enemy_move_desc = None
 
         if train:
             all_stats = {}
             batch_reward_stds = []
-            # All ranks enter the loop together; train_step broadcasts a
-            # should_train flag so every rank exits at the same iteration.
+            mfu_steps = []
+            hfu_steps = []
             while True:
                 step_stats = self.grpo_trainer.train_step()
                 if not step_stats:
@@ -685,9 +935,19 @@ class Agent(ABC):
                 br = step_stats.get("grpo/batch_reward_std")
                 if br is not None and np.isfinite(br):
                     batch_reward_stds.append(br)
+                mfu_val = step_stats.get("mfu/mfu")
+                if mfu_val is not None:
+                    mfu_steps.append(mfu_val)
+                hfu_val = step_stats.get("mfu/hfu")
+                if hfu_val is not None:
+                    hfu_steps.append(hfu_val)
             if batch_reward_stds:
                 all_stats["grpo/batch_reward_std_mean"] = float(np.mean(batch_reward_stds))
                 all_stats["grpo/grpo_train_steps"] = len(batch_reward_stds)
+            if mfu_steps:
+                all_stats["mfu/mean_mfu_episode"] = float(np.mean(mfu_steps))
+            if hfu_steps:
+                all_stats["mfu/mean_hfu_episode"] = float(np.mean(hfu_steps))
             return all_stats
 
         return {}
@@ -724,9 +984,13 @@ class ChineseChessAgent(Agent):
     EARLY_GAME_ALLY_MOVES = 50
 
     def format_observation(
-        self, observation: gym.core.ObsType, env: gym.Env = None, ally_turn_index: int = 0
+        self, observation: gym.core.ObsType, env: gym.Env = None, ally_turn_index: int = 0,
+        enemy_move_desc: Optional[str] = None,
     ) -> str:
-        message = f"The current board looks like this:\n{observation}\n"
+        message = ""
+        if enemy_move_desc:
+            message += f"{enemy_move_desc}\n\n"
+        message += f"The current board looks like this:\n{observation}\n"
         if env is not None:
             legal_actions = np.where(env.ally_actions == 1)[0]
             lines_in_env_order = []
@@ -814,15 +1078,15 @@ hyperparams = {
     "checkpoint/load_adapter_path": "",
     # True: wipe episode metrics CSV when this script starts (one file per run, no appended old runs)
     "metrics/clear_csv_on_start": True,
-    # From this episode index onward, each episode picks all-greedy or all-random enemy (Bernoulli)
-    "enemy/mix_greedy_start_episode": 80,
-    "enemy/greedy_episode_probability": 0.5,  # P(greedy episode); 1-P is random-opponent episode
+    # Reward shaping
+    "reward/material_scale": 0.1,  # multiplier on per-turn material delta
+    "reward/terminal_gamma": 0.99,  # discount factor for distributing terminal reward
     # Inference-only: load saved LoRA, play N games with RecordVideo, then exit (no training)
     "inference/record_only": False,
     "inference/adapter_path": "",  # e.g. ./checkpoints/xiangqi_grpo_lora/final (falls back to checkpoint/load_adapter_path)
     "inference/num_games": 1,
     "inference/video_dir": "./video_inference",
-    "inference/enemy": "random",  # "random" or "greedy" for the whole recorded run
+    "inference/enemy": "greedy",
 }
 
 _infer_only = bool(hyperparams.get("inference/record_only", False))
@@ -931,7 +1195,16 @@ def count_trainable_params(model):
 
 _t, _all, _pct = count_trainable_params(model)
 if rank == 0:
-    print(f"GRPO trainable params: {_t:,} / {_all:,} ({_pct:.2f}%)\n")
+    print(f"GRPO trainable params: {_t:,} / {_all:,} ({_pct:.2f}%)")
+    _gpu_name = torch.cuda.get_device_name(local_rank)
+    _mfu_dtype = _resolve_compute_dtype_str(fsdp_kwargs.get("mp_policy"))
+    _peak_tf = _get_gpu_peak_tflops(local_rank, _mfu_dtype)
+    _grad_ckpt_on = getattr(model, "is_gradient_checkpointing", False)
+    print(
+        f"MFU profiling: GPU={_gpu_name} | compute_dtype={_mfu_dtype} | "
+        f"peak={_peak_tf:.1f} TFLOPS | total_params={_all:,} | "
+        f"trainable_params={_t:,} | grad_checkpointing={_grad_ckpt_on}\n"
+    )
 
 
 def save_lora_checkpoint(checkpoint_path: str, episode: int, label: str = "") -> None:
@@ -964,6 +1237,7 @@ _ckpt_every = int(hyperparams.get("checkpoint/every_n_episodes", 0) or 0)
 
 # ─── Initialize GRPO trainer ───
 
+_active_mp_policy = fsdp_kwargs.get("mp_policy")
 grpo_trainer = GRPOTrainerOnline(
     model=model,
     tokenizer=tokenizer,
@@ -971,6 +1245,7 @@ grpo_trainer = GRPOTrainerOnline(
     batch_size=hyperparams["grpo/batch_size"],
     lr=hyperparams["grpo/lr"],
     beta=hyperparams["grpo/beta"],
+    mp_policy=_active_mp_policy,
 )
 
 # ─── Initialize Environment and Agents ───
@@ -1017,15 +1292,9 @@ if rank == 0 and not _infer_only:
                 "(episode_trigger uses the wrapper's internal episode index, not your training loop counter)."
             )
 
-enemy_agent_random = RandomAgent() if rank == 0 else None
-enemy_agent_greedy = GreedyEnemyAgent() if rank == 0 else None
-_greedy_start = int(hyperparams.get("enemy/mix_greedy_start_episode", 80))
-_greedy_p = float(
-    hyperparams.get(
-        "enemy/greedy_episode_probability",
-        hyperparams.get("enemy/greedy_move_probability", 0.5),
-    )
-)
+enemy_agent = GreedyEnemyAgent() if rank == 0 else None
+_material_scale = float(hyperparams.get("reward/material_scale", 0.1))
+_terminal_gamma = float(hyperparams.get("reward/terminal_gamma", 0.99))
 ally_agent = ChineseChessAgent(
     model,
     tokenizer,
@@ -1057,19 +1326,14 @@ _INFER_SIGNAL_ALL_DONE = 3
 
 def run_inference_record_videos(
     infer_ally_agent: ChineseChessAgent,
-    infer_enemy_random: Optional[RandomAgent],
-    infer_enemy_greedy: Optional[GreedyEnemyAgent],
+    infer_enemy: GreedyEnemyAgent,
 ) -> None:
     """Inference with RecordVideo. Rank 0 drives the env; all ranks participate in generate()."""
     num_games = max(1, int(hyperparams.get("inference/num_games", 1)))
     video_dir = hyperparams.get("inference/video_dir", "./video_inference")
-    enemy_kind = (hyperparams.get("inference/enemy", "random") or "random").strip().lower()
 
     infer_env = None
     if rank == 0:
-        if enemy_kind not in ("random", "greedy"):
-            print(f"[inference] Unknown inference/enemy={enemy_kind!r}; using random")
-            enemy_kind = "random"
         if RecordVideo is None:
             raise RuntimeError(
                 "inference/record_only requires RecordVideo (gym>=0.26 or gymnasium with RecordVideo)."
@@ -1087,7 +1351,7 @@ def run_inference_record_videos(
             name_prefix="xiangqi_infer",
         )
         print(
-            f"[inference] Recording up to {num_games} game(s), opponent={enemy_kind!r} -> {video_dir!r}"
+            f"[inference] Recording up to {num_games} game(s), opponent=GreedyEnemy -> {video_dir!r}"
         )
 
     model.eval()
@@ -1098,21 +1362,14 @@ def run_inference_record_videos(
             observation = raw_obs[0] if isinstance(raw_obs, tuple) else raw_obs
             round_idx, done = 1, False
             ally_reward = enemy_reward = 0.0
-            use_greedy = enemy_kind == "greedy"
-            _ep_opponent = "GreedyEnemy" if use_greedy else "RandomEnemy"
-            print(f"[inference game {game}/{num_games}] Opponent: {_ep_opponent}")
+            print(f"[inference game {game}/{num_games}] Opponent: GreedyEnemy")
             episode_ally_turns = episode_random_fallback = episode_act_failures = 0
             current_ally_rewards = current_enemy_rewards = 0.0
 
         while True:
             if rank == 0:
-                # Run enemy turns
                 while not done and _env_turn(infer_env) != ALLY:
-                    enemy_action = (
-                        infer_enemy_greedy.move(infer_env)
-                        if use_greedy
-                        else infer_enemy_random.move(infer_env)
-                    )
+                    enemy_action = infer_enemy.move(infer_env)
                     step_out = infer_env.step(enemy_action)
                     if len(step_out) == 5:
                         observation, enemy_reward, terminated, truncated, _ = step_out
@@ -1120,10 +1377,10 @@ def run_inference_record_videos(
                     else:
                         observation, enemy_reward, done, _ = step_out
                     current_enemy_rewards += enemy_reward
-                    _log_env_step(game, round_idx, f"Enemy ({_ep_opponent})", enemy_action, enemy_reward)
+                    _log_env_step(game, round_idx, "Enemy (GreedyEnemy)", enemy_action, enemy_reward)
                     round_idx += 1
                     if round_idx >= 200:
-                        print(f"[inference g{game} Rd {round_idx}] hit 200-round cap. Opponent={_ep_opponent}")
+                        print(f"[inference g{game} Rd {round_idx}] hit 200-round cap.")
                         done = True
 
                 signal = _INFER_SIGNAL_GAME_DONE if done else _INFER_SIGNAL_ALLY_TURN
@@ -1134,7 +1391,6 @@ def run_inference_record_videos(
             if signal == _INFER_SIGNAL_GAME_DONE:
                 break
 
-            # All ranks participate in generate
             if rank == 0:
                 used_random_fallback, ally_action, llm_output = infer_ally_agent.act(
                     observation, game, round_idx, infer_env, ally_turn_index=episode_ally_turns,
@@ -1163,7 +1419,7 @@ def run_inference_record_videos(
                                   random_fallback=used_random_fallback)
                 round_idx += 1
                 if round_idx >= 200 and not done:
-                    print(f"[inference g{game} Rd {round_idx}] hit 200-round cap. Opponent={_ep_opponent}")
+                    print(f"[inference g{game} Rd {round_idx}] hit 200-round cap.")
                     done = True
 
         if rank == 0:
@@ -1205,7 +1461,7 @@ _SIGNAL_ALLY_TURN = 1
 _SIGNAL_EPISODE_DONE = 2
 
 if _infer_only:
-    run_inference_record_videos(ally_agent, enemy_agent_random, enemy_agent_greedy)
+    run_inference_record_videos(ally_agent, enemy_agent)
 
 if not _infer_only:
     ally_wins = enemy_wins = truncated_game = 0
@@ -1222,55 +1478,42 @@ if not _infer_only:
     try:
         for episode in (trange(1, hyperparams["episodes"] + 1) if rank == 0 else range(1, hyperparams["episodes"] + 1)):
 
-            # --- Rank 0: reset env, pick enemy policy ---
             if rank == 0:
                 observation = env.reset()
                 round_idx, done = 1, False
                 current_ally_rewards = current_enemy_rewards = 0.0
                 episode_ally_turns = episode_random_fallback = episode_act_failures = 0
                 episode_hit_round_cap = False
-                episode_enemy_greedy_turns = episode_enemy_random_turns = 0
                 ally_reward = enemy_reward = 0.0
-                if episode >= _greedy_start:
-                    use_greedy_for_episode = random.random() < _greedy_p
-                else:
-                    use_greedy_for_episode = False
-                _ep_opponent = "GreedyEnemy" if use_greedy_for_episode else "RandomEnemy"
-                _ep_mix_note = (
-                    ""
-                    if episode >= _greedy_start
-                    else f" | greedy mix Random↔Greedy from ep {_greedy_start}"
-                )
-                print(f"[Ep {episode}] Opponent (full episode): {_ep_opponent}{_ep_mix_note}")
+                print(f"[Ep {episode}] Opponent: GreedyEnemy")
 
-            # --- Game loop: rank 0 steps env, all ranks sync on ally turns ---
             while True:
                 if rank == 0:
-                    # Run enemy turns until it's ally's turn or game ends
                     while not done and env.turn != ALLY:
-                        if use_greedy_for_episode:
-                            enemy_action = enemy_agent_greedy.move(env)
-                            episode_enemy_greedy_turns += 1
-                        else:
-                            enemy_action = enemy_agent_random.move(env)
-                            episode_enemy_random_turns += 1
+                        board_before_enemy = env.state.copy()
+                        enemy_action = enemy_agent.move(env)
                         observation, enemy_reward, done, _ = env.step(enemy_action)
                         current_enemy_rewards += enemy_reward
+
+                        enemy_desc = describe_enemy_move(
+                            board_before_enemy, env.state, enemy_action,
+                        )
+                        ally_agent.set_enemy_move_desc(enemy_desc)
+
                         _log_env_step(
-                            episode, round_idx, f"Enemy ({_ep_opponent})",
+                            episode, round_idx, "Enemy (GreedyEnemy)",
                             enemy_action, enemy_reward,
                         )
                         round_idx += 1
                         if round_idx >= 200:
                             print(
                                 f"[Ep {episode} Rd {round_idx}] "
-                                f"Episode reached 200 rounds, stopping. Opponent={_ep_opponent}"
+                                f"Episode reached 200 rounds, stopping."
                             )
                             done = True
                             truncated_game += 1
                             episode_hit_round_cap = True
 
-                    # Broadcast signal: ally turn or episode done
                     if done:
                         signal = _SIGNAL_EPISODE_DONE
                     else:
@@ -1283,8 +1526,8 @@ if not _infer_only:
                 if signal == _SIGNAL_EPISODE_DONE:
                     break
 
-                # --- All ranks: participate in model.generate() via act() ---
                 if rank == 0:
+                    board_before_ally = env.state.copy()
                     used_random_fallback, ally_action, llm_output = ally_agent.act(
                         observation, episode, round_idx, env,
                         ally_turn_index=episode_ally_turns,
@@ -1292,7 +1535,6 @@ if not _infer_only:
                 else:
                     ally_agent.act(None, episode, 0, None, ally_turn_index=0)
 
-                # --- Rank 0: step env with the chosen action ---
                 if rank == 0:
                     if ally_action is None:
                         episode_act_failures += 1
@@ -1304,12 +1546,19 @@ if not _infer_only:
                             episode_random_fallback += 1
                     _, ally_reward, done, _ = env.step(ally_action)
                     current_ally_rewards += ally_reward
-                    ally_agent.assign_reward(ally_reward)
+
+                    shaped = compute_shaped_reward(
+                        board_before_ally, ally_action, ally_reward,
+                        scale=_material_scale,
+                    )
+                    ally_agent.assign_reward(ally_reward, shaped_reward=shaped)
+
                     if ally_action is not None:
                         _log_env_step(
                             episode, round_idx, "Ally action",
                             ally_action, ally_reward,
                             random_fallback=used_random_fallback,
+                            shaped_reward=round(shaped, 4),
                         )
                     if episode % gap_size == 0 and ally_action is not None:
                         training_log_llm_output(
@@ -1319,14 +1568,13 @@ if not _infer_only:
                     if round_idx >= 200 and not done:
                         print(
                             f"[Ep {episode} Rd {round_idx}] "
-                            f"Episode reached 200 rounds, stopping. Opponent={_ep_opponent}"
+                            f"Episode reached 200 rounds, stopping."
                         )
                         done = True
                         truncated_game += 1
                         episode_hit_round_cap = True
 
-            # --- End of episode: all ranks call terminate_episode (synced train_step) ---
-            train_stats = ally_agent.terminate_episode()
+            train_stats = ally_agent.terminate_episode(gamma=_terminal_gamma)
 
             # --- Rank 0: bookkeeping, logging, checkpointing ---
             if rank == 0:
@@ -1378,9 +1626,7 @@ if not _infer_only:
                     "act_failures_episode": episode_act_failures,
                     "act_failures_lifetime": lifetime_act_failures,
                     "trained_turn_fraction": trained_turn_fraction,
-                    "enemy_greedy_turns": episode_enemy_greedy_turns,
-                    "enemy_random_turns": episode_enemy_random_turns,
-                    "enemy_policy": "greedy" if use_greedy_for_episode else "random",
+                    "enemy_policy": "greedy",
                 }
                 episode_stats.update(train_stats)
 
@@ -1396,7 +1642,7 @@ if not _infer_only:
                     trained_turn_fraction=trained_turn_fraction,
                     random_move_pct_episode=random_rate_episode,
                     train_stats=train_stats,
-                    enemy_policy="greedy" if use_greedy_for_episode else "random",
+                    enemy_policy="greedy",
                 )
 
                 series_ally_win_rate_cumulative.append(episode_stats["ally_win_rate"])
@@ -1425,7 +1671,7 @@ if not _infer_only:
                     "grpo/batch_reward_std_mean", train_stats.get("grpo/batch_reward_std", "n/a")
                 )
                 print(f"\n[Ep {episode}] --- periodic summary (every {gap_size} eps) ---")
-                print(f"Last episode opponent: {_ep_opponent}")
+                print("Opponent: GreedyEnemy")
                 print(
                     f"Wins: ally {ally_wins} ({wr:.1f}%) | enemy {enemy_wins} ({ewr:.1f}%) | "
                     f"trunc {truncated_game} ({tr:.1f}%)"
@@ -1444,6 +1690,23 @@ if not _infer_only:
                     f"mean_kl={train_stats.get('grpo/mean_kl', 'n/a')} | "
                     f"mean_rew={train_stats.get('grpo/mean_reward', 'n/a')}"
                 )
+                _mfu_val = train_stats.get("mfu/mfu")
+                _hfu_val = train_stats.get("mfu/hfu")
+                if _mfu_val is not None:
+                    _step_sec = train_stats.get("mfu/step_time_sec", 0)
+                    _mfu_ep_val = train_stats.get("mfu/mean_mfu_episode")
+                    _hfu_ep_val = train_stats.get("mfu/mean_hfu_episode")
+                    _ep_parts = []
+                    if _mfu_ep_val is not None:
+                        _ep_parts.append(f"ep_mean_mfu={_mfu_ep_val:.4f}")
+                    if _hfu_ep_val is not None:
+                        _ep_parts.append(f"ep_mean_hfu={_hfu_ep_val:.4f}")
+                    _ep_str = (" | " + " | ".join(_ep_parts)) if _ep_parts else ""
+                    _hfu_str = f" | HFU: {_hfu_val:.4f} ({_hfu_val*100:.2f}%)" if _hfu_val is not None else ""
+                    print(
+                        f"MFU: {_mfu_val:.4f} ({_mfu_val*100:.2f}%){_hfu_str} | "
+                        f"step_time={_step_sec:.2f}s{_ep_str}"
+                    )
                 print("-" * 60)
 
         if rank == 0 and episode_lengths:
@@ -1487,6 +1750,23 @@ if not _infer_only and rank == 0:
     print(f"Average Episode Length: {average_episode_length(episode_lengths)}")
     print(f"Ally Reward Variability: {reward_variability(ally_rewards)}")
     print(f"Enemy Reward Variability: {reward_variability(enemy_rewards)}")
+    _mfu_summary = grpo_trainer.mfu_tracker.summary()
+    if _mfu_summary:
+        print(
+            f"\nMFU lifetime: "
+            f"mean={_mfu_summary['mfu/lifetime_mean_mfu']:.4f} "
+            f"({_mfu_summary['mfu/lifetime_mean_mfu']*100:.2f}%) | "
+            f"median={_mfu_summary['mfu/lifetime_median_mfu']:.4f} | "
+            f"tflops={_mfu_summary['mfu/lifetime_mean_mfu_tflops']:.2f}"
+        )
+        print(
+            f"HFU lifetime: "
+            f"mean={_mfu_summary['mfu/lifetime_mean_hfu']:.4f} "
+            f"({_mfu_summary['mfu/lifetime_mean_hfu']*100:.2f}%) | "
+            f"median={_mfu_summary['mfu/lifetime_median_hfu']:.4f} | "
+            f"tflops={_mfu_summary['mfu/lifetime_mean_hfu_tflops']:.2f}"
+        )
+        print(f"Steps profiled: {_mfu_summary['mfu/lifetime_steps_profiled']}")
     plot_episode_lengths(episode_lengths, ally="LLM-Agent", enemy="Random")
     plot_episode_rewards(ally_rewards, enemy_rewards, ally="LLM-Agent", enemy="Random")
     if series_ally_win_rate_cumulative:
