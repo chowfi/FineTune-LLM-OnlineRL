@@ -10,6 +10,9 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:256"
+)
 
 import gym
 import matplotlib.pyplot as plt
@@ -558,13 +561,15 @@ class GRPOTrainerOnline:
     """
 
     def __init__(self, model, tokenizer, device, batch_size=8, lr=1e-5, beta=0.1, max_grad_norm=1.0,
-                 mp_policy: Optional[MixedPrecisionPolicy] = None):
+                 mp_policy: Optional[MixedPrecisionPolicy] = None,
+                 grad_accum_steps: int = 4):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.batch_size = batch_size
         self.beta = beta
         self.max_grad_norm = max_grad_norm
+        self.grad_accum_steps = grad_accum_steps
 
         self.optimizer = torch.optim.AdamW(
             (p for p in model.parameters() if p.requires_grad), lr=lr
@@ -674,29 +679,50 @@ class GRPOTrainerOnline:
         total_loss_val = 0.0
         total_kl_val = 0.0
 
+        samples_ok = 0
         for i in range(n):
             q = query_ids_batch[i]
             r = response_ids_batch[i]
             adv = advantages[i].to(self.device)
 
-            with torch.no_grad():
-                self.model.disable_adapter_layers()
-                ref_log_prob = self._compute_response_log_probs(q, r)
-                self.model.enable_adapter_layers()
+            try:
+                with torch.no_grad():
+                    self.model.disable_adapter_layers()
+                    ref_log_prob = self._compute_response_log_probs(q, r)
+                    self.model.enable_adapter_layers()
+                    torch.cuda.empty_cache()
+
+                current_log_prob = self._compute_response_log_probs(q, r)
+
+                kl = current_log_prob - ref_log_prob
+                sample_loss = (-adv * current_log_prob + self.beta * kl) / n
+
+                sample_loss.backward()
+
+                total_loss_val += sample_loss.item()
+                total_kl_val += kl.item()
+                samples_ok += 1
+
+                del current_log_prob, ref_log_prob, kl, sample_loss
                 torch.cuda.empty_cache()
 
-            current_log_prob = self._compute_response_log_probs(q, r)
+            except torch.cuda.OutOfMemoryError:
+                if rank == 0:
+                    seq_len = q.numel() + r.numel()
+                    print(
+                        f"[GRPO] CUDA OOM on sample {i}/{n} "
+                        f"(seq_len={seq_len}), skipping"
+                    )
+                self.model.enable_adapter_layers()
+                torch.cuda.empty_cache()
+                continue
 
-            kl = current_log_prob - ref_log_prob
-            sample_loss = (-adv * current_log_prob + self.beta * kl) / n
-
-            sample_loss.backward()
-
-            total_loss_val += sample_loss.item()
-            total_kl_val += kl.item()
-
-            del current_log_prob, ref_log_prob, kl, sample_loss
+        if samples_ok == 0:
+            self.optimizer.zero_grad()
             torch.cuda.empty_cache()
+            if rank == 0:
+                print("[GRPO] All samples OOM'd — skipping this train step")
+            return {}
 
         torch.nn.utils.clip_grad_norm_(
             (p for p in self.model.parameters() if p.requires_grad),
@@ -712,12 +738,15 @@ class GRPOTrainerOnline:
 
         torch.cuda.empty_cache()
 
+        effective_n = samples_ok if samples_ok > 0 else 1
         stats = {
             "grpo/loss": total_loss_val,
             "grpo/mean_advantage": advantages.mean().item(),
-            "grpo/mean_kl": total_kl_val / n,
+            "grpo/mean_kl": total_kl_val / effective_n,
             "grpo/mean_reward": rewards_t.mean().item(),
             "grpo/batch_reward_std": reward_std_before_norm,
+            "grpo/samples_ok": samples_ok,
+            "grpo/samples_oom": n - samples_ok,
         }
         stats.update(mfu_stats)
         return stats
@@ -788,15 +817,26 @@ class Agent(ABC):
         self.model.eval()
         if hasattr(self.model, "gradient_checkpointing_disable"):
             self.model.gradient_checkpointing_disable()
-        with torch.no_grad():
-            generate_ids = self.model.generate(
-                inputs=ids_bcast,
-                attention_mask=mask_bcast,
-                **{
-                    key.split("/")[-1]: value
-                    for key, value in self.generate_config_dict.items()
-                }
-            )
+        try:
+            with torch.no_grad():
+                generate_ids = self.model.generate(
+                    inputs=ids_bcast,
+                    attention_mask=mask_bcast,
+                    **{
+                        key.split("/")[-1]: value
+                        for key, value in self.generate_config_dict.items()
+                    }
+                )
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if rank == 0:
+                print(
+                    f"[LLM] CUDA OOM during generate "
+                    f"(ctx_len={context_len}), returning empty"
+                )
+            if hasattr(self.model, "gradient_checkpointing_enable"):
+                self.model.gradient_checkpointing_enable()
+            return ""
         if hasattr(self.model, "gradient_checkpointing_enable"):
             self.model.gradient_checkpointing_enable()
         generate_ids = generate_ids[:, context_len:]
@@ -873,7 +913,7 @@ class Agent(ABC):
                 assistant_msg = corrected_response
 
             query_ids = inputs.input_ids[0].cpu()
-            max_train_ctx = 4096
+            max_train_ctx = 2048
             if len(query_ids) > max_train_ctx:
                 query_ids = query_ids[-max_train_ctx:]
             response_ids = self.tokenizer(corrected_response, return_tensors="pt").input_ids[0]
@@ -1047,7 +1087,7 @@ class ChineseChessAgent(Agent):
 # Setup
 # ═══════════════════════════════════════════════════════════════
 
-max_input_token = 8192
+max_input_token = 4096
 
 hyperparams = {
     "model_name": "Qwen/Qwen2.5-14B-Instruct",
