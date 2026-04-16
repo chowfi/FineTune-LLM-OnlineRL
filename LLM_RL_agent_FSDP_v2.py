@@ -168,6 +168,7 @@ THINK_RE = re.compile(r"<think>.*?</think>", flags=re.IGNORECASE | re.DOTALL)
 THINK_CAPTURE_RE = re.compile(r"<think>(.*?)</think>", flags=re.IGNORECASE | re.DOTALL)
 ENGINE_CP_RE = re.compile(r"\bscore\s+cp\s+(-?\d+)\b", flags=re.IGNORECASE)
 ENGINE_MATE_RE = re.compile(r"\bscore\s+mate\s+(-?\d+)\b", flags=re.IGNORECASE)
+ENGINE_PERFT_MOVE_RE = re.compile(r"^([a-i][0-9][a-i][0-9]):\s+\d+\b", flags=re.IGNORECASE)
 MOVE_IN_TEXT_RE = re.compile(r"\b([a-i][0-9][a-i][0-9])\b", flags=re.IGNORECASE)
 
 THREAT_KEYWORDS = (
@@ -253,6 +254,21 @@ def algebraic_to_board_coords(move_str: str) -> Optional[Tuple[Tuple[int, int], 
     return (from_row, from_col), (to_row, to_col)
 
 
+def algebraic_to_engine_move(move_str: str) -> Optional[str]:
+    """
+    Convert internal board-index algebraic into Pikafish UCI move notation.
+
+    Internal rows: 0 = top (Black/enemy), 9 = bottom (Red/ally).
+    Pikafish ranks: 0 = bottom (Red/ally), 9 = top (Black/enemy).
+    So we flip: pikafish_rank = 9 - internal_row.
+    """
+    parsed = algebraic_to_board_coords(move_str)
+    if parsed is None:
+        return None
+    (from_row, from_col), (to_row, to_col) = parsed
+    return f"{COLS[from_col]}{9 - from_row}{COLS[to_col]}{9 - to_row}"
+
+
 def algebraic_to_action(move_str: str, board_state: np.ndarray, env: gym.Env) -> Optional[int]:
     parsed = algebraic_to_board_coords(move_str)
     if parsed is None:
@@ -266,6 +282,58 @@ def algebraic_to_action(move_str: str, board_state: np.ndarray, env: gym.Env) ->
     if action in legal:
         return action
     return None
+
+
+def engine_move_to_action(move_str: str, board_state: np.ndarray) -> Optional[int]:
+    """Convert a Pikafish UCI move string to an internal action ID.
+
+    Pikafish ranks: 0 = bottom (Red/ally), 9 = top (Black/enemy).
+    Internal rows: 0 = top (enemy), 9 = bottom (ally).
+    So we flip: numpy_row = 9 - pikafish_rank.
+    """
+    parsed = algebraic_to_board_coords(move_str)
+    if parsed is None:
+        return None
+    (pf_from_row, from_col), (pf_to_row, to_col) = parsed
+    from_row = 9 - pf_from_row
+    to_row = 9 - pf_to_row
+    piece_id = int(board_state[from_row][from_col])
+    if piece_id <= 0:
+        return None
+    return int(move_to_action_space(piece_id, (from_row, from_col), (to_row, to_col)))
+
+
+def apply_pikafish_legal_mask(
+    board_state: np.ndarray,
+    env: gym.Env,
+    pikafish_evaluator: Optional["PikafishEvaluator"],
+) -> Tuple[np.ndarray, bool, int]:
+    env_legal_actions = np.where(env.ally_actions == 1)[0]
+    if (
+        pikafish_evaluator is None
+        or not pikafish_evaluator.enabled
+        or len(env_legal_actions) == 0
+    ):
+        return env_legal_actions, False, 0
+
+    fen_before = board_to_uci_fen(board_state, side_to_move="w")
+    engine_legal_moves = pikafish_evaluator.list_legal_moves(fen_before)
+    if not engine_legal_moves:
+        return env_legal_actions, False, 0
+
+    engine_actions: List[int] = []
+    for move_str in engine_legal_moves:
+        action = engine_move_to_action(move_str, board_state)
+        if action is not None:
+            engine_actions.append(int(action))
+
+    if not engine_actions:
+        return env_legal_actions, False, len(engine_legal_moves)
+
+    unique_actions = np.array(sorted(set(engine_actions)), dtype=int)
+    env.ally_actions.fill(0)
+    env.ally_actions[unique_actions] = 1
+    return unique_actions, True, len(engine_legal_moves)
 
 
 def action_to_algebraic(action: int) -> str:
@@ -295,8 +363,13 @@ class CandidateEval:
     has_format: bool
     capture_value: float
     engine_reward: float
+    format_reward: float
     reasoning_quality: float
     reward: float
+    cp_before: Optional[float]
+    cp_after_raw: Optional[float]
+    cp_delta: Optional[float]
+    engine_eval_success: bool
     query_ids: torch.Tensor
     response_ids: torch.Tensor
 
@@ -361,6 +434,9 @@ def normalize_cp_delta_to_reward(cp_delta: float, cp_scale: float) -> float:
 
 
 class PikafishEvaluator:
+    """Communicate with Pikafish using raw (unbuffered) I/O so that
+    ``select()`` accurately reflects available data."""
+
     def __init__(
         self,
         binary_path: str,
@@ -370,32 +446,36 @@ class PikafishEvaluator:
         self.binary_path = binary_path
         self.depth = max(1, int(depth))
         self.timeout_sec = max(0.2, float(timeout_sec))
-        self.proc: Optional[subprocess.Popen[str]] = None
+        self.proc: Optional[subprocess.Popen[bytes]] = None
         self.enabled = False
         self.eval_file: Optional[str] = None
+        self._buf = b""
+        self.engine_dir: Optional[str] = None
 
         resolved = shutil.which(binary_path) if binary_path else None
         if not resolved:
             return
         self.binary_path = resolved
         engine_dir = os.path.dirname(self.binary_path)
+        self.engine_dir = engine_dir or None
         eval_candidate = os.path.join(engine_dir, "pikafish.nnue") if engine_dir else ""
         self.eval_file = eval_candidate if eval_candidate and os.path.isfile(eval_candidate) else None
+        self._launch()
+
+    def _launch(self) -> None:
         try:
             self.proc = subprocess.Popen(
                 [self.binary_path],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                cwd=engine_dir or None,
+                bufsize=0,
+                cwd=self.engine_dir,
             )
+            self._buf = b""
             if self.eval_file:
                 self._send(f"setoption name EvalFile value {self.eval_file}")
-            # This build responds reliably to isready even when uci is flaky on pipes.
-            self._send("isready")
-            if not self._read_until(lambda line: "readyok" in line.lower()):
+            if not self._sync_ready():
                 self.close()
                 return
             self.enabled = True
@@ -405,61 +485,137 @@ class PikafishEvaluator:
     def _send(self, command: str) -> None:
         if not self.proc or not self.proc.stdin:
             raise RuntimeError("Pikafish process is not available")
-        self.proc.stdin.write(command + "\n")
+        self.proc.stdin.write((command + "\n").encode())
         self.proc.stdin.flush()
+
+    def _read_lines(self, timeout: float) -> List[str]:
+        """Read all available lines within *timeout* seconds using raw I/O."""
+        deadline = time.time() + timeout
+        lines: List[str] = []
+        while time.time() < deadline:
+            remaining = max(deadline - time.time(), 0)
+            ready, _, _ = select.select([self.proc.stdout], [], [], min(remaining, 0.05))
+            if ready:
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                self._buf += chunk
+            while b"\n" in self._buf:
+                line_bytes, self._buf = self._buf.split(b"\n", 1)
+                lines.append(line_bytes.decode(errors="replace").strip())
+            if lines and lines[-1].lower().startswith("bestmove"):
+                break
+        return lines
 
     def _read_until(self, done_predicate) -> bool:
         if not self.proc or not self.proc.stdout:
             return False
         deadline = time.time() + self.timeout_sec
         while time.time() < deadline:
-            ready, _, _ = select.select([self.proc.stdout], [], [], 0.05)
-            if not ready:
-                continue
-            line = self.proc.stdout.readline()
-            if not line:
-                return False
-            if done_predicate(line.strip()):
-                return True
+            remaining = max(deadline - time.time(), 0)
+            ready, _, _ = select.select([self.proc.stdout], [], [], min(remaining, 0.05))
+            if ready:
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+                if not chunk:
+                    return False
+                self._buf += chunk
+            while b"\n" in self._buf:
+                line_bytes, self._buf = self._buf.split(b"\n", 1)
+                if done_predicate(line_bytes.decode(errors="replace").strip()):
+                    return True
         return False
+
+    def _sync_ready(self) -> bool:
+        if not self.proc or self.proc.poll() is not None:
+            return False
+        try:
+            self._send("isready")
+            return self._read_until(lambda line: "readyok" in line.lower())
+        except Exception:
+            return False
+
+    def _stop_search(self) -> None:
+        if not self.proc or self.proc.poll() is not None:
+            return
+        try:
+            self._send("stop")
+            self._read_until(lambda line: line.lower().startswith("bestmove"))
+        except Exception:
+            pass
+
+    def _restart(self) -> bool:
+        self.close()
+        self._launch()
+        return bool(self.enabled and self.proc and self.proc.poll() is None)
+
+    def list_legal_moves(self, fen: str) -> Optional[List[str]]:
+        if not self.enabled or not self.proc or self.proc.poll() is not None:
+            return None
+        for attempt in range(2):
+            try:
+                if attempt > 0 and not self._restart():
+                    return None
+                if not self._sync_ready():
+                    continue
+                self._send(f"position fen {fen}")
+                self._send("go perft 1")
+                lines = self._read_lines(self.timeout_sec)
+                if any("critical error" in text.lower() for text in lines):
+                    self._restart()
+                    continue
+                legal_moves: List[str] = []
+                for text in lines:
+                    match = ENGINE_PERFT_MOVE_RE.match(text)
+                    if match:
+                        legal_moves.append(match.group(1).lower())
+                if legal_moves:
+                    return legal_moves
+            except Exception:
+                self.enabled = False
+            if attempt == 0:
+                self.enabled = True
+        return None
 
     def evaluate_cp(self, fen: str, moves: Optional[List[str]] = None) -> Optional[float]:
         if not self.enabled or not self.proc or self.proc.poll() is not None:
             return None
         moves = moves or []
-        try:
-            position_cmd = f"position fen {fen}"
-            if moves:
-                position_cmd += " moves " + " ".join(moves)
-            self._send(position_cmd)
-            self._send(f"go depth {self.depth}")
-
-            latest_score: Optional[float] = None
-            if not self.proc.stdout:
-                return None
-            deadline = time.time() + self.timeout_sec
-            while time.time() < deadline:
-                ready, _, _ = select.select([self.proc.stdout], [], [], 0.05)
-                if not ready:
+        for attempt in range(2):
+            try:
+                if attempt > 0 and not self._restart():
+                    return None
+                if not self._sync_ready():
                     continue
-                line = self.proc.stdout.readline()
-                if not line:
-                    break
-                text = line.strip().lower()
-                cp_match = ENGINE_CP_RE.search(text)
-                if cp_match:
-                    latest_score = float(cp_match.group(1))
-                mate_match = ENGINE_MATE_RE.search(text)
-                if mate_match:
-                    mate_dist = int(mate_match.group(1))
-                    sign = 1.0 if mate_dist >= 0 else -1.0
-                    latest_score = sign * max(9000.0, 10000.0 - 100.0 * min(abs(mate_dist), 90))
-                if text.startswith("bestmove"):
-                    break
-            return latest_score
-        except Exception:
-            self.enabled = False
-            return None
+
+                position_cmd = f"position fen {fen}"
+                if moves:
+                    position_cmd += " moves " + " ".join(moves)
+                self._send(position_cmd)
+                self._send(f"go depth {self.depth}")
+
+                latest_score: Optional[float] = None
+                lines = self._read_lines(self.timeout_sec)
+                if any("critical error" in text.lower() for text in lines):
+                    self._restart()
+                    continue
+                for text in lines:
+                    text_lower = text.lower()
+                    cp_match = ENGINE_CP_RE.search(text_lower)
+                    if cp_match:
+                        latest_score = float(cp_match.group(1))
+                    mate_match = ENGINE_MATE_RE.search(text_lower)
+                    if mate_match:
+                        mate_dist = int(mate_match.group(1))
+                        sign = 1.0 if mate_dist >= 0 else -1.0
+                        latest_score = sign * max(9000.0, 10000.0 - 100.0 * min(abs(mate_dist), 90))
+                if latest_score is not None:
+                    return latest_score
+                self._stop_search()
+            except Exception:
+                self.enabled = False
+            if attempt == 0:
+                self.enabled = True
+        return None
 
     def close(self) -> None:
         if self.proc is None:
@@ -467,7 +623,7 @@ class PikafishEvaluator:
             return
         try:
             if self.proc.poll() is None and self.proc.stdin is not None:
-                self.proc.stdin.write("quit\n")
+                self.proc.stdin.write(b"quit\n")
                 self.proc.stdin.flush()
             self.proc.terminate()
         except Exception:
@@ -499,8 +655,13 @@ def evaluate_candidate_response(
     action = None
     capture_value = 0.0
     engine_reward = 0.0
+    format_reward = 0.0
     reasoning_quality = _reasoning_quality_score(response, enemy_move_desc)
     reward = 0.0
+    cp_before: Optional[float] = None
+    cp_after_raw: Optional[float] = None
+    cp_delta: Optional[float] = None
+    engine_eval_success = False
 
     if forced_action is not None:
         action = int(forced_action)
@@ -516,12 +677,16 @@ def evaluate_candidate_response(
         engine_reward = 5.5
         if pikafish_evaluator and pikafish_evaluator.enabled:
             fen_before = board_to_uci_fen(board_before, side_to_move="w")
+            engine_move = algebraic_to_engine_move(move_str)
             cp_before = pikafish_evaluator.evaluate_cp(fen_before, moves=None)
-            cp_after_raw = pikafish_evaluator.evaluate_cp(fen_before, moves=[move_str])
+            cp_after_raw = (
+                pikafish_evaluator.evaluate_cp(fen_before, moves=[engine_move]) if engine_move else None
+            )
             if cp_before is not None and cp_after_raw is not None:
                 cp_after_from_ally = -float(cp_after_raw)
                 cp_delta = cp_after_from_ally - float(cp_before)
                 engine_reward = normalize_cp_delta_to_reward(cp_delta, cp_scale=cp_scale)
+                engine_eval_success = True
         format_subscore = 0.0
         if has_format:
             format_subscore += 0.25
@@ -545,8 +710,13 @@ def evaluate_candidate_response(
         has_format=has_format,
         capture_value=capture_value,
         engine_reward=float(engine_reward),
+        format_reward=float(format_reward),
         reasoning_quality=float(reasoning_quality),
         reward=reward,
+        cp_before=None if cp_before is None else float(cp_before),
+        cp_after_raw=None if cp_after_raw is None else float(cp_after_raw),
+        cp_delta=None if cp_delta is None else float(cp_delta),
+        engine_eval_success=bool(engine_eval_success),
         query_ids=query_ids.cpu(),
         response_ids=response_ids.cpu(),
     )
@@ -590,6 +760,12 @@ def _fmt_metric(val: Any) -> str:
     if isinstance(val, float):
         return repr(val)
     return str(val)
+
+
+def _fmt_optional_float(val: Optional[float], precision: int = 3) -> str:
+    if val is None:
+        return "None"
+    return f"{float(val):.{precision}f}"
 
 
 def reset_episode_metrics_csv(filepath: str) -> None:
@@ -956,6 +1132,12 @@ class TurnResult:
     used_random_fallback: bool
     chosen_capture_value: float
     best_candidate_reward: float
+    chosen_engine_reward: float
+    chosen_format_reward: float
+    chosen_cp_before: Optional[float]
+    chosen_cp_after_raw: Optional[float]
+    chosen_cp_delta: Optional[float]
+    chosen_engine_eval_success: bool
     candidate_metrics: Dict[str, float]
     train_stats: Dict[str, float]
     chosen_response: str
@@ -1167,7 +1349,11 @@ class XiangqiAgent:
             format_count = 0
             reasoning_count = 0
             move_strings: List[str] = []
-            legal_actions = np.where(env.ally_actions == 1)[0]
+            legal_actions, using_pikafish_legality, engine_legal_count = apply_pikafish_legal_mask(
+                board_state=board_state,
+                env=env,
+                pikafish_evaluator=self.pikafish_evaluator,
+            )
             if len(legal_actions) == 0:
                 raise RuntimeError("XiangqiAgent: no legal ally moves available")
 
@@ -1202,11 +1388,13 @@ class XiangqiAgent:
             used_random_fallback = False
             chosen_capture = 0.0
             chosen_response = ""
+            chosen_eval: Optional[CandidateEval] = None
 
             if legal_evals:
                 best_reward = max(ev.reward for ev in legal_evals)
                 best_candidates = [ev for ev in legal_evals if ev.reward == best_reward]
                 chosen = random.choice(best_candidates)
+                chosen_eval = chosen
                 chosen_action = int(chosen.action)
                 chosen_move = str(chosen.move_str)
                 chosen_capture = float(chosen.capture_value)
@@ -1229,6 +1417,10 @@ class XiangqiAgent:
             response_batch = [ev.response_ids for ev in evals]
             reward_batch = [float(ev.reward) for ev in evals]
             train_stats = self.grpo_trainer.train_group(query_batch, response_batch, reward_batch)
+            successful_cp_deltas = [float(ev.cp_delta) for ev in legal_evals if ev.cp_delta is not None]
+            mean_cp_delta_success = (
+                float(np.mean(successful_cp_deltas)) if successful_cp_deltas else None
+            )
 
             candidate_metrics = {
                 "game/legal_move_rate": legal_count / max(1, len(evals)),
@@ -1240,8 +1432,22 @@ class XiangqiAgent:
                 "game/mean_engine_reward": float(np.mean([ev.engine_reward for ev in legal_evals]))
                 if legal_evals
                 else 0.0,
+                "game/mean_format_reward": float(np.mean([ev.format_reward for ev in legal_evals]))
+                if legal_evals
+                else 0.0,
+                "game/engine_eval_success_rate": float(
+                    np.mean([1.0 if ev.engine_eval_success else 0.0 for ev in legal_evals])
+                )
+                if legal_evals
+                else 0.0,
+                "game/mean_cp_delta_success": float(mean_cp_delta_success)
+                if mean_cp_delta_success is not None
+                else 0.0,
                 "game/move_diversity": len(set(move_strings)) / max(1, len(evals)),
                 "game/mean_best_candidate_reward": float(best_reward),
+                "game/using_pikafish_legality": 1.0 if using_pikafish_legality else 0.0,
+                "game/engine_legal_action_count": float(len(legal_actions)),
+                "game/engine_legal_move_count_raw": float(engine_legal_count),
             }
 
             log_board_sync(
@@ -1257,10 +1463,34 @@ class XiangqiAgent:
                         f"best_reward={best_reward:.4f}"
                     ),
                     (
+                        "Legality source: "
+                        f"{'pikafish' if using_pikafish_legality else 'env'} "
+                        f"(usable_actions={len(legal_actions)}, engine_list_count={engine_legal_count})"
+                    ),
+                    (
+                        "Candidate scoring: "
+                        f"mean_engine_reward={candidate_metrics['game/mean_engine_reward']:.4f} "
+                        f"mean_format_reward={candidate_metrics['game/mean_format_reward']:.4f} "
+                        f"engine_eval_success_rate={candidate_metrics['game/engine_eval_success_rate']:.3f} "
+                        f"mean_cp_delta_success={_fmt_optional_float(mean_cp_delta_success)}"
+                    ),
+                    (
                         f"Chosen move: {chosen_move} "
                         f"= {describe_action(chosen_action)}"
                     ),
                     f"Chosen response: {chosen_response}",
+                    (
+                        "Chosen scoring: "
+                        f"combined_reward={chosen_eval.reward:.4f} "
+                        f"engine_reward={chosen_eval.engine_reward:.4f} "
+                        f"format_reward={chosen_eval.format_reward:.4f} "
+                        f"engine_eval_success={int(chosen_eval.engine_eval_success)} "
+                        f"cp_before={_fmt_optional_float(chosen_eval.cp_before)} "
+                        f"cp_after_raw={_fmt_optional_float(chosen_eval.cp_after_raw)} "
+                        f"cp_delta={_fmt_optional_float(chosen_eval.cp_delta)}"
+                    )
+                    if chosen_eval is not None
+                    else "Chosen scoring: fallback legal move selected, no evaluated candidate chosen.",
                 ]
             )
 
@@ -1270,6 +1500,14 @@ class XiangqiAgent:
                 used_random_fallback=used_random_fallback,
                 chosen_capture_value=chosen_capture,
                 best_candidate_reward=float(best_reward),
+                chosen_engine_reward=float(chosen_eval.engine_reward) if chosen_eval is not None else 0.0,
+                chosen_format_reward=float(chosen_eval.format_reward) if chosen_eval is not None else 0.0,
+                chosen_cp_before=None if chosen_eval is None else chosen_eval.cp_before,
+                chosen_cp_after_raw=None if chosen_eval is None else chosen_eval.cp_after_raw,
+                chosen_cp_delta=None if chosen_eval is None else chosen_eval.cp_delta,
+                chosen_engine_eval_success=bool(chosen_eval.engine_eval_success)
+                if chosen_eval is not None
+                else False,
                 candidate_metrics=candidate_metrics,
                 train_stats=train_stats,
                 chosen_response=chosen_response,
@@ -1282,6 +1520,12 @@ class XiangqiAgent:
             used_random_fallback=False,
             chosen_capture_value=0.0,
             best_candidate_reward=0.0,
+            chosen_engine_reward=0.0,
+            chosen_format_reward=0.0,
+            chosen_cp_before=None,
+            chosen_cp_after_raw=None,
+            chosen_cp_delta=None,
+            chosen_engine_eval_success=False,
             candidate_metrics={},
             train_stats=train_stats,
             chosen_response="",
@@ -1585,6 +1829,10 @@ try:
             capture_series: List[float] = []
             best_reward_series: List[float] = []
             diversity_series: List[float] = []
+            engine_eval_success_series: List[float] = []
+            chosen_engine_reward_series: List[float] = []
+            chosen_format_reward_series: List[float] = []
+            chosen_cp_delta_series: List[float] = []
             train_stats_last: Dict[str, float] = {}
 
             print(f"\n[Ep {episode}] Opponent: GreedyEnemy")
@@ -1659,6 +1907,13 @@ try:
                 diversity_series.append(float(turn_result.candidate_metrics["game/move_diversity"]))
                 best_reward_series.append(float(turn_result.best_candidate_reward))
                 capture_series.append(float(turn_result.chosen_capture_value))
+                engine_eval_success_series.append(
+                    float(turn_result.candidate_metrics["game/engine_eval_success_rate"])
+                )
+                chosen_engine_reward_series.append(float(turn_result.chosen_engine_reward))
+                chosen_format_reward_series.append(float(turn_result.chosen_format_reward))
+                if turn_result.chosen_cp_delta is not None:
+                    chosen_cp_delta_series.append(float(turn_result.chosen_cp_delta))
 
                 train_stats_last = turn_result.train_stats
                 if turn_result.train_stats:
@@ -1678,10 +1933,41 @@ try:
                             "train/candidate_mean_engine_reward": turn_result.candidate_metrics[
                                 "game/mean_engine_reward"
                             ],
+                            "train/candidate_mean_format_reward": turn_result.candidate_metrics[
+                                "game/mean_format_reward"
+                            ],
+                            "train/candidate_engine_eval_success_rate": turn_result.candidate_metrics[
+                                "game/engine_eval_success_rate"
+                            ],
+                            "train/candidate_mean_cp_delta_success": turn_result.candidate_metrics[
+                                "game/mean_cp_delta_success"
+                            ],
+                            "train/using_pikafish_legality": turn_result.candidate_metrics[
+                                "game/using_pikafish_legality"
+                            ],
+                            "train/engine_legal_action_count": turn_result.candidate_metrics[
+                                "game/engine_legal_action_count"
+                            ],
+                            "train/engine_legal_move_count_raw": turn_result.candidate_metrics[
+                                "game/engine_legal_move_count_raw"
+                            ],
                             "train/best_candidate_reward": turn_result.best_candidate_reward,
                             "train/chosen_capture_value": turn_result.chosen_capture_value,
+                            "train/chosen_engine_reward": turn_result.chosen_engine_reward,
+                            "train/chosen_format_reward": turn_result.chosen_format_reward,
+                            "train/chosen_engine_eval_success": float(
+                                turn_result.chosen_engine_eval_success
+                            ),
                         }
                     )
+                    if turn_result.chosen_cp_before is not None:
+                        step_payload["train/chosen_cp_before"] = float(turn_result.chosen_cp_before)
+                    if turn_result.chosen_cp_after_raw is not None:
+                        step_payload["train/chosen_cp_after_raw"] = float(
+                            turn_result.chosen_cp_after_raw
+                        )
+                    if turn_result.chosen_cp_delta is not None:
+                        step_payload["train/chosen_cp_delta"] = float(turn_result.chosen_cp_delta)
                     wandb.log(step_payload)
 
                 round_idx += 1
@@ -1704,6 +1990,18 @@ try:
             move_diversity = float(np.mean(diversity_series)) if diversity_series else 0.0
             mean_capture = float(np.mean(capture_series)) if capture_series else 0.0
             mean_best_reward = float(np.mean(best_reward_series)) if best_reward_series else 0.0
+            mean_engine_eval_success_rate = (
+                float(np.mean(engine_eval_success_series)) if engine_eval_success_series else 0.0
+            )
+            mean_chosen_engine_reward = (
+                float(np.mean(chosen_engine_reward_series)) if chosen_engine_reward_series else 0.0
+            )
+            mean_chosen_format_reward = (
+                float(np.mean(chosen_format_reward_series)) if chosen_format_reward_series else 0.0
+            )
+            mean_chosen_cp_delta = (
+                float(np.mean(chosen_cp_delta_series)) if chosen_cp_delta_series else None
+            )
             random_rate_episode = (
                 100.0 * random_fallback_episode / ally_turns_episode if ally_turns_episode else 0.0
             )
@@ -1739,7 +2037,12 @@ try:
                 "game/mean_capture_value": mean_capture,
                 "game/mean_best_candidate_reward": mean_best_reward,
                 "game/move_diversity": move_diversity,
+                "game/engine_eval_success_rate": mean_engine_eval_success_rate,
+                "game/mean_chosen_engine_reward": mean_chosen_engine_reward,
+                "game/mean_chosen_format_reward": mean_chosen_format_reward,
             }
+            if mean_chosen_cp_delta is not None:
+                episode_stats["game/mean_chosen_cp_delta"] = mean_chosen_cp_delta
             wandb.log(episode_stats)
 
             csv_row = {
@@ -1772,7 +2075,11 @@ try:
                 f"ally_win_rate={episode_stats['game/ally_win_rate']:.1f}% "
                 f"enemy_win_rate={episode_stats['game/enemy_win_rate']:.1f}% "
                 f"legal_rate={legal_move_rate:.3f} format_rate={format_rate:.3f} "
-                f"reasoning_rate={reasoning_rate:.3f} mean_capture={mean_capture:.3f}"
+                f"reasoning_rate={reasoning_rate:.3f} mean_capture={mean_capture:.3f} "
+                f"engine_eval_success_rate={mean_engine_eval_success_rate:.3f} "
+                f"mean_chosen_engine_reward={mean_chosen_engine_reward:.3f} "
+                f"mean_chosen_format_reward={mean_chosen_format_reward:.3f} "
+                f"mean_chosen_cp_delta={_fmt_optional_float(mean_chosen_cp_delta)}"
             )
 
         if ckpt_every > 0 and episode % ckpt_every == 0:

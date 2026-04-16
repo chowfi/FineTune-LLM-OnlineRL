@@ -6,42 +6,38 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     # Core ML
     "torch==2.10.0",
-    "transformers==5.3.0",
+    # Unsloth (PyPI) supports transformers 4.51–4.57, not 5.x
+    "transformers==4.57.2",
     "peft==0.18.1",
     "accelerate==1.13.0",
     "bitsandbytes==0.49.2",
     "trl==0.29.0",
     "datasets==4.7.0",
-
     # RL environments
     "setuptools>=69.5.1,<82",  # pkg_resources (gym-xiangqi; removed in setuptools 82+)
     "gym==0.26.2",
     "gym-xiangqi==0.5.0",
     "gymnasium==0.29.1",
     "pygame==2.6.1",
-
     # Text adventure RL (notebook experiments)
     "textworld==1.7.0",
     "jericho==3.3.1",
     "llamagym==0.1.1",
     "spacy==3.8.11",
-
     # Logging & visualization
     "wandb==0.16.6",
     "matplotlib==3.10.8",
     "tqdm==4.67.3",
-
     # Data & science
     "numpy==1.26.4",
     "pandas==3.0.1",
     "scipy==1.17.1",
-
     # Notebook support
     "ipykernel==7.2.0",
     "ipython==9.11.0",
-
     # HuggingFace hub (notebook login)
-    "huggingface_hub==1.7.1",
+    "huggingface_hub==0.36.2",
+    "unsloth>=2025.11.1",
 ]
 
 [tool.uv]
@@ -51,7 +47,7 @@ override-dependencies = [
     "accelerate==1.13.0",
     "bitsandbytes==0.49.2",
     "peft==0.18.1",
-    "transformers==5.3.0",
+    "transformers==4.57.2",
     "trl==0.29.0",
 ]
 
