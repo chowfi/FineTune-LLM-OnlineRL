@@ -1,5 +1,5 @@
 """
-export PIKAFISH_BIN=/absolute/path/to/pikafish
+export PIKAFISH_BIN=/home/fchow/bin/pikafish
 7B / single 5090:
 torchrun --nproc_per_node 1 LLM_RL_agent_FSDP_v2.py --model-size 7b --mixed-precision
 14B / two 5090:
@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import time
 import traceback
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -361,6 +362,7 @@ class CandidateEval:
     legal: bool
     has_reasoning: bool
     has_format: bool
+    parsed_move_ok: bool
     capture_value: float
     engine_reward: float
     format_reward: float
@@ -392,28 +394,58 @@ def _extract_think_text(response: str) -> str:
     return match.group(1).strip()
 
 
-def _reasoning_quality_score(response: str, enemy_move_desc: Optional[str]) -> float:
+def _reasoning_quality_score(
+    response: str,
+    enemy_move_desc: Optional[str],
+    chosen_move: Optional[str] = None,
+    chosen_piece_name: Optional[str] = None,
+) -> float:
+    """Score how well the ``<think>`` block justifies the move that will be played.
+
+    The old implementation awarded points for generic keyword presence and any
+    move-like token, which the model easily gamed without actually describing
+    its own move. The new version only gives full credit when the reasoning
+    references the move (UCI string or source/target square or the piece type
+    name) that the candidate will actually execute.
+    """
     think = _extract_think_text(response).lower()
     if not think:
         return 0.0
 
     score = 0.0
-    if len(think.split()) >= 8:
-        score += 0.25
+    if len(think.split()) >= 12:
+        score += 0.2
     if any(token in think for token in THREAT_KEYWORDS):
-        score += 0.25
+        score += 0.15
 
     enemy_move_str = ""
     if enemy_move_desc:
         m = MOVE_IN_TEXT_RE.search(enemy_move_desc)
         if m:
             enemy_move_str = m.group(1).lower()
-    if any(token in think for token in ENEMY_KEYWORDS) or (enemy_move_str and enemy_move_str in think):
-        score += 0.25
+    if any(token in think for token in ENEMY_KEYWORDS) or (
+        enemy_move_str and enemy_move_str in think
+    ):
+        score += 0.15
 
-    if MOVE_IN_TEXT_RE.search(think):
-        score += 0.25
-    return min(score, 1.0)
+    # Big bucket: does the reasoning actually describe the move being played?
+    if chosen_move:
+        cm = chosen_move.lower()
+        from_sq, to_sq = cm[:2], cm[2:]
+        if cm in think:
+            score += 0.35
+        elif from_sq in think and to_sq in think:
+            score += 0.25
+        elif from_sq in think or to_sq in think:
+            score += 0.1
+    else:
+        # No move parsed from the response - no credit for referring to moves.
+        score += 0.0
+
+    if chosen_piece_name and chosen_piece_name.lower() in think:
+        score += 0.15
+
+    return float(min(score, 1.0))
 
 
 def _capture_value_for_move(board_before: np.ndarray, move_str: str) -> float:
@@ -433,15 +465,42 @@ def normalize_cp_delta_to_reward(cp_delta: float, cp_scale: float) -> float:
     return float(np.clip(reward, 1.0, 10.0))
 
 
+def adaptive_cp_scale(base_scale: float, cp_before: Optional[float]) -> float:
+    """Stretch the tanh normalisation by how extreme the current position is.
+
+    In a dead-lost or dead-won position the absolute |cp_before| can be several
+    thousand centipawns (including mate-inflated values near 9000-10000). With a
+    fixed scale of 250 the tanh saturates and every candidate move receives the
+    same reward, destroying the advantage signal. We widen the scale
+    proportionally to ``|cp_before|`` but cap it at ``2 * base_scale`` so it
+    never becomes so wide that every move in a lost position looks identical to
+    the engine reward.
+    """
+    base = max(10.0, float(base_scale))
+    if cp_before is None:
+        return base
+    widened = max(base, 0.2 * abs(float(cp_before)))
+    return min(widened, 2.0 * base)
+
+
 class PikafishEvaluator:
     """Communicate with Pikafish using raw (unbuffered) I/O so that
-    ``select()`` accurately reflects available data."""
+    ``select()`` accurately reflects available data.
+
+    Results are cached by ``(fen, moves_tuple)`` for ``evaluate_cp`` and by
+    ``fen`` for ``list_legal_moves`` so that the 16 candidates in a round that
+    share the same ``cp_before`` position only trigger one engine search.
+    The ``legal_moves`` call uses ``go perft 1`` (no depth search) while
+    ``evaluate_cp`` uses ``eval_depth`` for a higher-quality positional score.
+    """
 
     def __init__(
         self,
         binary_path: str,
         depth: int,
         timeout_sec: float = 2.0,
+        eval_cache_size: int = 20000,
+        legal_cache_size: int = 20000,
     ):
         self.binary_path = binary_path
         self.depth = max(1, int(depth))
@@ -451,6 +510,11 @@ class PikafishEvaluator:
         self.eval_file: Optional[str] = None
         self._buf = b""
         self.engine_dir: Optional[str] = None
+        self._eval_cache: "OrderedDict[Tuple[str, Tuple[str, ...]], float]" = OrderedDict()
+        self._legal_cache: "OrderedDict[str, Tuple[str, ...]]" = OrderedDict()
+        self._eval_cache_max = max(0, int(eval_cache_size))
+        self._legal_cache_max = max(0, int(legal_cache_size))
+        self._cache_stats = {"eval_hits": 0, "eval_misses": 0, "legal_hits": 0, "legal_misses": 0}
 
         resolved = shutil.which(binary_path) if binary_path else None
         if not resolved:
@@ -473,8 +537,23 @@ class PikafishEvaluator:
                 cwd=self.engine_dir,
             )
             self._buf = b""
+            # UCI: must send `uci` and wait for `uciok` before `setoption`. With EvalFile,
+            # setoption-before-uci leaves Pikafish not responding to `isready` (timeouts → disabled).
+            self._send("uci")
+            if not self._read_until(lambda line: "uciok" in line.lower()):
+                self.close()
+                return
             if self.eval_file:
-                self._send(f"setoption name EvalFile value {self.eval_file}")
+                # Pikafish can hang on `isready` after EvalFile is set to an absolute path; cwd is
+                # engine_dir so a basename (e.g. pikafish.nnue) is enough and responds quickly.
+                ev_arg = (
+                    os.path.basename(self.eval_file)
+                    if self.engine_dir
+                    and os.path.dirname(os.path.abspath(self.eval_file))
+                    == os.path.abspath(self.engine_dir)
+                    else self.eval_file
+                )
+                self._send(f"setoption name EvalFile value {ev_arg}")
             if not self._sync_ready():
                 self.close()
                 return
@@ -548,9 +627,33 @@ class PikafishEvaluator:
         self._launch()
         return bool(self.enabled and self.proc and self.proc.poll() is None)
 
+    def _cache_put_eval(self, key: Tuple[str, Tuple[str, ...]], value: float) -> None:
+        if self._eval_cache_max <= 0:
+            return
+        self._eval_cache[key] = value
+        self._eval_cache.move_to_end(key)
+        while len(self._eval_cache) > self._eval_cache_max:
+            self._eval_cache.popitem(last=False)
+
+    def _cache_put_legal(self, fen: str, value: Tuple[str, ...]) -> None:
+        if self._legal_cache_max <= 0:
+            return
+        self._legal_cache[fen] = value
+        self._legal_cache.move_to_end(fen)
+        while len(self._legal_cache) > self._legal_cache_max:
+            self._legal_cache.popitem(last=False)
+
+    def cache_stats(self) -> Dict[str, int]:
+        return dict(self._cache_stats)
+
     def list_legal_moves(self, fen: str) -> Optional[List[str]]:
+        if fen in self._legal_cache:
+            self._legal_cache.move_to_end(fen)
+            self._cache_stats["legal_hits"] += 1
+            return list(self._legal_cache[fen])
         if not self.enabled or not self.proc or self.proc.poll() is not None:
             return None
+        self._cache_stats["legal_misses"] += 1
         for attempt in range(2):
             try:
                 if attempt > 0 and not self._restart():
@@ -558,6 +661,7 @@ class PikafishEvaluator:
                 if not self._sync_ready():
                     continue
                 self._send(f"position fen {fen}")
+                # perft 1 is a move enumeration; depth search is not required for legality.
                 self._send("go perft 1")
                 lines = self._read_lines(self.timeout_sec)
                 if any("critical error" in text.lower() for text in lines):
@@ -569,6 +673,7 @@ class PikafishEvaluator:
                     if match:
                         legal_moves.append(match.group(1).lower())
                 if legal_moves:
+                    self._cache_put_legal(fen, tuple(legal_moves))
                     return legal_moves
             except Exception:
                 self.enabled = False
@@ -577,9 +682,16 @@ class PikafishEvaluator:
         return None
 
     def evaluate_cp(self, fen: str, moves: Optional[List[str]] = None) -> Optional[float]:
+        moves_tuple: Tuple[str, ...] = tuple(moves or ())
+        cache_key = (fen, moves_tuple)
+        cached = self._eval_cache.get(cache_key)
+        if cached is not None:
+            self._eval_cache.move_to_end(cache_key)
+            self._cache_stats["eval_hits"] += 1
+            return cached
         if not self.enabled or not self.proc or self.proc.poll() is not None:
             return None
-        moves = moves or []
+        self._cache_stats["eval_misses"] += 1
         for attempt in range(2):
             try:
                 if attempt > 0 and not self._restart():
@@ -588,8 +700,8 @@ class PikafishEvaluator:
                     continue
 
                 position_cmd = f"position fen {fen}"
-                if moves:
-                    position_cmd += " moves " + " ".join(moves)
+                if moves_tuple:
+                    position_cmd += " moves " + " ".join(moves_tuple)
                 self._send(position_cmd)
                 self._send(f"go depth {self.depth}")
 
@@ -609,6 +721,7 @@ class PikafishEvaluator:
                         sign = 1.0 if mate_dist >= 0 else -1.0
                         latest_score = sign * max(9000.0, 10000.0 - 100.0 * min(abs(mate_dist), 90))
                 if latest_score is not None:
+                    self._cache_put_eval(cache_key, latest_score)
                     return latest_score
                 self._stop_search()
             except Exception:
@@ -644,36 +757,63 @@ def evaluate_candidate_response(
     format_weight: float,
     forced_action: Optional[int] = None,
 ) -> CandidateEval:
+    """Evaluate a single LLM candidate.
+
+    The model now emits both ``<think>`` reasoning and ``Move: <uci>`` on its own.
+    ``forced_action`` is only honoured when the LLM failed to produce a parseable
+    legal move; in that case we still evaluate the fallback move but heavily
+    discount the reward so GRPO continues to push the policy toward self-picked
+    moves. Illegal/unparseable candidates receive a zero reward which gives
+    strong learning signal away from malformed outputs.
+    """
     has_reasoning = _extract_reasoning(response)
     parsed_move_str = _extract_move(response)
-    move_str = parsed_move_str
-    # Format compliance now focuses on structured <think> output; the move can be
-    # selected from legal actions by the harness.
-    has_format = has_reasoning
+    has_format = has_reasoning and parsed_move_str is not None
 
     legal = False
-    action = None
+    parsed_move_ok = False
+    action: Optional[int] = None
+    move_str: Optional[str] = parsed_move_str
+    used_forced = False
     capture_value = 0.0
     engine_reward = 0.0
     format_reward = 0.0
-    reasoning_quality = _reasoning_quality_score(response, enemy_move_desc)
     reward = 0.0
     cp_before: Optional[float] = None
     cp_after_raw: Optional[float] = None
     cp_delta: Optional[float] = None
     engine_eval_success = False
 
-    if forced_action is not None:
+    if parsed_move_str is not None:
+        candidate_action = algebraic_to_action(parsed_move_str, board_before, env)
+        if candidate_action is not None:
+            action = int(candidate_action)
+            move_str = parsed_move_str
+            parsed_move_ok = True
+    if action is None and forced_action is not None:
         action = int(forced_action)
         move_str = action_to_algebraic(action)
-    elif move_str is not None:
-        action = algebraic_to_action(move_str, board_before, env)
+        used_forced = True
+
+    chosen_piece_name: Optional[str] = None
+    if action is not None:
+        piece_id, _, _ = action_space_to_move(int(action))
+        if 0 <= piece_id < len(PIECE_ID_TO_NAME):
+            chosen_piece_name = PIECE_ID_TO_NAME[piece_id].split("_")[0]
+
+    reasoning_quality = _reasoning_quality_score(
+        response,
+        enemy_move_desc,
+        chosen_move=move_str,
+        chosen_piece_name=chosen_piece_name,
+    )
 
     if action is not None and move_str is not None:
         legal = True
         capture_value = _capture_value_for_move(board_before, move_str)
 
-        # Illegal moves always score 0. Legal moves map to [1, 10].
+        # Baseline neutral engine reward; tanh of cp_delta overrides when the
+        # engine is available.
         engine_reward = 5.5
         if pikafish_evaluator and pikafish_evaluator.enabled:
             fen_before = board_to_uci_fen(board_before, side_to_move="w")
@@ -685,17 +825,28 @@ def evaluate_candidate_response(
             if cp_before is not None and cp_after_raw is not None:
                 cp_after_from_ally = -float(cp_after_raw)
                 cp_delta = cp_after_from_ally - float(cp_before)
-                engine_reward = normalize_cp_delta_to_reward(cp_delta, cp_scale=cp_scale)
+                effective_scale = adaptive_cp_scale(cp_scale, cp_before)
+                engine_reward = normalize_cp_delta_to_reward(cp_delta, cp_scale=effective_scale)
                 engine_eval_success = True
+
+        # Format reward: mostly reasoning quality now that the move is tied into
+        # the scorer. We still require the <think> tags and the Move: line for
+        # maximum credit.
         format_subscore = 0.0
-        if has_format:
-            format_subscore += 0.25
         if has_reasoning:
-            format_subscore += 0.25
-        format_subscore += 0.5 * reasoning_quality
-        format_reward = 1.0 + 9.0 * min(format_subscore, 1.0)
+            format_subscore += 0.2
+        if parsed_move_ok:
+            format_subscore += 0.2
+        format_subscore += 0.6 * reasoning_quality
+        format_reward = 1.0 + 9.0 * float(min(format_subscore, 1.0))
+
         mix = float(np.clip(format_weight, 0.0, 0.8))
         reward = (1.0 - mix) * engine_reward + mix * format_reward
+
+        # Discourage relying on the forced fallback: give only 30% of the
+        # reward when the LLM didn't produce a parseable legal move of its own.
+        if used_forced:
+            reward *= 0.3
 
     response_ids = tokenizer(response, return_tensors="pt", add_special_tokens=False).input_ids[0]
     if response_ids.numel() == 0:
@@ -708,6 +859,7 @@ def evaluate_candidate_response(
         legal=legal,
         has_reasoning=has_reasoning,
         has_format=has_format,
+        parsed_move_ok=parsed_move_ok,
         capture_value=capture_value,
         engine_reward=float(engine_reward),
         format_reward=float(format_reward),
@@ -864,9 +1016,30 @@ class MFUTracker:
             "mfu/peak_tflops": float(self.gpu_peak_tflops),
             "mfu/total_tokens_step": float(total_tokens),
             "mfu/step_time_sec": float(elapsed_sec),
+            "mfu/mfu_flops_step": float(mfu_flops),
+            "mfu/hfu_flops_step": float(hfu_flops),
         }
         self.history.append(stats)
         return stats
+
+    def generation_flops(
+        self,
+        num_sequences: int,
+        prompt_len: int,
+        generated_len: int,
+    ) -> float:
+        """Rough FLOP estimate for an autoregressive generate() call.
+
+        Uses the standard 2P-per-token approximation: prefill costs ~2P per
+        prompt token and each decoded token costs ~2P (KV-cache amortizes the
+        attention-to-past, we do not count it separately here). Returns a
+        single scalar summed over all sequences in the batch.
+        """
+        if num_sequences <= 0 or (prompt_len + generated_len) <= 0:
+            return 0.0
+        return float(
+            2.0 * float(self.total_params) * float(num_sequences) * float(prompt_len + generated_len)
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -925,6 +1098,7 @@ class GRPOTrainerOnline:
         max_grad_norm: float,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         optimizer_name: str = "adamw_8bit",
+        logprob_micro_batch: int = 4,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -933,6 +1107,7 @@ class GRPOTrainerOnline:
         self.kl_penalty_min = kl_penalty_min
         self.kl_penalty_max = kl_penalty_max
         self.max_grad_norm = max_grad_norm
+        self.logprob_micro_batch = max(1, int(logprob_micro_batch))
         self.optimizer = _build_optimizer(model, lr=lr, optimizer_name=optimizer_name)
 
         unwrapped = unwrap_model(model)
@@ -954,6 +1129,52 @@ class GRPOTrainerOnline:
         log_probs = F.log_softmax(response_logits.float(), dim=-1)
         token_log_probs = log_probs.gather(1, response_ids.to(self.device).unsqueeze(1)).squeeze(1)
         return token_log_probs.sum()
+
+    def _compute_response_log_probs_batch(
+        self,
+        queries: List[torch.Tensor],
+        responses: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """Summed response log-probabilities for a micro-batch in one forward pass.
+
+        Sequences are left-padded to the common length so every response ends
+        at column ``max_total - 1`` and can be sliced uniformly. Padding is
+        masked out via ``attention_mask`` so it never contributes gradients.
+        Returns a tensor of shape ``(G,)``.
+        """
+        G = len(queries)
+        q_lens = [int(q.numel()) for q in queries]
+        r_lens = [int(r.numel()) for r in responses]
+        max_total = max(q + r for q, r in zip(q_lens, r_lens))
+        pad_id = int(self.tokenizer.pad_token_id)
+
+        input_ids = torch.full((G, max_total), pad_id, dtype=torch.long, device=self.device)
+        attention_mask = torch.zeros((G, max_total), dtype=torch.long, device=self.device)
+        resp_tokens_padded = torch.zeros((G, max_total), dtype=torch.long, device=self.device)
+        resp_lens = torch.tensor(r_lens, dtype=torch.long, device=self.device)
+
+        for i, (q, r) in enumerate(zip(queries, responses)):
+            seq = torch.cat([q, r]).to(self.device, dtype=torch.long)
+            L = seq.numel()
+            input_ids[i, max_total - L:] = seq
+            attention_mask[i, max_total - L:] = 1
+            resp_tokens_padded[i, max_total - r.numel():] = r.to(self.device, dtype=torch.long)
+
+        logits = self.model(input_ids=input_ids, attention_mask=attention_mask).logits
+        # Shift by one so that column ``t-1`` predicts token at position ``t``.
+        shifted = logits[:, :-1, :]
+        log_probs = F.log_softmax(shifted.float(), dim=-1)
+        # Align target tokens with the shifted positions.
+        target = resp_tokens_padded[:, 1:]
+        token_lp = log_probs.gather(2, target.unsqueeze(-1)).squeeze(-1)  # (G, max_total - 1)
+        # ``shifted[p]`` predicts the token at absolute position ``p + 1``. The
+        # response occupies positions ``[max_total - r_len, max_total - 1]`` so
+        # the relevant shifted indices are ``[max_total - r_len - 1, max_total - 2]``.
+        pos = torch.arange(max_total - 1, device=self.device).unsqueeze(0)  # (1, L-1)
+        resp_pred_start = (max_total - resp_lens - 1).unsqueeze(1)  # (G, 1)
+        response_mask = (pos >= resp_pred_start).to(token_lp.dtype)
+        summed = (token_lp * response_mask).sum(dim=1)
+        return summed
 
     def _toggle_adapters(self, enable: bool) -> None:
         unwrapped = unwrap_model(self.model)
@@ -1045,40 +1266,106 @@ class GRPOTrainerOnline:
         self.model.train()
         self.optimizer.zero_grad()
 
+        n = len(query_ids_batch)
+        advantages_dev = advantages.to(self.device)
+
         total_loss = 0.0
         total_kl = 0.0
         total_kl_penalty = 0.0
-        n = len(query_ids_batch)
         samples_ok = 0
 
-        for idx in range(n):
-            q = query_ids_batch[idx]
-            r = response_ids_batch[idx]
-            adv = advantages[idx].to(self.device)
+        def _process_micro(start_idx: int, end_idx: int) -> bool:
+            nonlocal total_loss, total_kl, total_kl_penalty, samples_ok
+            qs = [query_ids_batch[i] for i in range(start_idx, end_idx)]
+            rs = [response_ids_batch[i] for i in range(start_idx, end_idx)]
+            adv_slice = advantages_dev[start_idx:end_idx]
             try:
                 with torch.no_grad():
                     self._toggle_adapters(enable=False)
-                    ref_log_prob = self._compute_response_log_probs(q, r)
+                    ref_lp = self._compute_response_log_probs_batch(qs, rs)
                     self._toggle_adapters(enable=True)
-                cur_log_prob = self._compute_response_log_probs(q, r)
+                cur_lp = self._compute_response_log_probs_batch(qs, rs)
 
-                kl_raw = cur_log_prob - ref_log_prob
-                # Clamp per-sample KL contribution to avoid runaway policy drift.
-                kl_penalty = torch.clamp(kl_raw, min=self.kl_penalty_min, max=self.kl_penalty_max)
-                sample_loss = (-adv * cur_log_prob + self.beta * kl_penalty) / n
-                sample_loss.backward()
+                kl_raw = cur_lp - ref_lp  # (g,)
+                kl_pen = torch.clamp(kl_raw, min=self.kl_penalty_min, max=self.kl_penalty_max)
+                loss_per = -adv_slice * cur_lp + self.beta * kl_pen  # (g,)
+                group_loss = loss_per.sum() / n
+                group_loss.backward()
 
-                total_loss += float(sample_loss.item())
-                total_kl += float(kl_raw.item())
-                total_kl_penalty += float(kl_penalty.item())
-                samples_ok += 1
+                total_loss += float(group_loss.item())
+                total_kl += float(kl_raw.sum().item())
+                total_kl_penalty += float(kl_pen.sum().item())
+                samples_ok += (end_idx - start_idx)
+                return True
             except torch.cuda.OutOfMemoryError:
-                if rank == 0:
-                    print(f"[GRPO] CUDA OOM on sample {idx + 1}/{n}, skipping sample.")
                 self._toggle_adapters(enable=True)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                continue
+                return False
+
+        micro = max(1, int(self.logprob_micro_batch))
+        oom_retries_left = 3
+        while True:
+            self.optimizer.zero_grad()
+            total_loss = 0.0
+            total_kl = 0.0
+            total_kl_penalty = 0.0
+            samples_ok = 0
+
+            step_oom = False
+            for start_idx in range(0, n, micro):
+                end_idx = min(start_idx + micro, n)
+                if not _process_micro(start_idx, end_idx):
+                    if rank == 0:
+                        print(
+                            f"[GRPO] CUDA OOM on log-prob micro-batch size {end_idx - start_idx}"
+                            f" (current micro={micro}); retrying step with a smaller micro size."
+                        )
+                    step_oom = True
+                    break
+
+            if not step_oom:
+                break
+            if micro <= 1 or oom_retries_left <= 0:
+                # Final fallback: fully sequential per-sample (guaranteed to fit
+                # if any generation fit) with gradient accumulation.
+                if rank == 0:
+                    print("[GRPO] Falling back to fully sequential per-sample log-prob pass.")
+                self.optimizer.zero_grad()
+                total_loss = 0.0
+                total_kl = 0.0
+                total_kl_penalty = 0.0
+                samples_ok = 0
+                for idx in range(n):
+                    q = query_ids_batch[idx]
+                    r = response_ids_batch[idx]
+                    adv = advantages_dev[idx]
+                    try:
+                        with torch.no_grad():
+                            self._toggle_adapters(enable=False)
+                            ref_log_prob = self._compute_response_log_probs(q, r)
+                            self._toggle_adapters(enable=True)
+                        cur_log_prob = self._compute_response_log_probs(q, r)
+                        kl_raw = cur_log_prob - ref_log_prob
+                        kl_penalty = torch.clamp(
+                            kl_raw, min=self.kl_penalty_min, max=self.kl_penalty_max
+                        )
+                        sample_loss = (-adv * cur_log_prob + self.beta * kl_penalty) / n
+                        sample_loss.backward()
+                        total_loss += float(sample_loss.item())
+                        total_kl += float(kl_raw.item())
+                        total_kl_penalty += float(kl_penalty.item())
+                        samples_ok += 1
+                    except torch.cuda.OutOfMemoryError:
+                        if rank == 0:
+                            print(f"[GRPO] CUDA OOM on sample {idx + 1}/{n}; skipping.")
+                        self._toggle_adapters(enable=True)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+                break
+            micro = max(1, micro // 2)
+            oom_retries_left -= 1
 
         if samples_ok == 0:
             self.optimizer.zero_grad()
@@ -1141,6 +1428,7 @@ class TurnResult:
     candidate_metrics: Dict[str, float]
     train_stats: Dict[str, float]
     chosen_response: str
+    generation_stats: Dict[str, float]
 
 
 class XiangqiAgent:
@@ -1157,6 +1445,10 @@ class XiangqiAgent:
         pikafish_evaluator: Optional[PikafishEvaluator],
         reward_cp_scale: float,
         reward_format_weight: float,
+        reward_format_weight_min: float = 0.05,
+        reward_format_weight_anneal_start: float = 0.9,
+        reward_format_weight_anneal_end: float = 0.98,
+        reward_format_compliance_ema_alpha: float = 0.1,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -1169,6 +1461,52 @@ class XiangqiAgent:
         self.pikafish_evaluator = pikafish_evaluator
         self.reward_cp_scale = float(reward_cp_scale)
         self.reward_format_weight = float(reward_format_weight)
+        self.reward_format_weight_min = float(reward_format_weight_min)
+        self.reward_format_weight_anneal_start = float(reward_format_weight_anneal_start)
+        self.reward_format_weight_anneal_end = float(reward_format_weight_anneal_end)
+        self.reward_format_compliance_ema_alpha = float(reward_format_compliance_ema_alpha)
+        # Start the EMA at 0 so the full format_weight is used until the model
+        # has demonstrated consistent compliance across multiple rounds.
+        self._format_compliance_ema: float = 0.0
+        self._format_compliance_ema_initialized: bool = False
+        self._last_generation_stats: Dict[str, float] = {
+            "num_sequences": 0.0,
+            "prompt_len": 0.0,
+            "generated_len": 0.0,
+            "wall_sec": 0.0,
+        }
+
+    def _current_format_weight(self) -> float:
+        """Linearly anneal format_weight toward ``reward_format_weight_min`` as
+        the rolling (EMA) per-round format-compliance rate grows past
+        ``reward_format_weight_anneal_start`` and down to
+        ``reward_format_weight_min`` at ``reward_format_weight_anneal_end``.
+        """
+        start = self.reward_format_weight_anneal_start
+        end = self.reward_format_weight_anneal_end
+        high = self.reward_format_weight
+        low = max(0.0, self.reward_format_weight_min)
+        if end <= start or high <= low:
+            return high
+        compliance = self._format_compliance_ema
+        if compliance <= start:
+            return high
+        if compliance >= end:
+            return low
+        # Linear interpolation between (start, high) and (end, low)
+        t = (compliance - start) / (end - start)
+        return float(high + t * (low - high))
+
+    def _update_format_compliance_ema(self, round_format_rate: float) -> None:
+        rate = float(np.clip(round_format_rate, 0.0, 1.0))
+        alpha = float(np.clip(self.reward_format_compliance_ema_alpha, 1e-4, 1.0))
+        if not self._format_compliance_ema_initialized:
+            self._format_compliance_ema = rate
+            self._format_compliance_ema_initialized = True
+        else:
+            self._format_compliance_ema = (
+                (1.0 - alpha) * self._format_compliance_ema + alpha * rate
+            )
 
     def _set_generation_checkpointing(self, enable: bool) -> None:
         model = unwrap_model(self.model)
@@ -1204,28 +1542,38 @@ class XiangqiAgent:
 
     def system_prompt(self) -> str:
         return (
-            "You are a Xiangqi (Chinese Chess) player.\n"
-            "Your pieces are uppercase, enemy pieces are lowercase.\n"
-            "K=General A=Advisor B=Elephant N=Horse R=Chariot C=Cannon P=Soldier.\n\n"
-            "In <think>, include: enemy's last move impact, your tactical threat, and enemy counterplay risk.\n"
-            "Do not output a move; only output tactical reasoning.\n\n"
-            "Respond exactly as:\n"
-            "<think>brief tactical reasoning</think>"
+            "You are a Xiangqi (Chinese Chess) player. You always play the uppercase side.\n"
+            "Piece letters: K=General A=Advisor B=Elephant N=Horse R=Chariot C=Cannon P=Soldier.\n"
+            "Coordinates: files a-i (left to right), ranks 0-9 (top to bottom as shown in the graphic).\n"
+            "A move is written as <from_file><from_rank><to_file><to_rank>, e.g. b7e7.\n\n"
+            "In <think>, briefly state: (1) the impact of the enemy's last move, (2) the piece you will move\n"
+            "and why, (3) the enemy's most dangerous reply. Then output exactly one legal move on its own line.\n\n"
+            "Respond exactly in this format (two lines, nothing else):\n"
+            "<think>your tactical reasoning referring to the piece and squares of the move you will play</think>\n"
+            "Move: <from><to>"
         )
 
     def format_turn_prompt(
         self,
         board_state: np.ndarray,
         enemy_move_desc: Optional[str],
+        legal_moves_hint: Optional[List[str]] = None,
     ) -> List[Dict[str, str]]:
         fen = board_to_fen(board_state)
         graphic = board_to_graphic(board_state)
         prefix = f"Enemy previous move: {enemy_move_desc}\n" if enemy_move_desc else "Enemy previous move: none\n"
+        # Hint only a trimmed list to avoid ballooning prompt tokens.
+        hint_line = ""
+        if legal_moves_hint:
+            trimmed = legal_moves_hint[:48]
+            more = "" if len(legal_moves_hint) <= 48 else f" (+{len(legal_moves_hint) - 48} more)"
+            hint_line = f"Legal moves (subset): {' '.join(trimmed)}{more}\n"
         user_msg = (
             f"{prefix}"
             f"Current board FEN: {fen}\n"
             f"Current board graphic:\n{graphic}\n"
-            "Provide tactical reasoning for the best plan."
+            f"{hint_line}"
+            "Pick the single best legal move for the uppercase side and output reasoning + move."
         )
         return [
             {"role": "system", "content": self.system_prompt()},
@@ -1238,9 +1586,12 @@ class XiangqiAgent:
         enemy_move_desc: Optional[str],
         episode: int,
         round_idx: int,
+        legal_moves_hint: Optional[List[str]] = None,
     ) -> Tuple[Optional[torch.Tensor], List[str], str, str]:
         if rank == 0:
-            messages = self.format_turn_prompt(board_state, enemy_move_desc)
+            messages = self.format_turn_prompt(
+                board_state, enemy_move_desc, legal_moves_hint=legal_moves_hint
+            )
             prompt_text = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
@@ -1264,6 +1615,9 @@ class XiangqiAgent:
         decoded: List[str] = []
         context_len = 0
         attempt_used: Optional[Tuple[int, int]] = None
+        generated_len_used = 0
+        num_sequences_used = 0
+        gen_total_wall_sec = 0.0
 
         self._set_generation_checkpointing(enable=False)
         try:
@@ -1276,6 +1630,9 @@ class XiangqiAgent:
 
                 local_success = True
                 outputs = None
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                attempt_start = time.perf_counter()
                 try:
                     with torch.no_grad():
                         outputs = generate_model.generate(
@@ -1290,6 +1647,9 @@ class XiangqiAgent:
                     local_success = False
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                gen_total_wall_sec += time.perf_counter() - attempt_start
 
                 success = self._sync_success_all_ranks(local_success)
                 if not success:
@@ -1309,9 +1669,18 @@ class XiangqiAgent:
                     out_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
                 )
                 attempt_used = (num_generations, max_new_tokens)
+                generated_len_used = int(out_tokens.shape[1])
+                num_sequences_used = int(outputs.shape[0])
                 break
         finally:
             self._set_generation_checkpointing(enable=True)
+
+        self._last_generation_stats = {
+            "num_sequences": float(num_sequences_used),
+            "prompt_len": float(context_len),
+            "generated_len": float(generated_len_used),
+            "wall_sec": float(gen_total_wall_sec),
+        }
 
         if rank == 0:
             if attempt_used is not None:
@@ -1336,19 +1705,11 @@ class XiangqiAgent:
         episode: int,
         round_idx: int,
     ) -> TurnResult:
-        query_ids, responses, fen, graphic = self._generate_candidates(
-            board_state=board_state,
-            enemy_move_desc=enemy_move_desc,
-            episode=episode,
-            round_idx=round_idx,
-        )
-
+        legal_actions: np.ndarray = np.array([], dtype=int)
+        using_pikafish_legality = False
+        engine_legal_count = 0
+        legal_moves_hint: Optional[List[str]] = None
         if rank == 0:
-            evals: List[CandidateEval] = []
-            legal_count = 0
-            format_count = 0
-            reasoning_count = 0
-            move_strings: List[str] = []
             legal_actions, using_pikafish_legality, engine_legal_count = apply_pikafish_legal_mask(
                 board_state=board_state,
                 env=env,
@@ -1356,12 +1717,32 @@ class XiangqiAgent:
             )
             if len(legal_actions) == 0:
                 raise RuntimeError("XiangqiAgent: no legal ally moves available")
+            # Shuffle to avoid positional bias when we have to trim the hint list.
+            hint_actions = list(legal_actions)
+            random.shuffle(hint_actions)
+            legal_moves_hint = [action_to_algebraic(int(a)) for a in hint_actions]
 
+        query_ids, responses, fen, graphic = self._generate_candidates(
+            board_state=board_state,
+            enemy_move_desc=enemy_move_desc,
+            episode=episode,
+            round_idx=round_idx,
+            legal_moves_hint=legal_moves_hint,
+        )
+
+        if rank == 0:
+            evals: List[CandidateEval] = []
+            legal_count = 0
+            format_count = 0
+            reasoning_count = 0
+            move_parsed_count = 0
+            move_strings: List[str] = []
+
+            effective_format_weight = self._current_format_weight()
             for response in responses:
                 clipped_query = query_ids
                 if clipped_query.numel() > self.max_train_query_ctx:
                     clipped_query = clipped_query[-self.max_train_query_ctx :]
-                forced_action = int(np.random.choice(legal_actions))
                 ev = evaluate_candidate_response(
                     response=response,
                     board_before=board_state,
@@ -1371,8 +1752,8 @@ class XiangqiAgent:
                     enemy_move_desc=enemy_move_desc,
                     pikafish_evaluator=self.pikafish_evaluator,
                     cp_scale=self.reward_cp_scale,
-                    format_weight=self.reward_format_weight,
-                    forced_action=forced_action,
+                    format_weight=effective_format_weight,
+                    forced_action=None,
                 )
                 evals.append(ev)
                 if ev.legal:
@@ -1381,6 +1762,8 @@ class XiangqiAgent:
                     format_count += 1
                 if ev.has_reasoning:
                     reasoning_count += 1
+                if ev.parsed_move_ok:
+                    move_parsed_count += 1
                 if ev.move_str is not None:
                     move_strings.append(ev.move_str)
 
@@ -1422,9 +1805,15 @@ class XiangqiAgent:
                 float(np.mean(successful_cp_deltas)) if successful_cp_deltas else None
             )
 
+            round_format_rate = format_count / max(1, len(evals))
+            self._update_format_compliance_ema(round_format_rate)
+
             candidate_metrics = {
                 "game/legal_move_rate": legal_count / max(1, len(evals)),
-                "game/format_compliance_rate": format_count / max(1, len(evals)),
+                "game/parsed_move_rate": move_parsed_count / max(1, len(evals)),
+                "game/format_compliance_rate": round_format_rate,
+                "game/format_compliance_ema": float(self._format_compliance_ema),
+                "game/effective_format_weight": float(effective_format_weight),
                 "game/reasoning_rate": reasoning_count / max(1, len(evals)),
                 "game/reasoning_quality_rate": float(np.mean([ev.reasoning_quality for ev in evals]))
                 if evals
@@ -1511,6 +1900,7 @@ class XiangqiAgent:
                 candidate_metrics=candidate_metrics,
                 train_stats=train_stats,
                 chosen_response=chosen_response,
+                generation_stats=dict(self._last_generation_stats),
             )
 
         train_stats = self.grpo_trainer.train_group(None, None, None)
@@ -1529,6 +1919,7 @@ class XiangqiAgent:
             candidate_metrics={},
             train_stats=train_stats,
             chosen_response="",
+            generation_stats=dict(self._last_generation_stats),
         )
 
 
@@ -1544,9 +1935,9 @@ MODEL_REGISTRY = {
 hyperparams = {
     "model_name": MODEL_REGISTRY[args.model_size],
     "env": "gym_xiangqi:xiangqi-v0",
-    "max_seq_length": 512,
-    "max_prompt_length": 256,
-    "max_train_query_ctx": 256,
+    "max_seq_length": 1024,
+    "max_prompt_length": 384,
+    "max_train_query_ctx": 384,
     "lora/r": 32,
     "lora/lora_alpha": 32,
     "lora/lora_dropout": 0.0,
@@ -1559,17 +1950,21 @@ hyperparams = {
         "up_proj",
         "down_proj",
     ],
-    "grpo/num_generations": 6,
-    "grpo/lr": 2e-6,
+    "grpo/num_generations": 16,
+    "grpo/lr": 6e-6,
     "grpo/beta": 0.1,
     "grpo/kl_penalty_min": 0.0,
     "grpo/kl_penalty_max": 10.0,
     "grpo/max_grad_norm": 0.1,
     "grpo/optim": "adamw_8bit",
-    "generate/max_new_tokens": 200,
+    "generate/max_new_tokens": 384,
     "generate/do_sample": True,
-    "generate/temperature": 0.8,
+    # Slightly higher sampling temperature + a mild repetition penalty discourage
+    # the 8 candidates from collapsing onto a single move, which was previously
+    # destroying GRPO's group-relative advantage signal.
+    "generate/temperature": 1.0,
     "generate/top_p": 0.95,
+    "generate/repetition_penalty": 1.1,
     "episodes": 500,
     "max_rounds_per_episode": 200,
     "seed": 42069,
@@ -1578,10 +1973,24 @@ hyperparams = {
     "checkpoint/every_n_episodes": 25,
     "checkpoint/load_adapter_path": "",
     "pikafish/bin": os.environ.get("PIKAFISH_BIN", "/home/fchow/bin/pikafish"),
-    "pikafish/depth": 8,
-    "pikafish/timeout_sec": 2.0,
+    # Positional cp evaluation uses a deeper search for cleaner reward signal;
+    # ``list_legal_moves`` always uses ``go perft 1`` internally and ignores
+    # this depth.
+    "pikafish/depth": 12,
+    "pikafish/timeout_sec": 2.5,
     "reward/engine_cp_scale": 250.0,
     "reward/format_weight": 0.2,
+    # Once the rolling format-compliance rate crosses
+    # ``reward/format_weight_anneal_start`` the effective format weight decays
+    # linearly toward ``reward/format_weight_min`` (reached at
+    # ``reward/format_weight_anneal_end``). This keeps the format bonus useful
+    # while the model is still learning the <think>/Move: template, but lets
+    # the engine signal dominate once compliance is a solved problem.
+    "reward/format_weight_min": 0.05,
+    "reward/format_weight_anneal_start": 0.9,
+    "reward/format_weight_anneal_end": 0.98,
+    "reward/format_compliance_ema_alpha": 0.1,
+    "grpo/logprob_micro_batch": 4,
 }
 
 if args.episodes is not None:
@@ -1742,6 +2151,7 @@ grpo_trainer = GRPOTrainerOnline(
     max_grad_norm=float(hyperparams["grpo/max_grad_norm"]),
     mp_policy=mp_policy,
     optimizer_name=str(hyperparams["grpo/optim"]),
+    logprob_micro_batch=int(hyperparams.get("grpo/logprob_micro_batch", 4)),
 )
 
 generate_config = {
@@ -1749,6 +2159,7 @@ generate_config = {
     "do_sample": bool(hyperparams["generate/do_sample"]),
     "temperature": float(hyperparams["generate/temperature"]),
     "top_p": float(hyperparams["generate/top_p"]),
+    "repetition_penalty": float(hyperparams.get("generate/repetition_penalty", 1.0)),
     "pad_token_id": tokenizer.pad_token_id,
     "eos_token_id": tokenizer.eos_token_id,
 }
@@ -1783,6 +2194,16 @@ ally_agent = XiangqiAgent(
     pikafish_evaluator=pikafish_evaluator if rank == 0 else None,
     reward_cp_scale=float(hyperparams["reward/engine_cp_scale"]),
     reward_format_weight=float(hyperparams["reward/format_weight"]),
+    reward_format_weight_min=float(hyperparams["reward/format_weight_min"]),
+    reward_format_weight_anneal_start=float(
+        hyperparams["reward/format_weight_anneal_start"]
+    ),
+    reward_format_weight_anneal_end=float(
+        hyperparams["reward/format_weight_anneal_end"]
+    ),
+    reward_format_compliance_ema_alpha=float(
+        hyperparams["reward/format_compliance_ema_alpha"]
+    ),
 )
 enemy_agent = GreedyEnemyAgent()
 
@@ -1834,6 +2255,12 @@ try:
             chosen_format_reward_series: List[float] = []
             chosen_cp_delta_series: List[float] = []
             train_stats_last: Dict[str, float] = {}
+            episode_train_mfu_flops = 0.0
+            episode_train_hfu_flops = 0.0
+            episode_gen_flops = 0.0
+            episode_train_wall_sec = 0.0
+            episode_gen_wall_sec = 0.0
+            episode_wall_start = time.perf_counter()
 
             print(f"\n[Ep {episode}] Opponent: GreedyEnemy")
 
@@ -1916,6 +2343,27 @@ try:
                     chosen_cp_delta_series.append(float(turn_result.chosen_cp_delta))
 
                 train_stats_last = turn_result.train_stats
+
+                gen_stats_turn = turn_result.generation_stats or {}
+                if gen_stats_turn.get("num_sequences", 0.0) > 0.0:
+                    episode_gen_flops += ally_agent.grpo_trainer.mfu_tracker.generation_flops(
+                        num_sequences=int(gen_stats_turn.get("num_sequences", 0.0)),
+                        prompt_len=int(gen_stats_turn.get("prompt_len", 0.0)),
+                        generated_len=int(gen_stats_turn.get("generated_len", 0.0)),
+                    )
+                    episode_gen_wall_sec += float(gen_stats_turn.get("wall_sec", 0.0))
+
+                if turn_result.train_stats:
+                    episode_train_mfu_flops += float(
+                        turn_result.train_stats.get("mfu/mfu_flops_step", 0.0)
+                    )
+                    episode_train_hfu_flops += float(
+                        turn_result.train_stats.get("mfu/hfu_flops_step", 0.0)
+                    )
+                    episode_train_wall_sec += float(
+                        turn_result.train_stats.get("mfu/step_time_sec", 0.0)
+                    )
+
                 if turn_result.train_stats:
                     step_payload = dict(turn_result.train_stats)
                     step_payload.update(
@@ -2043,6 +2491,39 @@ try:
             }
             if mean_chosen_cp_delta is not None:
                 episode_stats["game/mean_chosen_cp_delta"] = mean_chosen_cp_delta
+
+            episode_wall_sec = max(1e-9, time.perf_counter() - episode_wall_start)
+            peak_flops = ally_agent.grpo_trainer.mfu_tracker.gpu_peak_flops
+            episode_total_flops_mfu = episode_train_mfu_flops + episode_gen_flops
+            episode_total_flops_hfu = episode_train_hfu_flops + episode_gen_flops
+            if peak_flops > 0:
+                e2e_mfu = episode_total_flops_mfu / (episode_wall_sec * peak_flops)
+                e2e_hfu = episode_total_flops_hfu / (episode_wall_sec * peak_flops)
+            else:
+                e2e_mfu = 0.0
+                e2e_hfu = 0.0
+            episode_stats["mfu/episode_e2e_mfu"] = float(e2e_mfu)
+            episode_stats["mfu/episode_e2e_hfu"] = float(e2e_hfu)
+            episode_stats["mfu/episode_e2e_achieved_tflops_mfu"] = float(
+                (episode_total_flops_mfu / episode_wall_sec) / 1e12
+            )
+            episode_stats["mfu/episode_e2e_achieved_tflops_hfu"] = float(
+                (episode_total_flops_hfu / episode_wall_sec) / 1e12
+            )
+            episode_stats["mfu/episode_wall_sec"] = float(episode_wall_sec)
+            episode_stats["mfu/episode_train_wall_sec"] = float(episode_train_wall_sec)
+            episode_stats["mfu/episode_gen_wall_sec"] = float(episode_gen_wall_sec)
+            episode_stats["mfu/episode_train_flops_mfu"] = float(episode_train_mfu_flops)
+            episode_stats["mfu/episode_train_flops_hfu"] = float(episode_train_hfu_flops)
+            episode_stats["mfu/episode_gen_flops"] = float(episode_gen_flops)
+            if episode_wall_sec > 0:
+                episode_stats["mfu/episode_gen_time_fraction"] = float(
+                    episode_gen_wall_sec / episode_wall_sec
+                )
+                episode_stats["mfu/episode_train_time_fraction"] = float(
+                    episode_train_wall_sec / episode_wall_sec
+                )
+
             wandb.log(episode_stats)
 
             csv_row = {
