@@ -501,10 +501,30 @@ class PikafishEvaluator:
         timeout_sec: float = 2.0,
         eval_cache_size: int = 20000,
         legal_cache_size: int = 20000,
+        movetime_ms: Optional[int] = None,
+        eval_timeout_sec: Optional[float] = None,
+        negative_cache_ttl_sec: float = 30.0,
+        negative_cache_max: int = 4096,
+        verbose: bool = True,
     ):
         self.binary_path = binary_path
         self.depth = max(1, int(depth))
+        # Short timeout for handshake-style commands: uciok, readyok, stop.
         self.timeout_sec = max(0.2, float(timeout_sec))
+        # Use ``go movetime`` instead of ``go depth`` so per-candidate eval cost
+        # is bounded by wall-clock. The old ``go depth N`` path could block
+        # far longer than the read timeout on hard mid-game positions, which
+        # caused every candidate of a round to time out in cascade.
+        if movetime_ms is None:
+            movetime_ms = max(200, 80 * self.depth)
+        self.movetime_ms = max(50, int(movetime_ms))
+        # Read deadline for search output. Must be comfortably larger than
+        # ``movetime_ms`` so we always see ``bestmove`` on clean shutdown.
+        self.eval_timeout_sec = (
+            float(eval_timeout_sec)
+            if eval_timeout_sec is not None
+            else (self.movetime_ms / 1000.0 + 2.0)
+        )
         self.proc: Optional[subprocess.Popen[bytes]] = None
         self.enabled = False
         self.eval_file: Optional[str] = None
@@ -514,7 +534,22 @@ class PikafishEvaluator:
         self._legal_cache: "OrderedDict[str, Tuple[str, ...]]" = OrderedDict()
         self._eval_cache_max = max(0, int(eval_cache_size))
         self._legal_cache_max = max(0, int(legal_cache_size))
-        self._cache_stats = {"eval_hits": 0, "eval_misses": 0, "legal_hits": 0, "legal_misses": 0}
+        # Negative cache prevents the 24 candidates of a round from each
+        # hammering the engine when one query fails: after any failure the
+        # key is remembered for ``negative_cache_ttl_sec`` seconds.
+        self._negative_cache: "OrderedDict[Tuple[str, Tuple[str, ...]], float]" = OrderedDict()
+        self._negative_cache_ttl = max(0.0, float(negative_cache_ttl_sec))
+        self._negative_cache_max = max(0, int(negative_cache_max))
+        self._verbose = bool(verbose)
+        self._cache_stats = {
+            "eval_hits": 0,
+            "eval_misses": 0,
+            "legal_hits": 0,
+            "legal_misses": 0,
+            "negative_hits": 0,
+            "restarts": 0,
+            "health_restarts": 0,
+        }
 
         resolved = shutil.which(binary_path) if binary_path else None
         if not resolved:
@@ -622,10 +657,63 @@ class PikafishEvaluator:
         except Exception:
             pass
 
-    def _restart(self) -> bool:
+    def _restart(self, reason: str = "") -> bool:
+        self._cache_stats["restarts"] += 1
+        if self._verbose:
+            msg = "[pikafish] restarting engine"
+            if reason:
+                msg += f" ({reason})"
+            print(msg, flush=True)
         self.close()
         self._launch()
         return bool(self.enabled and self.proc and self.proc.poll() is None)
+
+    def _ensure_alive(self, reason: str = "") -> bool:
+        """Top-guard auto-heal: if the subprocess has died, try to restart it
+        once before giving up. Prevents a single engine crash from silently
+        disabling engine rewards for the rest of training.
+        """
+        if self.proc and self.proc.poll() is None:
+            return self.enabled
+        # Process is absent or exited: attempt one restart.
+        return self._restart(reason or "process exited")
+
+    def _health_check_or_restart(self, reason: str = "") -> bool:
+        """Probe the engine with ``isready``. If unresponsive, restart. Call
+        this after any failed query so the *next* candidate in the round
+        starts from a healthy engine rather than a stalled one.
+        """
+        if not self.proc or self.proc.poll() is not None:
+            return self._restart(reason or "proc dead before health check")
+        if self._sync_ready():
+            return True
+        self._cache_stats["health_restarts"] += 1
+        return self._restart(reason or "isready timeout")
+
+    def _negative_cache_hit(self, key: Tuple[str, Tuple[str, ...]]) -> bool:
+        if self._negative_cache_ttl <= 0 or self._negative_cache_max <= 0:
+            return False
+        ts = self._negative_cache.get(key)
+        if ts is None:
+            return False
+        if time.time() - ts > self._negative_cache_ttl:
+            # Expired entry: drop it and let the caller retry.
+            try:
+                del self._negative_cache[key]
+            except KeyError:
+                pass
+            return False
+        self._negative_cache.move_to_end(key)
+        self._cache_stats["negative_hits"] += 1
+        return True
+
+    def _negative_cache_put(self, key: Tuple[str, Tuple[str, ...]]) -> None:
+        if self._negative_cache_ttl <= 0 or self._negative_cache_max <= 0:
+            return
+        self._negative_cache[key] = time.time()
+        self._negative_cache.move_to_end(key)
+        while len(self._negative_cache) > self._negative_cache_max:
+            self._negative_cache.popitem(last=False)
 
     def _cache_put_eval(self, key: Tuple[str, Tuple[str, ...]], value: float) -> None:
         if self._eval_cache_max <= 0:
@@ -651,12 +739,16 @@ class PikafishEvaluator:
             self._legal_cache.move_to_end(fen)
             self._cache_stats["legal_hits"] += 1
             return list(self._legal_cache[fen])
-        if not self.enabled or not self.proc or self.proc.poll() is not None:
+        neg_key = (fen, ("__legal__",))
+        if self._negative_cache_hit(neg_key):
+            return None
+        if not self._ensure_alive("list_legal_moves"):
             return None
         self._cache_stats["legal_misses"] += 1
         for attempt in range(2):
             try:
-                if attempt > 0 and not self._restart():
+                if attempt > 0 and not self._restart("legal_moves retry"):
+                    self._negative_cache_put(neg_key)
                     return None
                 if not self._sync_ready():
                     continue
@@ -665,7 +757,7 @@ class PikafishEvaluator:
                 self._send("go perft 1")
                 lines = self._read_lines(self.timeout_sec)
                 if any("critical error" in text.lower() for text in lines):
-                    self._restart()
+                    self._restart("critical error on perft")
                     continue
                 legal_moves: List[str] = []
                 for text in lines:
@@ -679,6 +771,9 @@ class PikafishEvaluator:
                 self.enabled = False
             if attempt == 0:
                 self.enabled = True
+        # Last-ditch health restart so the next call isn't against a stalled engine.
+        self._health_check_or_restart("legal_moves exhausted")
+        self._negative_cache_put(neg_key)
         return None
 
     def evaluate_cp(self, fen: str, moves: Optional[List[str]] = None) -> Optional[float]:
@@ -689,12 +784,15 @@ class PikafishEvaluator:
             self._eval_cache.move_to_end(cache_key)
             self._cache_stats["eval_hits"] += 1
             return cached
-        if not self.enabled or not self.proc or self.proc.poll() is not None:
+        if self._negative_cache_hit(cache_key):
+            return None
+        if not self._ensure_alive("evaluate_cp"):
             return None
         self._cache_stats["eval_misses"] += 1
         for attempt in range(2):
             try:
-                if attempt > 0 and not self._restart():
+                if attempt > 0 and not self._restart("evaluate_cp retry"):
+                    self._negative_cache_put(cache_key)
                     return None
                 if not self._sync_ready():
                     continue
@@ -703,12 +801,15 @@ class PikafishEvaluator:
                 if moves_tuple:
                     position_cmd += " moves " + " ".join(moves_tuple)
                 self._send(position_cmd)
-                self._send(f"go depth {self.depth}")
+                # Bounded wall-clock search: Pikafish emits ``bestmove`` after
+                # ~movetime_ms. Reading up to ``eval_timeout_sec`` (> movetime)
+                # guarantees we capture a final ``info ... score cp`` line.
+                self._send(f"go movetime {self.movetime_ms}")
 
                 latest_score: Optional[float] = None
-                lines = self._read_lines(self.timeout_sec)
+                lines = self._read_lines(self.eval_timeout_sec)
                 if any("critical error" in text.lower() for text in lines):
-                    self._restart()
+                    self._restart("critical error on eval")
                     continue
                 for text in lines:
                     text_lower = text.lower()
@@ -723,11 +824,17 @@ class PikafishEvaluator:
                 if latest_score is not None:
                     self._cache_put_eval(cache_key, latest_score)
                     return latest_score
+                # No score captured: make sure a stale ``go`` isn't still
+                # running, then fall through to the next attempt.
                 self._stop_search()
             except Exception:
                 self.enabled = False
             if attempt == 0:
                 self.enabled = True
+        # Prevent the remaining 23 candidates of the round from each paying
+        # the same timeout cost, and heal the engine for the next round.
+        self._health_check_or_restart("evaluate_cp exhausted")
+        self._negative_cache_put(cache_key)
         return None
 
     def close(self) -> None:
@@ -897,6 +1004,9 @@ _EPISODE_METRICS_FIELDNAMES = [
     "game_mean_capture_value",
     "game_mean_best_candidate_reward",
     "game_move_diversity",
+    "game_cp_saturation_truncated",
+    "game_mean_chosen_cp_delta_raw",
+    "game_mean_chosen_cp_delta_clipped",
     "grpo_loss",
     "grpo_mean_kl",
     "grpo_mean_reward",
@@ -1449,6 +1559,11 @@ class XiangqiAgent:
         reward_format_weight_anneal_start: float = 0.9,
         reward_format_weight_anneal_end: float = 0.98,
         reward_format_compliance_ema_alpha: float = 0.1,
+        min_legal_candidates: int = 0,
+        max_regeneration_rounds: int = 0,
+        regeneration_batch_size: int = 0,
+        min_distinct_legal_moves: int = 0,
+        dedupe_legal_by_move: bool = True,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -1465,6 +1580,15 @@ class XiangqiAgent:
         self.reward_format_weight_anneal_start = float(reward_format_weight_anneal_start)
         self.reward_format_weight_anneal_end = float(reward_format_weight_anneal_end)
         self.reward_format_compliance_ema_alpha = float(reward_format_compliance_ema_alpha)
+        self.min_legal_candidates = max(0, int(min_legal_candidates))
+        self.max_regeneration_rounds = max(0, int(max_regeneration_rounds))
+        self.regeneration_batch_size = (
+            max(1, int(regeneration_batch_size))
+            if regeneration_batch_size and regeneration_batch_size > 0
+            else max(1, int(num_generations) // 2)
+        )
+        self.min_distinct_legal_moves = max(0, int(min_distinct_legal_moves))
+        self.dedupe_legal_by_move = bool(dedupe_legal_by_move)
         # Start the EMA at 0 so the full format_weight is used until the model
         # has demonstrated consistent compliance across multiple rounds.
         self._format_compliance_ema: float = 0.0
@@ -1545,9 +1669,37 @@ class XiangqiAgent:
             "You are a Xiangqi (Chinese Chess) player. You always play the uppercase side.\n"
             "Piece letters: K=General A=Advisor B=Elephant N=Horse R=Chariot C=Cannon P=Soldier.\n"
             "Coordinates: files a-i (left to right), ranks 0-9 (top to bottom as shown in the graphic).\n"
-            "A move is written as <from_file><from_rank><to_file><to_rank>, e.g. b7e7.\n\n"
+            "Uppercase (your) pieces start on the BOTTOM (ranks 7-9); lowercase enemy pieces start on the TOP\n"
+            "(ranks 0-2). The river sits between ranks 4 and 5 (shown as '~~~' in the graphic).\n"
+            "A move is written <from_file><from_rank><to_file><to_rank>, e.g. b7b4 moves the piece on b7 to b4.\n\n"
+            "XIANGQI MOVEMENT RULES (these are NOT the same as Western chess):\n"
+            "- K (General): moves 1 step orthogonally, must stay in the palace (files d-f, ranks 7-9 for you).\n"
+            "  The two Generals may NEVER face each other on the same file with nothing between them\n"
+            "  (flying-general rule), so never expose your K on an open file facing the enemy k.\n"
+            "- A (Advisor): moves exactly 1 step diagonally, must stay in the palace (d-f, ranks 7-9).\n"
+            "- B (Elephant): moves exactly 2 steps diagonally (e.g. c7 to a5 or e5). Cannot cross the river\n"
+            "  (your B must stay on ranks 5-9). Blocked if the 1-step diagonal midpoint is occupied\n"
+            "  (the 'elephant eye').\n"
+            "- N (Horse): moves 1 step orthogonal + 1 step diagonal outward (L-shape, 8 possible targets).\n"
+            "  BLOCKED if the orthogonal-adjacent square ('horse leg') is occupied. A horse does NOT\n"
+            "  jump like a Western knight.\n"
+            "- R (Chariot): slides any number of empty squares orthogonally, exactly like a Western rook.\n"
+            "- C (Cannon): moves like R when NOT capturing, but to CAPTURE it must jump over exactly one\n"
+            "  piece (of either side) between itself and the target ('screen'). Non-capture cannon moves\n"
+            "  must be along empty squares with no piece in between.\n"
+            "- P (Soldier): before crossing the river (your P on ranks 5-9) it moves 1 step forward only\n"
+            "  (forward = decreasing rank number for you). After crossing the river (ranks 0-4) it may\n"
+            "  also move 1 step sideways. A soldier NEVER moves backward and NEVER moves diagonally.\n\n"
+            "IMPORTANT - DO NOT use Western chess concepts that do not apply here. In particular:\n"
+            "- There is NO queen, NO bishop-pair, NO pawn promotion, NO castling, NO en-passant.\n"
+            "- Do NOT talk about bishops (B here is an Elephant with very different movement), knights in\n"
+            "  the Western sense (N is a Horse that can be leg-blocked), or rooks beyond the R=Chariot slide.\n"
+            "- Only reason about the board using the Xiangqi rules above and the legal-move list provided.\n"
+            "- Before committing to a move, mentally verify it matches the movement rule for that piece and\n"
+            "  appears in the Legal moves list.\n\n"
             "In <think>, briefly state: (1) the impact of the enemy's last move, (2) the piece you will move\n"
-            "and why, (3) the enemy's most dangerous reply. Then output exactly one legal move on its own line.\n\n"
+            "and why (citing the Xiangqi rule it uses), (3) the enemy's most dangerous reply.\n"
+            "Then output exactly one legal move on its own line.\n\n"
             "Respond exactly in this format (two lines, nothing else):\n"
             "<think>your tactical reasoning referring to the piece and squares of the move you will play</think>\n"
             "Move: <from><to>"
@@ -1580,14 +1732,113 @@ class XiangqiAgent:
             {"role": "user", "content": user_msg},
         ]
 
+    def _generate_one_batch(
+        self,
+        encoded,
+        num_generations: int,
+        max_new_tokens_override: Optional[int],
+        episode: int,
+        round_idx: int,
+        pass_label: str,
+    ) -> Tuple[Optional[List[str]], int, int, int, float, Optional[Tuple[int, int]]]:
+        """Run a single generation pass with OOM retry.
+
+        Returns ``(decoded, context_len, num_sequences_used, generated_len, wall_sec,
+        attempt_used)``. ``decoded`` is ``None`` if every OOM retry failed.
+        """
+        generate_model = unwrap_model(self.model)
+        retry_schedule = self._build_generation_retry_schedule()
+        base_max_new = (
+            int(max_new_tokens_override)
+            if max_new_tokens_override is not None
+            else int(self.generate_config["max_new_tokens"])
+        )
+        # Rebuild schedule anchored on the requested generation budget.
+        anchored_schedule: List[Tuple[int, int]] = [
+            (num_generations, base_max_new),
+        ]
+        for _, tok_cap in retry_schedule:
+            if tok_cap < base_max_new:
+                anchored_schedule.append((max(1, num_generations), tok_cap))
+            else:
+                anchored_schedule.append((max(1, num_generations), base_max_new))
+            anchored_schedule.append((max(1, num_generations // 2), tok_cap))
+            anchored_schedule.append((1, tok_cap))
+
+        deduped: List[Tuple[int, int]] = []
+        for item in anchored_schedule:
+            if item not in deduped:
+                deduped.append(item)
+
+        total_wall_sec = 0.0
+        context_len_used = 0
+        for attempt_idx, (ng, max_new) in enumerate(deduped, start=1):
+            ids_batch, mask_batch, context_len = broadcast_generation_inputs(
+                encoded.input_ids if rank == 0 else None,
+                encoded.attention_mask if rank == 0 else None,
+                num_generations=ng,
+            )
+            context_len_used = context_len
+
+            local_success = True
+            outputs = None
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            attempt_start = time.perf_counter()
+            try:
+                with torch.no_grad():
+                    outputs = generate_model.generate(
+                        inputs=ids_batch,
+                        attention_mask=mask_batch,
+                        **{
+                            **self.generate_config,
+                            "max_new_tokens": max_new,
+                        },
+                    )
+            except torch.cuda.OutOfMemoryError:
+                local_success = False
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            total_wall_sec += time.perf_counter() - attempt_start
+
+            success = self._sync_success_all_ranks(local_success)
+            if not success:
+                if rank == 0:
+                    print(
+                        f"[Ep {episode} Rd {round_idx}] ({pass_label}) Generate OOM on attempt "
+                        f"{attempt_idx}/{len(deduped)} with num_generations={ng}, "
+                        f"max_new_tokens={max_new}. Retrying with a smaller load."
+                    )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+
+            out_tokens = outputs[:, context_len:]
+            decoded = self.tokenizer.batch_decode(
+                out_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            return (
+                decoded,
+                context_len_used,
+                int(outputs.shape[0]),
+                int(out_tokens.shape[1]),
+                total_wall_sec,
+                (ng, max_new),
+            )
+
+        return None, context_len_used, 0, 0, total_wall_sec, None
+
     def _generate_candidates(
         self,
         board_state: Optional[np.ndarray],
+        env: Optional[gym.Env],
         enemy_move_desc: Optional[str],
         episode: int,
         round_idx: int,
         legal_moves_hint: Optional[List[str]] = None,
-    ) -> Tuple[Optional[torch.Tensor], List[str], str, str]:
+    ) -> Tuple[Optional[torch.Tensor], List[str], str, str, int]:
         if rank == 0:
             messages = self.format_turn_prompt(
                 board_state, enemy_move_desc, legal_moves_hint=legal_moves_hint
@@ -1611,91 +1862,115 @@ class XiangqiAgent:
         generate_model = unwrap_model(self.model)
         generate_model.eval()
 
-        retry_schedule = self._build_generation_retry_schedule()
-        decoded: List[str] = []
+        all_decoded: List[str] = []
+        total_num_sequences = 0
+        # Accumulate num_seq * generated_len so that a weighted-average
+        # generated_len keeps the FLOPs calc identical to summing each pass.
+        total_gen_token_product = 0
+        total_wall_sec = 0.0
         context_len = 0
-        attempt_used: Optional[Tuple[int, int]] = None
-        generated_len_used = 0
-        num_sequences_used = 0
-        gen_total_wall_sec = 0.0
+        legal_so_far = 0
+        regen_passes = 0
+        distinct_legal_moves: set[str] = set()
 
         self._set_generation_checkpointing(enable=False)
         try:
-            for attempt_idx, (num_generations, max_new_tokens) in enumerate(retry_schedule, start=1):
-                ids_batch, mask_batch, context_len = broadcast_generation_inputs(
-                    encoded.input_ids if rank == 0 else None,
-                    encoded.attention_mask if rank == 0 else None,
-                    num_generations=num_generations,
+            pass_idx = 0
+            while True:
+                if pass_idx == 0:
+                    num_generations = self.num_generations
+                    pass_label = "initial"
+                else:
+                    num_generations = self.regeneration_batch_size
+                    pass_label = f"regen {pass_idx}"
+
+                decoded_batch, ctx_len_pass, n_seq, gen_len, wall_sec, attempt_used = (
+                    self._generate_one_batch(
+                        encoded=encoded,
+                        num_generations=num_generations,
+                        max_new_tokens_override=None,
+                        episode=episode,
+                        round_idx=round_idx,
+                        pass_label=pass_label,
+                    )
                 )
+                context_len = ctx_len_pass
+                total_wall_sec += wall_sec
 
-                local_success = True
-                outputs = None
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                attempt_start = time.perf_counter()
-                try:
-                    with torch.no_grad():
-                        outputs = generate_model.generate(
-                            inputs=ids_batch,
-                            attention_mask=mask_batch,
-                            **{
-                                **self.generate_config,
-                                "max_new_tokens": max_new_tokens,
-                            },
-                        )
-                except torch.cuda.OutOfMemoryError:
-                    local_success = False
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                gen_total_wall_sec += time.perf_counter() - attempt_start
-
-                success = self._sync_success_all_ranks(local_success)
-                if not success:
+                if decoded_batch is None:
                     if rank == 0:
                         print(
-                            f"[Ep {episode} Rd {round_idx}] Generate OOM on attempt "
-                            f"{attempt_idx}/{len(retry_schedule)} with "
-                            f"num_generations={num_generations}, max_new_tokens={max_new_tokens}. "
-                            "Retrying with a smaller generation load."
+                            f"[Ep {episode} Rd {round_idx}] ({pass_label}) Generate failed "
+                            "after all retries."
                         )
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue
+                    break
 
-                out_tokens = outputs[:, context_len:]
-                decoded = self.tokenizer.batch_decode(
-                    out_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
-                )
-                attempt_used = (num_generations, max_new_tokens)
-                generated_len_used = int(out_tokens.shape[1])
-                num_sequences_used = int(outputs.shape[0])
-                break
+                all_decoded.extend(decoded_batch)
+                total_num_sequences += n_seq
+                total_gen_token_product += n_seq * gen_len
+                if pass_idx > 0:
+                    regen_passes += 1
+
+                # Rank-0 cheap legality check so we can decide whether to regen.
+                batch_legal = 0
+                batch_distinct_new = 0
+                if rank == 0:
+                    for resp in decoded_batch:
+                        move_str = _extract_move(resp)
+                        if move_str is None or env is None or board_state is None:
+                            continue
+                        act = algebraic_to_action(move_str, board_state, env)
+                        if act is not None:
+                            batch_legal += 1
+                            if move_str not in distinct_legal_moves:
+                                distinct_legal_moves.add(move_str)
+                                batch_distinct_new += 1
+                    legal_so_far += batch_legal
+                    print(
+                        f"[Ep {episode} Rd {round_idx}] ({pass_label}) Generated "
+                        f"{len(decoded_batch)} candidates ({batch_legal} legal, "
+                        f"{batch_distinct_new} new distinct). "
+                        f"Totals: candidates={len(all_decoded)}, "
+                        f"legal={legal_so_far}, distinct_legal={len(distinct_legal_moves)}, "
+                        f"regen_passes={regen_passes}"
+                    )
+                    legal_threshold_met = (
+                        self.min_legal_candidates <= 0
+                        or legal_so_far >= self.min_legal_candidates
+                    )
+                    distinct_threshold_met = (
+                        self.min_distinct_legal_moves <= 0
+                        or len(distinct_legal_moves) >= self.min_distinct_legal_moves
+                    )
+                    should_stop = (
+                        (legal_threshold_met and distinct_threshold_met)
+                        or regen_passes >= self.max_regeneration_rounds
+                    )
+                else:
+                    should_stop = False
+                should_stop = broadcast_bool(should_stop, src=0)
+
+                pass_idx += 1
+                if should_stop:
+                    break
         finally:
             self._set_generation_checkpointing(enable=True)
 
+        effective_gen_len = (
+            float(total_gen_token_product) / float(total_num_sequences)
+            if total_num_sequences > 0
+            else 0.0
+        )
         self._last_generation_stats = {
-            "num_sequences": float(num_sequences_used),
+            "num_sequences": float(total_num_sequences),
             "prompt_len": float(context_len),
-            "generated_len": float(generated_len_used),
-            "wall_sec": float(gen_total_wall_sec),
+            "generated_len": effective_gen_len,
+            "wall_sec": float(total_wall_sec),
         }
 
         if rank == 0:
-            if attempt_used is not None:
-                print(
-                    f"[Ep {episode} Rd {round_idx}] Generated {len(decoded)} candidates "
-                    f"(prompt_tokens={context_len}, num_generations={attempt_used[0]}, "
-                    f"max_new_tokens={attempt_used[1]})"
-                )
-            else:
-                print(
-                    f"[Ep {episode} Rd {round_idx}] Generate failed after all retries; "
-                    "falling back to a random legal move."
-                )
-            return query_ids, decoded, fen, graphic
-        return None, [], "", ""
+            return query_ids, all_decoded, fen, graphic, legal_so_far
+        return None, [], "", "", 0
 
     def act_and_train(
         self,
@@ -1722,8 +1997,9 @@ class XiangqiAgent:
             random.shuffle(hint_actions)
             legal_moves_hint = [action_to_algebraic(int(a)) for a in hint_actions]
 
-        query_ids, responses, fen, graphic = self._generate_candidates(
+        query_ids, responses, fen, graphic, _prefilter_legal_count = self._generate_candidates(
             board_state=board_state,
+            env=env,
             enemy_move_desc=enemy_move_desc,
             episode=episode,
             round_idx=round_idx,
@@ -1768,14 +2044,45 @@ class XiangqiAgent:
                     move_strings.append(ev.move_str)
 
             legal_evals = [ev for ev in evals if ev.legal and ev.action is not None]
+
+            # Dedupe legal candidates by parsed move_str so GRPO's group isn't
+            # dominated by many near-identical completions that all picked the
+            # same move (which flattens the within-group advantage signal).
+            # For each distinct legal move we keep the single candidate with
+            # the highest combined reward; all illegal / unparseable
+            # candidates are kept as-is (they still carry useful "don't do
+            # this" signal).
+            if self.dedupe_legal_by_move and legal_evals:
+                best_idx_by_move: Dict[str, int] = {}
+                for idx_ev, ev in enumerate(evals):
+                    if not (ev.legal and ev.action is not None and ev.move_str is not None):
+                        continue
+                    prev = best_idx_by_move.get(ev.move_str)
+                    if prev is None or ev.reward > evals[prev].reward:
+                        best_idx_by_move[ev.move_str] = idx_ev
+                keep_legal_indices = set(best_idx_by_move.values())
+                train_evals: List[CandidateEval] = [
+                    ev for i, ev in enumerate(evals)
+                    if (not (ev.legal and ev.action is not None)) or i in keep_legal_indices
+                ]
+            else:
+                train_evals = list(evals)
+
+            deduped_legal_evals = [
+                ev for ev in train_evals if ev.legal and ev.action is not None
+            ]
+            distinct_legal_move_count = len({
+                ev.move_str for ev in deduped_legal_evals if ev.move_str is not None
+            })
+
             used_random_fallback = False
             chosen_capture = 0.0
             chosen_response = ""
             chosen_eval: Optional[CandidateEval] = None
 
-            if legal_evals:
-                best_reward = max(ev.reward for ev in legal_evals)
-                best_candidates = [ev for ev in legal_evals if ev.reward == best_reward]
+            if deduped_legal_evals:
+                best_reward = max(ev.reward for ev in deduped_legal_evals)
+                best_candidates = [ev for ev in deduped_legal_evals if ev.reward == best_reward]
                 chosen = random.choice(best_candidates)
                 chosen_eval = chosen
                 chosen_action = int(chosen.action)
@@ -1796,9 +2103,9 @@ class XiangqiAgent:
                 used_random_fallback = True
                 best_reward = 0.0
 
-            query_batch = [ev.query_ids for ev in evals]
-            response_batch = [ev.response_ids for ev in evals]
-            reward_batch = [float(ev.reward) for ev in evals]
+            query_batch = [ev.query_ids for ev in train_evals]
+            response_batch = [ev.response_ids for ev in train_evals]
+            reward_batch = [float(ev.reward) for ev in train_evals]
             train_stats = self.grpo_trainer.train_group(query_batch, response_batch, reward_batch)
             successful_cp_deltas = [float(ev.cp_delta) for ev in legal_evals if ev.cp_delta is not None]
             mean_cp_delta_success = (
@@ -1833,6 +2140,9 @@ class XiangqiAgent:
                 if mean_cp_delta_success is not None
                 else 0.0,
                 "game/move_diversity": len(set(move_strings)) / max(1, len(evals)),
+                "game/distinct_legal_moves": float(distinct_legal_move_count),
+                "game/deduped_train_group_size": float(len(train_evals)),
+                "game/dedupe_dropped_count": float(len(evals) - len(train_evals)),
                 "game/mean_best_candidate_reward": float(best_reward),
                 "game/using_pikafish_legality": 1.0 if using_pikafish_legality else 0.0,
                 "game/engine_legal_action_count": float(len(legal_actions)),
@@ -1849,6 +2159,8 @@ class XiangqiAgent:
                     np.array2string(board_state),
                     (
                         f"Candidates: {len(evals)} generated, {legal_count} legal, "
+                        f"{len(deduped_legal_evals)} legal_after_dedupe "
+                        f"({distinct_legal_move_count} distinct moves), "
                         f"best_reward={best_reward:.4f}"
                     ),
                     (
@@ -1863,6 +2175,20 @@ class XiangqiAgent:
                         f"engine_eval_success_rate={candidate_metrics['game/engine_eval_success_rate']:.3f} "
                         f"mean_cp_delta_success={_fmt_optional_float(mean_cp_delta_success)}"
                     ),
+                    "Legal candidates [deduped by move] (move | engine_reward | cp_before | cp_after_raw | cp_delta | format_reward | combined_reward):",
+                    *[
+                        (
+                            f"  [{idx}] {ev.move_str} "
+                            f"engine={ev.engine_reward:.4f} "
+                            f"cp_before={_fmt_optional_float(ev.cp_before)} "
+                            f"cp_after_raw={_fmt_optional_float(ev.cp_after_raw)} "
+                            f"cp_delta={_fmt_optional_float(ev.cp_delta)} "
+                            f"format={ev.format_reward:.4f} "
+                            f"combined={ev.reward:.4f} "
+                            f"engine_eval_success={int(ev.engine_eval_success)}"
+                        )
+                        for idx, ev in enumerate(deduped_legal_evals)
+                    ],
                     (
                         f"Chosen move: {chosen_move} "
                         f"= {describe_action(chosen_action)}"
@@ -1935,9 +2261,13 @@ MODEL_REGISTRY = {
 hyperparams = {
     "model_name": MODEL_REGISTRY[args.model_size],
     "env": "gym_xiangqi:xiangqi-v0",
-    "max_seq_length": 1024,
-    "max_prompt_length": 384,
-    "max_train_query_ctx": 384,
+    # The expanded Xiangqi system prompt (piece-movement rules + anti-Western-chess
+    # warning) is noticeably longer than the old one, so bump the prompt budget
+    # accordingly. Total seq length = max_prompt_length + generate/max_new_tokens
+    # with a small safety margin.
+    "max_seq_length": 1536,
+    "max_prompt_length": 768,
+    "max_train_query_ctx": 768,
     "lora/r": 32,
     "lora/lora_alpha": 32,
     "lora/lora_dropout": 0.0,
@@ -1950,7 +2280,29 @@ hyperparams = {
         "up_proj",
         "down_proj",
     ],
-    "grpo/num_generations": 16,
+    "grpo/num_generations": 32,
+    # When fewer than ``grpo/min_legal_candidates`` of the ``grpo/num_generations``
+    # candidates are legal, regenerate an additional batch (of size
+    # ``grpo/regeneration_batch_size``) and append it to the training group. Up to
+    # ``grpo/max_regeneration_rounds`` extra passes are made before we give up.
+    # This prevents the GRPO signal from collapsing when the policy happens to
+    # output mostly illegal moves for a given position, which starves the group
+    # of comparable rewards and kills the advantage signal.
+    "grpo/min_legal_candidates": 8,
+    # Regenerate if the number of *distinct* legal move strings seen so far is
+    # below this threshold. Stops the group collapsing onto a handful of
+    # moves (e.g. 20 of 26 legal candidates all outputting g9e7), which kills
+    # GRPO's group-relative advantage signal. Set to 0 to disable.
+    "grpo/min_distinct_legal_moves": 8,
+    # When true, collapse legal candidates down to one row per distinct
+    # parsed move (keeping the highest-reward row per move) before the GRPO
+    # update. This complements ``min_distinct_legal_moves``: regeneration
+    # grows the variety of moves in the pool, and dedup ensures the GRPO
+    # group isn't dominated by duplicate-move rows whose identical rewards
+    # flatten the within-group advantage. Illegal/unparseable rows are kept.
+    "grpo/dedupe_legal_by_move": True,
+    "grpo/max_regeneration_rounds": 3,
+    "grpo/regeneration_batch_size": 12,
     "grpo/lr": 6e-6,
     "grpo/beta": 0.1,
     "grpo/kl_penalty_min": 0.0,
@@ -1959,11 +2311,14 @@ hyperparams = {
     "grpo/optim": "adamw_8bit",
     "generate/max_new_tokens": 384,
     "generate/do_sample": True,
-    # Slightly higher sampling temperature + a mild repetition penalty discourage
-    # the 8 candidates from collapsing onto a single move, which was previously
-    # destroying GRPO's group-relative advantage signal.
-    "generate/temperature": 1.0,
-    "generate/top_p": 0.95,
+    # Higher sampling temperature + mild top_p widening discourage the 32
+    # candidates from collapsing onto a single move, which was previously
+    # destroying GRPO's group-relative advantage signal and wasting the
+    # regeneration budget. Paired with ``grpo/dedupe_legal_by_move`` the
+    # effective group keeps distinct-move diversity without blowing up the
+    # group size.
+    "generate/temperature": 1.2,
+    "generate/top_p": 0.98,
     "generate/repetition_penalty": 1.1,
     "episodes": 500,
     "max_rounds_per_episode": 200,
@@ -1973,11 +2328,16 @@ hyperparams = {
     "checkpoint/every_n_episodes": 25,
     "checkpoint/load_adapter_path": "",
     "pikafish/bin": os.environ.get("PIKAFISH_BIN", "/home/fchow/bin/pikafish"),
-    # Positional cp evaluation uses a deeper search for cleaner reward signal;
-    # ``list_legal_moves`` always uses ``go perft 1`` internally and ignores
-    # this depth.
+    # Positional cp evaluation uses ``go movetime`` instead of ``go depth`` so
+    # each candidate eval is bounded in wall-clock. ``list_legal_moves`` uses
+    # ``go perft 1`` internally and ignores depth/movetime. ``pikafish/depth``
+    # is kept only as a signal for ``movetime_ms`` when it isn't set.
     "pikafish/depth": 12,
-    "pikafish/timeout_sec": 2.5,
+    # Short timeout for handshake commands: uciok, readyok, stop.
+    "pikafish/timeout_sec": 120.0,
+    # Wall-clock budget per cp evaluation. ~500ms at depth-12-class quality on
+    # modern CPUs is plenty while staying well under the old 2.5s read window.
+    "pikafish/movetime_ms": 500,
     "reward/engine_cp_scale": 250.0,
     "reward/format_weight": 0.2,
     # Once the rolling format-compliance rate crosses
@@ -1991,6 +2351,19 @@ hyperparams = {
     "reward/format_weight_anneal_end": 0.98,
     "reward/format_compliance_ema_alpha": 0.1,
     "grpo/logprob_micro_batch": 4,
+    # One catastrophic blunder is worth thousands of cp, which dominates the
+    # ``mean_chosen_cp_delta`` metric (and anything derived from it) across an
+    # otherwise normal ~90-round game. Clip the raw per-turn cp_delta before it
+    # feeds into aggregates so a single -10000 outlier can't swing the mean by
+    # -100+. The reward itself is already bounded by tanh and is not touched.
+    "metrics/cp_delta_clip_abs": 400.0,
+    # When the engine's score stays at mate saturation (|cp_before| >=
+    # ``game/cp_saturation_threshold``) for ``game/cp_saturation_consecutive``
+    # ally turns in a row, the position is effectively terminal and continuing
+    # the episode just pads the logs with 0-delta rounds. Truncate early.
+    # Set ``game/cp_saturation_consecutive`` to 0 to disable.
+    "game/cp_saturation_threshold": 8000.0,
+    "game/cp_saturation_consecutive": 0,
 }
 
 if args.episodes is not None:
@@ -2170,6 +2543,7 @@ if rank == 0:
         binary_path=str(hyperparams["pikafish/bin"]),
         depth=int(hyperparams["pikafish/depth"]),
         timeout_sec=float(hyperparams["pikafish/timeout_sec"]),
+        movetime_ms=int(hyperparams.get("pikafish/movetime_ms", 0) or 0) or None,
     )
     if pikafish_evaluator.enabled:
         print(
@@ -2204,6 +2578,11 @@ ally_agent = XiangqiAgent(
     reward_format_compliance_ema_alpha=float(
         hyperparams["reward/format_compliance_ema_alpha"]
     ),
+    min_legal_candidates=int(hyperparams["grpo/min_legal_candidates"]),
+    max_regeneration_rounds=int(hyperparams["grpo/max_regeneration_rounds"]),
+    regeneration_batch_size=int(hyperparams["grpo/regeneration_batch_size"]),
+    min_distinct_legal_moves=int(hyperparams["grpo/min_distinct_legal_moves"]),
+    dedupe_legal_by_move=bool(hyperparams["grpo/dedupe_legal_by_move"]),
 )
 enemy_agent = GreedyEnemyAgent()
 
@@ -2223,10 +2602,14 @@ episodes = int(hyperparams["episodes"])
 max_rounds = int(hyperparams["max_rounds_per_episode"])
 ckpt_root = hyperparams["checkpoint/dir"]
 ckpt_every = int(hyperparams["checkpoint/every_n_episodes"])
+cp_delta_clip_abs = float(hyperparams["metrics/cp_delta_clip_abs"])
+cp_saturation_threshold = float(hyperparams["game/cp_saturation_threshold"])
+cp_saturation_consecutive = int(hyperparams["game/cp_saturation_consecutive"])
 
 ally_wins = 0
 enemy_wins = 0
 truncated_games = 0
+cp_saturation_truncations = 0
 lifetime_ally_turns = 0
 lifetime_random_fallback = 0
 global_train_steps = 0
@@ -2254,6 +2637,9 @@ try:
             chosen_engine_reward_series: List[float] = []
             chosen_format_reward_series: List[float] = []
             chosen_cp_delta_series: List[float] = []
+            chosen_cp_delta_raw_series: List[float] = []
+            cp_saturation_streak = 0
+            cp_saturation_truncated_this_episode = False
             train_stats_last: Dict[str, float] = {}
             episode_train_mfu_flops = 0.0
             episode_train_hfu_flops = 0.0
@@ -2340,7 +2726,23 @@ try:
                 chosen_engine_reward_series.append(float(turn_result.chosen_engine_reward))
                 chosen_format_reward_series.append(float(turn_result.chosen_format_reward))
                 if turn_result.chosen_cp_delta is not None:
-                    chosen_cp_delta_series.append(float(turn_result.chosen_cp_delta))
+                    raw_delta = float(turn_result.chosen_cp_delta)
+                    chosen_cp_delta_raw_series.append(raw_delta)
+                    if cp_delta_clip_abs > 0.0:
+                        chosen_cp_delta_series.append(
+                            float(np.clip(raw_delta, -cp_delta_clip_abs, cp_delta_clip_abs))
+                        )
+                    else:
+                        chosen_cp_delta_series.append(raw_delta)
+
+                if (
+                    cp_saturation_consecutive > 0
+                    and turn_result.chosen_cp_before is not None
+                    and abs(float(turn_result.chosen_cp_before)) >= cp_saturation_threshold
+                ):
+                    cp_saturation_streak += 1
+                else:
+                    cp_saturation_streak = 0
 
                 train_stats_last = turn_result.train_stats
 
@@ -2423,6 +2825,27 @@ try:
                     done = True
                     truncated_games += 1
 
+                if (
+                    not done
+                    and cp_saturation_consecutive > 0
+                    and cp_saturation_streak >= cp_saturation_consecutive
+                ):
+                    done = True
+                    cp_saturation_truncated_this_episode = True
+                    cp_saturation_truncations += 1
+                    # cp-saturation is a form of early truncation. Count it as a
+                    # truncated game so that ally_win_rate + enemy_win_rate +
+                    # truncated_rate sums to 100% (cp_saturation_truncation_rate
+                    # is kept as a separate sub-category metric).
+                    truncated_games += 1
+                    last_cp = turn_result.chosen_cp_before
+                    print(
+                        f"[Ep {episode} Rd {round_idx - 1}] cp-saturation truncation "
+                        f"(|cp_before| >= {cp_saturation_threshold:.0f} for "
+                        f"{cp_saturation_streak} consecutive ally turns; "
+                        f"last cp_before={_fmt_optional_float(last_cp)})"
+                    )
+
         if rank == 0:
             lifetime_ally_turns += ally_turns_episode
             lifetime_random_fallback += random_fallback_episode
@@ -2450,6 +2873,11 @@ try:
             mean_chosen_cp_delta = (
                 float(np.mean(chosen_cp_delta_series)) if chosen_cp_delta_series else None
             )
+            mean_chosen_cp_delta_raw = (
+                float(np.mean(chosen_cp_delta_raw_series))
+                if chosen_cp_delta_raw_series
+                else None
+            )
             random_rate_episode = (
                 100.0 * random_fallback_episode / ally_turns_episode if ally_turns_episode else 0.0
             )
@@ -2459,6 +2887,8 @@ try:
                 outcome = "enemy_win"
             elif ally_reward_terminal == 100:
                 outcome = "ally_win"
+            elif cp_saturation_truncated_this_episode:
+                outcome = "truncated_cp_saturation"
             elif round_idx >= max_rounds:
                 outcome = "truncated_cap"
 
@@ -2491,6 +2921,15 @@ try:
             }
             if mean_chosen_cp_delta is not None:
                 episode_stats["game/mean_chosen_cp_delta"] = mean_chosen_cp_delta
+            if mean_chosen_cp_delta_raw is not None:
+                episode_stats["game/mean_chosen_cp_delta_raw"] = mean_chosen_cp_delta_raw
+            episode_stats["game/cp_delta_clip_abs"] = cp_delta_clip_abs
+            episode_stats["game/cp_saturation_truncated"] = (
+                1.0 if cp_saturation_truncated_this_episode else 0.0
+            )
+            episode_stats["game/cp_saturation_truncation_rate"] = (
+                100.0 * cp_saturation_truncations / episode
+            )
 
             episode_wall_sec = max(1e-9, time.perf_counter() - episode_wall_start)
             peak_flops = ally_agent.grpo_trainer.mfu_tracker.gpu_peak_flops
@@ -2542,6 +2981,9 @@ try:
                 "game_mean_capture_value": round(mean_capture, 6),
                 "game_mean_best_candidate_reward": round(mean_best_reward, 6),
                 "game_move_diversity": round(move_diversity, 6),
+                "game_cp_saturation_truncated": int(cp_saturation_truncated_this_episode),
+                "game_mean_chosen_cp_delta_raw": _fmt_metric(mean_chosen_cp_delta_raw),
+                "game_mean_chosen_cp_delta_clipped": _fmt_metric(mean_chosen_cp_delta),
                 "grpo_loss": _fmt_metric(train_stats_last.get("grpo/loss")),
                 "grpo_mean_kl": _fmt_metric(train_stats_last.get("grpo/mean_kl")),
                 "grpo_mean_reward": _fmt_metric(train_stats_last.get("grpo/mean_reward")),
@@ -2560,7 +3002,10 @@ try:
                 f"engine_eval_success_rate={mean_engine_eval_success_rate:.3f} "
                 f"mean_chosen_engine_reward={mean_chosen_engine_reward:.3f} "
                 f"mean_chosen_format_reward={mean_chosen_format_reward:.3f} "
-                f"mean_chosen_cp_delta={_fmt_optional_float(mean_chosen_cp_delta)}"
+                f"mean_chosen_cp_delta={_fmt_optional_float(mean_chosen_cp_delta)} "
+                f"mean_chosen_cp_delta_raw={_fmt_optional_float(mean_chosen_cp_delta_raw)} "
+                f"outcome={outcome} "
+                f"cp_sat_trunc_rate={episode_stats['game/cp_saturation_truncation_rate']:.1f}%"
             )
 
         if ckpt_every > 0 and episode % ckpt_every == 0:
