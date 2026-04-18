@@ -164,13 +164,97 @@ _PIECE_TO_FEN = {
 }
 
 MOVE_RE = re.compile(r"Move:\s*([a-i][0-9][a-i][0-9])", flags=re.IGNORECASE)
+MOVE_TAG_RE = re.compile(r"Move:", flags=re.IGNORECASE)
 ALGEBRAIC_RE = re.compile(r"^([a-i])([0-9])([a-i])([0-9])$")
 THINK_RE = re.compile(r"<think>.*?</think>", flags=re.IGNORECASE | re.DOTALL)
 THINK_CAPTURE_RE = re.compile(r"<think>(.*?)</think>", flags=re.IGNORECASE | re.DOTALL)
+THINK_OPEN_TAG = "<think>"
+THINK_CLOSE_TAG = "</think>"
 ENGINE_CP_RE = re.compile(r"\bscore\s+cp\s+(-?\d+)\b", flags=re.IGNORECASE)
 ENGINE_MATE_RE = re.compile(r"\bscore\s+mate\s+(-?\d+)\b", flags=re.IGNORECASE)
 ENGINE_PERFT_MOVE_RE = re.compile(r"^([a-i][0-9][a-i][0-9]):\s+\d+\b", flags=re.IGNORECASE)
 MOVE_IN_TEXT_RE = re.compile(r"\b([a-i][0-9][a-i][0-9])\b", flags=re.IGNORECASE)
+
+
+def _find_region_token_indices(
+    tokenizer,
+    response_ids: torch.Tensor,
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Locate the `<think>`/`</think>` and last `Move:` spans in a response.
+
+    Returns (think_start, think_end, move_start) as token indices within
+    ``response_ids``. ``think_end`` is exclusive (token index just past the
+    closing tag). Returns ``None`` for any span that could not be located.
+    """
+    r_list = response_ids.tolist()
+    r_len = len(r_list)
+    if r_len == 0:
+        return None, None, None
+    try:
+        text = tokenizer.decode(r_list, skip_special_tokens=False)
+    except Exception:
+        return None, None, None
+
+    def _tok_idx(char_pos: int) -> Optional[int]:
+        if char_pos < 0:
+            return None
+        prefix = text[:char_pos]
+        if not prefix:
+            return 0
+        try:
+            prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+        except Exception:
+            return None
+        return max(0, min(len(prefix_ids), r_len))
+
+    think_open = text.find(THINK_OPEN_TAG)
+    think_close = text.find(THINK_CLOSE_TAG)
+    move_matches = list(MOVE_TAG_RE.finditer(text))
+    move_char = move_matches[-1].start() if move_matches else -1
+    think_start = _tok_idx(think_open) if think_open >= 0 else None
+    think_end = (
+        _tok_idx(think_close + len(THINK_CLOSE_TAG)) if think_close >= 0 else None
+    )
+    move_start = _tok_idx(move_char) if move_char >= 0 else None
+    return think_start, think_end, move_start
+
+
+def _build_region_masks_padded(
+    region_indices: List[Tuple[Optional[int], Optional[int], Optional[int]]],
+    resp_lens: torch.Tensor,
+    max_total: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Align per-response region indices to the shifted log-prob tensor layout.
+
+    The shifted tensor has ``T = max_total - 1`` columns and response token
+    ``k`` (0-indexed) of sample ``i`` lives at shifted column
+    ``max_total - 1 - r_len_i + k``. Returns ``(think_mask, move_mask)`` of
+    shape ``(G, T)``, both ``dtype``-valued floats.
+    """
+    G = len(region_indices)
+    T = max(0, max_total - 1)
+    think_mask = torch.zeros((G, T), device=device, dtype=dtype)
+    move_mask = torch.zeros((G, T), device=device, dtype=dtype)
+    if T == 0:
+        return think_mask, move_mask
+    for i, (ts, te, ms) in enumerate(region_indices):
+        r_len_i = int(resp_lens[i].item())
+        if r_len_i <= 0:
+            continue
+        base = max_total - 1 - r_len_i
+        if ts is not None and te is not None and te > ts:
+            a = base + max(0, ts)
+            b = base + min(r_len_i, te)
+            if b > a:
+                think_mask[i, a:b] = 1.0
+        if ms is not None and ms < r_len_i:
+            a = base + max(0, ms)
+            b = base + r_len_i
+            if b > a:
+                move_mask[i, a:b] = 1.0
+    return think_mask, move_mask
 
 THREAT_KEYWORDS = (
     "threat",
@@ -1009,6 +1093,13 @@ _EPISODE_METRICS_FIELDNAMES = [
     "game_mean_chosen_cp_delta_clipped",
     "grpo_loss",
     "grpo_mean_kl",
+    "grpo_mean_kl_per_token",
+    "grpo_mean_kl_think",
+    "grpo_mean_kl_move",
+    "grpo_policy_entropy_move",
+    "grpo_pg_clip_frac",
+    "grpo_ratio_mean",
+    "grpo_ppo_epochs_completed",
     "grpo_mean_reward",
     "mfu",
     "hfu",
@@ -1203,9 +1294,11 @@ class GRPOTrainerOnline:
         device_obj: torch.device,
         lr: float,
         beta: float,
-        kl_penalty_min: float,
-        kl_penalty_max: float,
         max_grad_norm: float,
+        ppo_epochs: int = 2,
+        clip_eps_low: float = 0.2,
+        clip_eps_high: float = 0.28,
+        entropy_coef_move: float = 0.0,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         optimizer_name: str = "adamw_8bit",
         logprob_micro_batch: int = 4,
@@ -1214,9 +1307,11 @@ class GRPOTrainerOnline:
         self.tokenizer = tokenizer
         self.device = device_obj
         self.beta = beta
-        self.kl_penalty_min = kl_penalty_min
-        self.kl_penalty_max = kl_penalty_max
         self.max_grad_norm = max_grad_norm
+        self.ppo_epochs = max(1, int(ppo_epochs))
+        self.clip_eps_low = float(clip_eps_low)
+        self.clip_eps_high = float(clip_eps_high)
+        self.entropy_coef_move = float(entropy_coef_move)
         self.logprob_micro_batch = max(1, int(logprob_micro_batch))
         self.optimizer = _build_optimizer(model, lr=lr, optimizer_name=optimizer_name)
 
@@ -1231,26 +1326,49 @@ class GRPOTrainerOnline:
             gradient_checkpointing=getattr(unwrapped, "is_gradient_checkpointing", False),
         )
 
-    def _compute_response_log_probs(self, query_ids: torch.Tensor, response_ids: torch.Tensor) -> torch.Tensor:
+    def _compute_response_log_probs(
+        self, query_ids: torch.Tensor, response_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Per-token response log-probs for a single sample.
+
+        Returns ``(token_lp, resp_mask, r_len)`` where ``token_lp`` and
+        ``resp_mask`` both have shape ``(r_len,)``. ``resp_mask`` is all-ones
+        here (no padding for a single sequence) but is returned for API
+        parity with the batched helper.
+        """
         input_ids = torch.cat([query_ids, response_ids]).unsqueeze(0).to(self.device)
         logits = self.model(input_ids=input_ids).logits
         response_start = query_ids.size(0)
         response_logits = logits[0, response_start - 1 : -1, :]
         log_probs = F.log_softmax(response_logits.float(), dim=-1)
         token_log_probs = log_probs.gather(1, response_ids.to(self.device).unsqueeze(1)).squeeze(1)
-        return token_log_probs.sum()
+        r_len = int(response_ids.numel())
+        resp_mask = torch.ones(r_len, dtype=token_log_probs.dtype, device=self.device)
+        return token_log_probs, resp_mask, r_len
 
     def _compute_response_log_probs_batch(
         self,
         queries: List[torch.Tensor],
         responses: List[torch.Tensor],
-    ) -> torch.Tensor:
-        """Summed response log-probabilities for a micro-batch in one forward pass.
+        move_mask: Optional[torch.Tensor] = None,
+        return_move_entropy: bool = False,
+    ) -> Dict[str, Any]:
+        """Per-token response log-probs (and optional move-region entropy) in one forward.
 
         Sequences are left-padded to the common length so every response ends
         at column ``max_total - 1`` and can be sliced uniformly. Padding is
         masked out via ``attention_mask`` so it never contributes gradients.
-        Returns a tensor of shape ``(G,)``.
+
+        Returns a dict with:
+          - ``token_lp``: ``(G, max_total - 1)`` per-token log-probs of the
+            target tokens (zero outside the response span).
+          - ``resp_mask``: ``(G, max_total - 1)`` float mask, 1 on response
+            token predictions.
+          - ``resp_lens``: ``(G,)`` int tensor of response lengths.
+          - ``max_total``: ``int`` common padded sequence length.
+          - ``move_entropy_mean``: ``(G,)`` or ``None``. Per-sample mean
+            entropy over ``move_mask`` positions if ``return_move_entropy``
+            and ``move_mask`` is non-empty.
         """
         G = len(queries)
         q_lens = [int(q.numel()) for q in queries]
@@ -1283,8 +1401,45 @@ class GRPOTrainerOnline:
         pos = torch.arange(max_total - 1, device=self.device).unsqueeze(0)  # (1, L-1)
         resp_pred_start = (max_total - resp_lens - 1).unsqueeze(1)  # (G, 1)
         response_mask = (pos >= resp_pred_start).to(token_lp.dtype)
-        summed = (token_lp * response_mask).sum(dim=1)
-        return summed
+        token_lp = token_lp * response_mask
+
+        move_entropy_mean: Optional[torch.Tensor] = None
+        if return_move_entropy and move_mask is not None and move_mask.numel() > 0:
+            mm_bool = move_mask.to(dtype=torch.bool, device=self.device)
+            # Only honor move tokens that are inside the response span.
+            mm_bool = mm_bool & response_mask.bool()
+            counts = mm_bool.sum(dim=1)  # (G,)
+            if int(counts.sum().item()) > 0:
+                selected_logits = shifted[mm_bool]  # (N_sel, V)
+                sel_logp = F.log_softmax(selected_logits.float(), dim=-1)
+                sel_p = sel_logp.exp()
+                entropy_selected = -(sel_p * sel_logp).sum(dim=-1)  # (N_sel,)
+                sample_idx = (
+                    torch.arange(G, device=self.device)
+                    .unsqueeze(1)
+                    .expand_as(mm_bool)[mm_bool]
+                )
+                per_sample_sum = torch.zeros(
+                    G, device=self.device, dtype=entropy_selected.dtype
+                )
+                per_sample_sum.scatter_add_(0, sample_idx, entropy_selected)
+                move_entropy_mean = per_sample_sum / counts.clamp_min(1).to(
+                    per_sample_sum.dtype
+                )
+            else:
+                move_entropy_mean = torch.zeros(
+                    G, device=self.device, dtype=token_lp.dtype
+                )
+        elif return_move_entropy:
+            move_entropy_mean = torch.zeros(G, device=self.device, dtype=token_lp.dtype)
+
+        return {
+            "token_lp": token_lp,
+            "resp_mask": response_mask,
+            "resp_lens": resp_lens,
+            "max_total": max_total,
+            "move_entropy_mean": move_entropy_mean,
+        }
 
     def _toggle_adapters(self, enable: bool) -> None:
         unwrapped = unwrap_model(self.model)
@@ -1379,131 +1534,297 @@ class GRPOTrainerOnline:
         n = len(query_ids_batch)
         advantages_dev = advantages.to(self.device)
 
-        total_loss = 0.0
-        total_kl = 0.0
-        total_kl_penalty = 0.0
-        samples_ok = 0
+        # Pre-compute region (think / move) token indices per sample once up
+        # front: these depend only on the response text and are reused across
+        # every PPO epoch.
+        region_indices_all: List[Tuple[Optional[int], Optional[int], Optional[int]]] = [
+            _find_region_token_indices(self.tokenizer, r) for r in response_ids_batch
+        ]
 
-        def _process_micro(start_idx: int, end_idx: int) -> bool:
-            nonlocal total_loss, total_kl, total_kl_penalty, samples_ok
-            qs = [query_ids_batch[i] for i in range(start_idx, end_idx)]
-            rs = [response_ids_batch[i] for i in range(start_idx, end_idx)]
-            adv_slice = advantages_dev[start_idx:end_idx]
+        # -----------------------------------------------------------------
+        # Phase 1: precompute (ref_tok_lp, cur_tok_lp_old) per micro-batch.
+        # Both are detached — they anchor KL (to reference) and the PPO
+        # importance ratio (to the pre-update policy).
+        # -----------------------------------------------------------------
+        micro = max(1, int(self.logprob_micro_batch))
+
+        def _precompute_caches(micro_size: int) -> Optional[List[Dict[str, Any]]]:
+            cache: List[Dict[str, Any]] = []
             try:
-                with torch.no_grad():
-                    self._toggle_adapters(enable=False)
-                    ref_lp = self._compute_response_log_probs_batch(qs, rs)
-                    self._toggle_adapters(enable=True)
-                cur_lp = self._compute_response_log_probs_batch(qs, rs)
-
-                kl_raw = cur_lp - ref_lp  # (g,)
-                kl_pen = torch.clamp(kl_raw, min=self.kl_penalty_min, max=self.kl_penalty_max)
-                loss_per = -adv_slice * cur_lp + self.beta * kl_pen  # (g,)
-                group_loss = loss_per.sum() / n
-                group_loss.backward()
-
-                total_loss += float(group_loss.item())
-                total_kl += float(kl_raw.sum().item())
-                total_kl_penalty += float(kl_pen.sum().item())
-                samples_ok += (end_idx - start_idx)
-                return True
+                for s in range(0, n, micro_size):
+                    e = min(s + micro_size, n)
+                    qs = [query_ids_batch[i] for i in range(s, e)]
+                    rs = [response_ids_batch[i] for i in range(s, e)]
+                    region_slice = region_indices_all[s:e]
+                    with torch.no_grad():
+                        self._toggle_adapters(enable=False)
+                        ref_out = self._compute_response_log_probs_batch(qs, rs)
+                        self._toggle_adapters(enable=True)
+                        cur_old_out = self._compute_response_log_probs_batch(qs, rs)
+                    max_total = ref_out["max_total"]
+                    resp_lens = ref_out["resp_lens"]
+                    think_mask, move_mask = _build_region_masks_padded(
+                        region_slice,
+                        resp_lens,
+                        max_total,
+                        self.device,
+                        dtype=ref_out["token_lp"].dtype,
+                    )
+                    cache.append(
+                        {
+                            "start": s,
+                            "end": e,
+                            "qs": qs,
+                            "rs": rs,
+                            "ref_tok_lp": ref_out["token_lp"].detach(),
+                            "cur_tok_lp_old": cur_old_out["token_lp"].detach(),
+                            "resp_mask": ref_out["resp_mask"],
+                            "resp_lens": resp_lens,
+                            "think_mask": think_mask,
+                            "move_mask": move_mask,
+                            "max_total": max_total,
+                        }
+                    )
+                return cache
             except torch.cuda.OutOfMemoryError:
                 self._toggle_adapters(enable=True)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                return False
+                return None
 
-        micro = max(1, int(self.logprob_micro_batch))
+        caches: Optional[List[Dict[str, Any]]] = None
         oom_retries_left = 3
-        while True:
-            self.optimizer.zero_grad()
-            total_loss = 0.0
-            total_kl = 0.0
-            total_kl_penalty = 0.0
-            samples_ok = 0
-
-            step_oom = False
-            for start_idx in range(0, n, micro):
-                end_idx = min(start_idx + micro, n)
-                if not _process_micro(start_idx, end_idx):
-                    if rank == 0:
-                        print(
-                            f"[GRPO] CUDA OOM on log-prob micro-batch size {end_idx - start_idx}"
-                            f" (current micro={micro}); retrying step with a smaller micro size."
-                        )
-                    step_oom = True
-                    break
-
-            if not step_oom:
+        while oom_retries_left >= 0:
+            caches = _precompute_caches(micro)
+            if caches is not None:
                 break
-            if micro <= 1 or oom_retries_left <= 0:
-                # Final fallback: fully sequential per-sample (guaranteed to fit
-                # if any generation fit) with gradient accumulation.
-                if rank == 0:
-                    print("[GRPO] Falling back to fully sequential per-sample log-prob pass.")
-                self.optimizer.zero_grad()
-                total_loss = 0.0
-                total_kl = 0.0
-                total_kl_penalty = 0.0
-                samples_ok = 0
-                for idx in range(n):
-                    q = query_ids_batch[idx]
-                    r = response_ids_batch[idx]
-                    adv = advantages_dev[idx]
-                    try:
-                        with torch.no_grad():
-                            self._toggle_adapters(enable=False)
-                            ref_log_prob = self._compute_response_log_probs(q, r)
-                            self._toggle_adapters(enable=True)
-                        cur_log_prob = self._compute_response_log_probs(q, r)
-                        kl_raw = cur_log_prob - ref_log_prob
-                        kl_penalty = torch.clamp(
-                            kl_raw, min=self.kl_penalty_min, max=self.kl_penalty_max
-                        )
-                        sample_loss = (-adv * cur_log_prob + self.beta * kl_penalty) / n
-                        sample_loss.backward()
-                        total_loss += float(sample_loss.item())
-                        total_kl += float(kl_raw.item())
-                        total_kl_penalty += float(kl_penalty.item())
-                        samples_ok += 1
-                    except torch.cuda.OutOfMemoryError:
-                        if rank == 0:
-                            print(f"[GRPO] CUDA OOM on sample {idx + 1}/{n}; skipping.")
-                        self._toggle_adapters(enable=True)
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        continue
+            if rank == 0:
+                print(
+                    f"[GRPO] CUDA OOM during precompute at micro={micro}; halving and retrying."
+                )
+            if micro <= 1:
                 break
             micro = max(1, micro // 2)
             oom_retries_left -= 1
+
+        use_sequential_fallback = caches is None
+
+        # -----------------------------------------------------------------
+        # Phase 2: PPO epochs over cached micro-batches.
+        # -----------------------------------------------------------------
+        total_loss = 0.0
+        total_kl_per_token_sum = 0.0
+        total_kl_think_sum = 0.0
+        total_kl_move_sum = 0.0
+        total_entropy_move_sum = 0.0
+        total_ratio_sum = 0.0
+        total_clipped_tokens = 0.0
+        total_response_tokens = 0.0
+        total_think_tokens = 0.0
+        total_move_tokens = 0.0
+        total_entropy_samples = 0
+        samples_ok = 0
+        epochs_completed = 0
+
+        eps_low = self.clip_eps_low
+        eps_high = self.clip_eps_high
+        beta = self.beta
+        ent_coef = self.entropy_coef_move
+
+        if not use_sequential_fallback and caches is not None:
+            need_entropy = ent_coef != 0.0
+            for epoch in range(self.ppo_epochs):
+                self.optimizer.zero_grad()
+                epoch_samples_ok = 0
+                epoch_oom = False
+                for entry in caches:
+                    try:
+                        fwd = self._compute_response_log_probs_batch(
+                            entry["qs"],
+                            entry["rs"],
+                            move_mask=entry["move_mask"],
+                            return_move_entropy=need_entropy,
+                        )
+                    except torch.cuda.OutOfMemoryError:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        if rank == 0:
+                            print(
+                                "[GRPO] CUDA OOM during PPO epoch forward; falling back to sequential path."
+                            )
+                        epoch_oom = True
+                        break
+                    cur_tok_lp = fwd["token_lp"]
+                    resp_mask = entry["resp_mask"]
+                    resp_lens_fl = entry["resp_lens"].to(cur_tok_lp.dtype).clamp_min(1.0)
+                    ref_tok_lp = entry["ref_tok_lp"]
+                    cur_old = entry["cur_tok_lp_old"]
+                    adv_slice = advantages_dev[entry["start"]:entry["end"]]
+
+                    # Importance ratio against the pre-update policy (PPO).
+                    ratio_raw = torch.exp(cur_tok_lp - cur_old)
+                    ratio = ratio_raw * resp_mask  # zero outside response
+
+                    adv_tok = adv_slice.unsqueeze(1).expand_as(ratio)
+                    surr1 = ratio * adv_tok
+                    surr2 = torch.clamp(ratio, 1.0 - eps_low, 1.0 + eps_high) * adv_tok
+                    pg_tok = -torch.min(surr1, surr2)
+                    pg_per_sample = (pg_tok * resp_mask).sum(dim=1) / resp_lens_fl
+
+                    # k3 KL estimator against the (frozen) reference policy.
+                    diff = ref_tok_lp - cur_tok_lp  # log(pi_ref / pi_cur)
+                    kl_tok = torch.exp(diff) - diff - 1.0
+                    kl_tok = kl_tok * resp_mask
+                    kl_per_sample = kl_tok.sum(dim=1) / resp_lens_fl
+
+                    # Entropy bonus on the Move: region.
+                    move_entropy_mean = fwd["move_entropy_mean"]
+                    if move_entropy_mean is None:
+                        entropy_bonus_per_sample = torch.zeros_like(pg_per_sample)
+                        move_entropy_for_log = torch.zeros_like(pg_per_sample)
+                    else:
+                        move_entropy_for_log = move_entropy_mean
+                        entropy_bonus_per_sample = -ent_coef * move_entropy_mean
+
+                    loss_per = pg_per_sample + beta * kl_per_sample + entropy_bonus_per_sample
+                    group_loss = loss_per.sum() / n
+                    group_loss.backward()
+
+                    with torch.no_grad():
+                        total_loss += float(group_loss.item()) / max(1, self.ppo_epochs)
+                        # Per-token mean KL across all response tokens.
+                        total_kl_per_token_sum += float(kl_tok.sum().item())
+                        total_response_tokens += float(resp_mask.sum().item())
+                        # Per-region KL.
+                        think_mask_e = entry["think_mask"]
+                        move_mask_e = entry["move_mask"]
+                        if think_mask_e.sum() > 0:
+                            total_kl_think_sum += float((kl_tok * think_mask_e).sum().item())
+                            total_think_tokens += float(think_mask_e.sum().item())
+                        if move_mask_e.sum() > 0:
+                            total_kl_move_sum += float((kl_tok * move_mask_e).sum().item())
+                            total_move_tokens += float(move_mask_e.sum().item())
+                        # Entropy accumulator (per-sample mean, averaged across batch).
+                        if move_entropy_mean is not None:
+                            total_entropy_move_sum += float(move_entropy_for_log.sum().item())
+                            total_entropy_samples += int(move_entropy_mean.numel())
+                        # Ratio + clip fractions (mask outside-response entries).
+                        mask_bool = resp_mask.bool()
+                        ratio_in_mask = ratio_raw[mask_bool]
+                        if ratio_in_mask.numel() > 0:
+                            total_ratio_sum += float(ratio_in_mask.sum().item())
+                            clipped_mask = (ratio_in_mask < (1.0 - eps_low)) | (
+                                ratio_in_mask > (1.0 + eps_high)
+                            )
+                            total_clipped_tokens += float(clipped_mask.sum().item())
+
+                    epoch_samples_ok += (entry["end"] - entry["start"])
+
+                if epoch_oom:
+                    use_sequential_fallback = True
+                    break
+
+                torch.nn.utils.clip_grad_norm_(
+                    (p for p in self.model.parameters() if p.requires_grad),
+                    self.max_grad_norm,
+                )
+                self.optimizer.step()
+                epochs_completed += 1
+                samples_ok = max(samples_ok, epoch_samples_ok)
+
+        if use_sequential_fallback:
+            # Fallback path: fully sequential, per-sample, single epoch, no
+            # PPO clip (OOM-safe). Keeps the k3 KL estimator for consistency.
+            if rank == 0:
+                print("[GRPO] Falling back to fully sequential per-sample log-prob pass.")
+            self.optimizer.zero_grad()
+            total_loss = 0.0
+            total_kl_per_token_sum = 0.0
+            total_response_tokens = 0.0
+            samples_ok = 0
+            for idx in range(n):
+                q = query_ids_batch[idx]
+                r = response_ids_batch[idx]
+                adv = advantages_dev[idx]
+                try:
+                    with torch.no_grad():
+                        self._toggle_adapters(enable=False)
+                        ref_tok_lp, _, r_len = self._compute_response_log_probs(q, r)
+                        self._toggle_adapters(enable=True)
+                    cur_tok_lp, _, _ = self._compute_response_log_probs(q, r)
+                    r_len_fl = max(1.0, float(r_len))
+                    diff = ref_tok_lp - cur_tok_lp
+                    kl_tok = torch.exp(diff) - diff - 1.0
+                    kl_per_sample = kl_tok.sum() / r_len_fl
+                    cur_lp_mean = cur_tok_lp.sum() / r_len_fl
+                    sample_loss = (-adv * cur_lp_mean + beta * kl_per_sample) / n
+                    sample_loss.backward()
+                    total_loss += float(sample_loss.item())
+                    total_kl_per_token_sum += float(kl_tok.sum().item())
+                    total_response_tokens += float(r_len)
+                    samples_ok += 1
+                except torch.cuda.OutOfMemoryError:
+                    if rank == 0:
+                        print(f"[GRPO] CUDA OOM on sample {idx + 1}/{n}; skipping.")
+                    self._toggle_adapters(enable=True)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+
+            if samples_ok > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    (p for p in self.model.parameters() if p.requires_grad),
+                    self.max_grad_norm,
+                )
+                self.optimizer.step()
+                epochs_completed = 1
 
         if samples_ok == 0:
             self.optimizer.zero_grad()
             return {}
 
-        torch.nn.utils.clip_grad_norm_(
-            (p for p in self.model.parameters() if p.requires_grad),
-            self.max_grad_norm,
-        )
-        self.optimizer.step()
-
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
 
+        # MFU accounting: ``epochs_completed`` training-forwards + 2 no-grad
+        # forwards for the ref / cur_old caches when using the batched path.
+        num_fwd_per_sample = (
+            int(epochs_completed) + 2 if not use_sequential_fallback else 2
+        )
         mfu_stats = self.mfu_tracker.compute(
             total_tokens=total_tokens,
             elapsed_sec=elapsed,
-            num_fwd_per_sample=2,
+            num_fwd_per_sample=max(2, num_fwd_per_sample),
         )
         mem_alloc = (torch.cuda.memory_allocated(device) / 1e9) if torch.cuda.is_available() else 0.0
         mem_res = (torch.cuda.memory_reserved(device) / 1e9) if torch.cuda.is_available() else 0.0
 
+        mean_kl_per_token = total_kl_per_token_sum / max(1.0, total_response_tokens)
+        mean_kl_think = total_kl_think_sum / total_think_tokens if total_think_tokens > 0 else 0.0
+        mean_kl_move = total_kl_move_sum / total_move_tokens if total_move_tokens > 0 else 0.0
+        mean_entropy_move = (
+            total_entropy_move_sum / total_entropy_samples
+            if total_entropy_samples > 0
+            else 0.0
+        )
+        ratio_tokens_seen = float(total_response_tokens)
+        ratio_mean = total_ratio_sum / ratio_tokens_seen if ratio_tokens_seen > 0 else 0.0
+        pg_clip_frac = (
+            total_clipped_tokens / ratio_tokens_seen if ratio_tokens_seen > 0 else 0.0
+        )
+
         stats = {
             "grpo/loss": total_loss,
             "grpo/mean_advantage": float(advantages.mean().item()),
-            "grpo/mean_kl": total_kl / max(1, samples_ok),
-            "grpo/mean_kl_penalty": total_kl_penalty / max(1, samples_ok),
+            "grpo/mean_kl": mean_kl_per_token,
+            "grpo/mean_kl_per_token": mean_kl_per_token,
+            "grpo/mean_kl_think": mean_kl_think,
+            "grpo/mean_kl_move": mean_kl_move,
+            "grpo/policy_entropy_move": mean_entropy_move,
+            "grpo/pg_clip_frac": pg_clip_frac,
+            "grpo/ratio_mean": ratio_mean,
+            "grpo/ppo_epochs_completed": float(epochs_completed),
             "grpo/mean_reward": float(rewards_t.mean().item()),
             "grpo/batch_reward_std": reward_std,
             "grpo/samples_ok": float(samples_ok),
@@ -1564,6 +1885,7 @@ class XiangqiAgent:
         regeneration_batch_size: int = 0,
         min_distinct_legal_moves: int = 0,
         dedupe_legal_by_move: bool = True,
+        regen_generate_overrides: Optional[Dict[str, Any]] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -1589,6 +1911,10 @@ class XiangqiAgent:
         )
         self.min_distinct_legal_moves = max(0, int(min_distinct_legal_moves))
         self.dedupe_legal_by_move = bool(dedupe_legal_by_move)
+        # Extra generate(...) kwargs applied only on regeneration passes
+        # (pass_idx > 0). Typically widens temperature / top_p to boost
+        # exploration once the initial pass lands in a low-diversity basin.
+        self.regen_generate_overrides: Dict[str, Any] = dict(regen_generate_overrides or {})
         # Start the EMA at 0 so the full format_weight is used until the model
         # has demonstrated consistent compliance across multiple rounds.
         self._format_compliance_ema: float = 0.0
@@ -1740,6 +2066,7 @@ class XiangqiAgent:
         episode: int,
         round_idx: int,
         pass_label: str,
+        generate_override: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[List[str]], int, int, int, float, Optional[Tuple[int, int]]]:
         """Run a single generation pass with OOM retry.
 
@@ -1787,13 +2114,16 @@ class XiangqiAgent:
             attempt_start = time.perf_counter()
             try:
                 with torch.no_grad():
+                    merged_cfg: Dict[str, Any] = {
+                        **self.generate_config,
+                        "max_new_tokens": max_new,
+                    }
+                    if generate_override:
+                        merged_cfg.update(generate_override)
                     outputs = generate_model.generate(
                         inputs=ids_batch,
                         attention_mask=mask_batch,
-                        **{
-                            **self.generate_config,
-                            "max_new_tokens": max_new,
-                        },
+                        **merged_cfg,
                     )
             except torch.cuda.OutOfMemoryError:
                 local_success = False
@@ -1880,9 +2210,15 @@ class XiangqiAgent:
                 if pass_idx == 0:
                     num_generations = self.num_generations
                     pass_label = "initial"
+                    generate_override: Optional[Dict[str, Any]] = None
                 else:
                     num_generations = self.regeneration_batch_size
                     pass_label = f"regen {pass_idx}"
+                    generate_override = (
+                        dict(self.regen_generate_overrides)
+                        if self.regen_generate_overrides
+                        else None
+                    )
 
                 decoded_batch, ctx_len_pass, n_seq, gen_len, wall_sec, attempt_used = (
                     self._generate_one_batch(
@@ -1892,6 +2228,7 @@ class XiangqiAgent:
                         episode=episode,
                         round_idx=round_idx,
                         pass_label=pass_label,
+                        generate_override=generate_override,
                     )
                 )
                 context_len = ctx_len_pass
@@ -2303,10 +2640,22 @@ hyperparams = {
     "grpo/dedupe_legal_by_move": True,
     "grpo/max_regeneration_rounds": 3,
     "grpo/regeneration_batch_size": 12,
-    "grpo/lr": 6e-6,
-    "grpo/beta": 0.1,
-    "grpo/kl_penalty_min": 0.0,
-    "grpo/kl_penalty_max": 10.0,
+    "grpo/lr": 3e-6,
+    # Lowered from 0.3 to match the per-token k3 KL scale (previous value was
+    # calibrated to per-sequence summed KL). Expect per-token KL to live near
+    # 1e-2 so a small beta is already strong regularization.
+    "grpo/beta": 0.05,
+    # PPO-style ratio clipping over ``grpo/ppo_epochs`` inner optimizer steps.
+    # ``clip_eps_high > clip_eps_low`` (DAPO "Clip Higher") gives exploration
+    # tokens a little more headroom to increase their probability while still
+    # bounding the step on the downside.
+    "grpo/ppo_epochs": 2,
+    "grpo/clip_eps_low": 0.2,
+    "grpo/clip_eps_high": 0.28,
+    # Small entropy bonus on just the ``Move:`` region tokens (3-5 tokens).
+    # Directly counteracts move-level mode collapse without affecting <think>
+    # reasoning. Set to 0 to disable.
+    "grpo/entropy_coef_move": 0.01,
     "grpo/max_grad_norm": 0.1,
     "grpo/optim": "adamw_8bit",
     "generate/max_new_tokens": 384,
@@ -2320,6 +2669,11 @@ hyperparams = {
     "generate/temperature": 1.2,
     "generate/top_p": 0.98,
     "generate/repetition_penalty": 1.1,
+    # Regeneration passes (pass_idx > 0) use a higher temperature + top_p to
+    # inject move diversity once the initial pass lands in a low-entropy
+    # basin. Leave unset (None) to reuse the base generate config.
+    "generate/regen_temperature": 1.6,
+    "generate/regen_top_p": 0.98,
     "episodes": 500,
     "max_rounds_per_episode": 200,
     "seed": 42069,
@@ -2519,9 +2873,11 @@ grpo_trainer = GRPOTrainerOnline(
     device_obj=device,
     lr=float(hyperparams["grpo/lr"]),
     beta=float(hyperparams["grpo/beta"]),
-    kl_penalty_min=float(hyperparams["grpo/kl_penalty_min"]),
-    kl_penalty_max=float(hyperparams["grpo/kl_penalty_max"]),
     max_grad_norm=float(hyperparams["grpo/max_grad_norm"]),
+    ppo_epochs=int(hyperparams.get("grpo/ppo_epochs", 2)),
+    clip_eps_low=float(hyperparams.get("grpo/clip_eps_low", 0.2)),
+    clip_eps_high=float(hyperparams.get("grpo/clip_eps_high", 0.28)),
+    entropy_coef_move=float(hyperparams.get("grpo/entropy_coef_move", 0.0)),
     mp_policy=mp_policy,
     optimizer_name=str(hyperparams["grpo/optim"]),
     logprob_micro_batch=int(hyperparams.get("grpo/logprob_micro_batch", 4)),
@@ -2536,6 +2892,14 @@ generate_config = {
     "pad_token_id": tokenizer.pad_token_id,
     "eos_token_id": tokenizer.eos_token_id,
 }
+
+regen_generate_overrides: Dict[str, Any] = {}
+_regen_temp_cfg = hyperparams.get("generate/regen_temperature")
+if _regen_temp_cfg is not None:
+    regen_generate_overrides["temperature"] = float(_regen_temp_cfg)
+_regen_top_p_cfg = hyperparams.get("generate/regen_top_p")
+if _regen_top_p_cfg is not None:
+    regen_generate_overrides["top_p"] = float(_regen_top_p_cfg)
 
 pikafish_evaluator: Optional[PikafishEvaluator] = None
 if rank == 0:
@@ -2583,6 +2947,7 @@ ally_agent = XiangqiAgent(
     regeneration_batch_size=int(hyperparams["grpo/regeneration_batch_size"]),
     min_distinct_legal_moves=int(hyperparams["grpo/min_distinct_legal_moves"]),
     dedupe_legal_by_move=bool(hyperparams["grpo/dedupe_legal_by_move"]),
+    regen_generate_overrides=regen_generate_overrides,
 )
 enemy_agent = GreedyEnemyAgent()
 
@@ -2986,6 +3351,19 @@ try:
                 "game_mean_chosen_cp_delta_clipped": _fmt_metric(mean_chosen_cp_delta),
                 "grpo_loss": _fmt_metric(train_stats_last.get("grpo/loss")),
                 "grpo_mean_kl": _fmt_metric(train_stats_last.get("grpo/mean_kl")),
+                "grpo_mean_kl_per_token": _fmt_metric(
+                    train_stats_last.get("grpo/mean_kl_per_token")
+                ),
+                "grpo_mean_kl_think": _fmt_metric(train_stats_last.get("grpo/mean_kl_think")),
+                "grpo_mean_kl_move": _fmt_metric(train_stats_last.get("grpo/mean_kl_move")),
+                "grpo_policy_entropy_move": _fmt_metric(
+                    train_stats_last.get("grpo/policy_entropy_move")
+                ),
+                "grpo_pg_clip_frac": _fmt_metric(train_stats_last.get("grpo/pg_clip_frac")),
+                "grpo_ratio_mean": _fmt_metric(train_stats_last.get("grpo/ratio_mean")),
+                "grpo_ppo_epochs_completed": _fmt_metric(
+                    train_stats_last.get("grpo/ppo_epochs_completed")
+                ),
                 "grpo_mean_reward": _fmt_metric(train_stats_last.get("grpo/mean_reward")),
                 "mfu": _fmt_metric(train_stats_last.get("mfu/mfu")),
                 "hfu": _fmt_metric(train_stats_last.get("mfu/hfu")),
