@@ -256,6 +256,89 @@ def _build_region_masks_padded(
                 move_mask[i, a:b] = 1.0
     return think_mask, move_mask
 
+
+def _build_move_constraint_fn(
+    legal_moves: List[str],
+    tokenizer,
+    prompt_len: int,
+):
+    """Return a ``prefix_allowed_tokens_fn`` that forces every sample to, once
+    it has emitted the literal ``"Move: "`` label, continue only with tokens
+    that extend at least one legal move string (e.g. ``e9e8``).
+
+    If the legal move list is empty or the tokenizer boundary-merges a move
+    into the trailing space of ``"Move: "`` differently than it encodes it in
+    isolation, we return ``None`` and the caller should skip the constraint
+    (falling back to unconstrained regen sampling).
+
+    Because HF requires ``prefix_allowed_tokens_fn`` to always return a list,
+    we cache a single full-vocab fallback list and return it when no
+    constraint applies.
+    """
+    if not legal_moves:
+        return None
+    move_prefix_text = "Move: "
+    try:
+        prefix_ids = tokenizer.encode(move_prefix_text, add_special_tokens=False)
+    except Exception:
+        return None
+    if not prefix_ids:
+        return None
+
+    per_move_only: List[Tuple[int, ...]] = []
+    for m in legal_moves:
+        try:
+            full_ids = tokenizer.encode(move_prefix_text + m, add_special_tokens=False)
+        except Exception:
+            continue
+        if len(full_ids) <= len(prefix_ids):
+            continue
+        if full_ids[: len(prefix_ids)] != prefix_ids:
+            # Tokenizer merged the boundary; skip this move. As long as at
+            # least one move survives the per-move list is still useful.
+            continue
+        per_move_only.append(tuple(full_ids[len(prefix_ids):]))
+    if not per_move_only:
+        return None
+
+    prefix_tuple = tuple(prefix_ids)
+    plen = len(prefix_tuple)
+    vocab_size = int(getattr(tokenizer, "vocab_size", 0)) or len(tokenizer)
+    full_vocab: List[int] = list(range(vocab_size))
+
+    def fn(batch_id: int, input_ids) -> List[int]:
+        try:
+            gen = input_ids.tolist()[prompt_len:]
+        except Exception:
+            return full_vocab
+        if not gen:
+            return full_vocab
+        # Walk backwards to find the latest ``"Move: "`` marker whose move
+        # has not yet been fully emitted. Anything before a completed
+        # move is ignored so the model can freely continue past it.
+        last_end = -1
+        for i in range(len(gen) - plen, -1, -1):
+            if tuple(gen[i : i + plen]) == prefix_tuple:
+                after_i = tuple(gen[i + plen :])
+                if not any(after_i == m for m in per_move_only):
+                    last_end = i + plen
+                    break
+        if last_end < 0:
+            return full_vocab
+        after = tuple(gen[last_end:])
+        allowed = set()
+        for m in per_move_only:
+            if len(after) >= len(m):
+                continue
+            if m[: len(after)] == after:
+                allowed.add(m[len(after)])
+        if not allowed:
+            return full_vocab
+        return sorted(allowed)
+
+    return fn
+
+
 THREAT_KEYWORDS = (
     "threat",
     "attack",
@@ -2203,6 +2286,21 @@ class XiangqiAgent:
         regen_passes = 0
         distinct_legal_moves: set[str] = set()
 
+        # Build an engine-constrained ``prefix_allowed_tokens_fn`` once per
+        # turn (rank 0 only) so regen passes are forced to sample moves from
+        # Pikafish's legal action list. For multi-rank we'd need to broadcast
+        # the legal move list; single-rank torchrun is the current deployment.
+        prompt_len_for_constraint = (
+            int(encoded.input_ids.size(1)) if (rank == 0 and encoded is not None) else 0
+        )
+        move_constraint_fn = None
+        if rank == 0 and legal_moves_hint:
+            move_constraint_fn = _build_move_constraint_fn(
+                legal_moves=list(legal_moves_hint),
+                tokenizer=self.tokenizer,
+                prompt_len=prompt_len_for_constraint,
+            )
+
         self._set_generation_checkpointing(enable=False)
         try:
             pass_idx = 0
@@ -2219,6 +2317,11 @@ class XiangqiAgent:
                         if self.regen_generate_overrides
                         else None
                     )
+                    if move_constraint_fn is not None:
+                        generate_override = generate_override or {}
+                        generate_override["prefix_allowed_tokens_fn"] = (
+                            move_constraint_fn
+                        )
 
                 decoded_batch, ctx_len_pass, n_seq, gen_len, wall_sec, attempt_used = (
                     self._generate_one_batch(
@@ -2655,7 +2758,7 @@ hyperparams = {
     # Small entropy bonus on just the ``Move:`` region tokens (3-5 tokens).
     # Directly counteracts move-level mode collapse without affecting <think>
     # reasoning. Set to 0 to disable.
-    "grpo/entropy_coef_move": 0.01,
+    "grpo/entropy_coef_move": 0.05,
     "grpo/max_grad_norm": 0.1,
     "grpo/optim": "adamw_8bit",
     "generate/max_new_tokens": 384,
