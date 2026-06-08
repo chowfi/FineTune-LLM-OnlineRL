@@ -1,5 +1,3 @@
-This is a group project developed by a team of three individuals.
-
 # FineTune-LLM-OnlineRL
 
 Game: Xiangqi
