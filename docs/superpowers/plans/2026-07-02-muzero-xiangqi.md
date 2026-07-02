@@ -1696,8 +1696,8 @@ class SelfPlayWorker:
         self.coordinator = coordinator
         self.evaluator = evaluator
         self.worker_id = worker_id
-        self.mcts = MCTS(config)
         self.rng = np.random.default_rng(config.seed + worker_id + 1)
+        self.mcts = MCTS(config, rng=self.rng)  # seeded noise, thread-local RNG
         self.games_started = 0
 
     def _new_game(self) -> _Game:
