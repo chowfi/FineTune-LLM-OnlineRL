@@ -146,3 +146,206 @@ class MuZeroTrainer:
         result = {k: float(v.detach()) for k, v in losses.items()}
         result["total"] = float(total.detach())
         return result
+
+
+def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
+    """Ally (MCTS, no noise, argmax) vs raw Pikafish at gate movetime."""
+    from muzero.encoding import index_to_move, move_to_index
+    from muzero.env import XiangqiEnv
+    from muzero.mcts import MCTS
+    from muzero.warmstart import SimpleUciEngine
+    from src.xiangqi_board import engine_uci_to_algebraic
+
+    engine = SimpleUciEngine(cfg.pikafish_bin, cfg.gate_movetime_ms, multipv=1)
+    mcts = MCTS(cfg)
+    wins = draws = 0
+    try:
+        for i in range(cfg.gate_games):
+            ally_side = "w" if i % 2 == 0 else "b"
+            env = XiangqiEnv(cfg, evaluator)
+            env.reset(ally_side=ally_side)
+            done = False
+            while not done:
+                if env.side_to_move == ally_side:
+                    legal = np.array(
+                        [move_to_index(m) for m in env.legal_moves()], dtype=np.int64
+                    )
+                    ((visits, _),) = mcts.run(
+                        runner,
+                        [(env.observation().astype(np.float32), legal)],
+                        add_noise=False,
+                    )
+                    move = index_to_move(max(visits, key=visits.get))
+                else:
+                    lines = engine.search(env.fen())
+                    if not lines:
+                        break
+                    move = engine_uci_to_algebraic(lines[0][0])
+                _, _, done, _ = env.step(move)
+            if env.result in ("red_win", "black_win"):
+                if (env.result == "red_win") == (ally_side == "w"):
+                    wins += 1
+            else:
+                draws += 1
+    finally:
+        engine.close()
+    n = cfg.gate_games
+    return {
+        "gate/win_rate": wins / n,
+        "gate/draw_rate": draws / n,
+        "gate/loss_rate": (n - wins - draws) / n,
+    }
+
+
+def main():
+    import argparse
+    import copy
+    import os
+
+    from src.pikafish_eval import PikafishEvaluator
+
+    from muzero.mcts import NetRunner
+    from muzero.metrics import MetricsLogger, aggregate_game_summaries
+    from muzero.replay_buffer import ReplayBuffer
+    from muzero.selfplay import SelfPlayCoordinator, SelfPlayWorker
+    from muzero.warmstart import generate_warmstart_games
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--iterations", type=int, default=1000)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--no-wandb", action="store_true")
+    parser.add_argument("--smoke", action="store_true", help="tiny end-to-end run")
+    args = parser.parse_args()
+
+    cfg = MuZeroConfig()
+    if args.device:
+        cfg.device = args.device
+    if args.smoke:
+        cfg.channels, cfg.repr_blocks, cfg.dyn_blocks = 16, 1, 1
+        cfg.num_simulations, cfg.interior_topk = 8, 8
+        cfg.num_workers, cfg.games_per_worker = 1, 2
+        cfg.max_game_plies, cfg.batch_size = 6, 4
+        cfg.warmstart_plies, cfg.warmstart_train_batches = 8, 2
+        cfg.games_per_train_loop, cfg.gate_every_loops = 2, 10**9
+
+    torch.manual_seed(cfg.seed)
+    device = cfg.device if torch.cuda.is_available() or cfg.device == "cpu" else "cpu"
+    ally = MuZeroNet(cfg).to(device)
+    enemy = copy.deepcopy(ally).to(device)
+    enemy.eval()
+    trainer = MuZeroTrainer(cfg, ally)
+    start_iteration = 0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        ally.load_state_dict(ckpt["ally"])
+        enemy.load_state_dict(ckpt["enemy"])
+        trainer.optimizer.load_state_dict(ckpt["optimizer"])
+        start_iteration = ckpt["iteration"]
+
+    buffer = ReplayBuffer(cfg)
+    ally_runner, enemy_runner = NetRunner(ally, device), NetRunner(enemy, device)
+    # Runners are created before the coordinator so the coordinator can be
+    # handed the enemy runner's lock: promotion must not swap weights
+    # mid-forward-pass (see Task 10).
+    coordinator = SelfPlayCoordinator(cfg, ally, enemy, enemy_lock=enemy_runner.lock)
+    if args.resume and "era" in torch.load(args.resume, map_location="cpu"):
+        coordinator.era = torch.load(args.resume, map_location="cpu")["era"]
+
+    def make_evaluator():
+        return PikafishEvaluator(
+            binary_path=cfg.pikafish_bin,
+            depth=cfg.pikafish_depth,
+            timeout_sec=cfg.pikafish_timeout_sec,
+            movetime_ms=cfg.pikafish_movetime_ms,
+            verbose=False,
+        )
+
+    workers = [
+        SelfPlayWorker(
+            cfg,
+            ally_runner,
+            enemy_runner,
+            buffer,
+            coordinator,
+            make_evaluator(),
+            worker_id=w,
+        )
+        for w in range(cfg.num_workers)
+    ]
+    gate_evaluator = make_evaluator()
+    logger = MetricsLogger(cfg, enabled=not args.no_wandb)
+    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+
+    if not buffer.games:
+        print("[warmstart] generating Pikafish games ...")
+        stats = generate_warmstart_games(cfg, buffer, workers[0].evaluator)
+        print(f"[warmstart] {stats['games']} games / {stats['plies']} plies")
+        for _ in range(cfg.warmstart_train_batches):
+            trainer.train_batch(buffer.sample_batch(cfg.batch_size))
+
+    import threading
+
+    for it in range(start_iteration, args.iterations):
+        # -- generate --
+        games_per_worker_now = cfg.games_per_worker
+        results, threads = [], []
+        for w in workers:
+            t = threading.Thread(
+                target=lambda w=w: results.extend(w.generate(games_per_worker_now))
+            )
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        metrics = aggregate_game_summaries(results)
+
+        # -- train: ~games_per_train_loop games' worth of positions --
+        num_batches = max(
+            1,
+            int(cfg.games_per_train_loop * buffer.mean_game_length() // cfg.batch_size),
+        )
+        loss_sums: dict = {}
+        for _ in range(num_batches):
+            for k, v in trainer.train_batch(
+                buffer.sample_batch(cfg.batch_size)
+            ).items():
+                loss_sums[k] = loss_sums.get(k, 0.0) + v
+        metrics.update({f"loss/{k}": v / num_batches for k, v in loss_sums.items()})
+        metrics.update(
+            {
+                "buffer/games": len(buffer.games),
+                "buffer/mean_game_length": buffer.mean_game_length(),
+                "buffer/total_games_added": buffer.total_games_added,
+                "train/batches": num_batches,
+                "train/steps": trainer.train_steps,
+            }
+        )
+
+        # -- gate --
+        if (it + 1) % cfg.gate_every_loops == 0:
+            metrics.update(run_gate(cfg, ally_runner, gate_evaluator))
+
+        logger.log(metrics, step=it)
+        print(
+            f"[iter {it}] "
+            + " ".join(
+                f"{k}={v:.3f}"
+                for k, v in sorted(metrics.items())
+                if isinstance(v, float)
+            )
+        )
+        torch.save(
+            {
+                "ally": ally.state_dict(),
+                "enemy": enemy.state_dict(),
+                "optimizer": trainer.optimizer.state_dict(),
+                "iteration": it + 1,
+                "era": coordinator.era,
+            },
+            os.path.join(cfg.checkpoint_dir, "latest.pt"),
+        )
+
+
+if __name__ == "__main__":
+    main()
