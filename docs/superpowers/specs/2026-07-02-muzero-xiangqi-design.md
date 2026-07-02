@@ -83,7 +83,9 @@ place numbers live.
   `192 × 10 × 9` latent.
 - **Dynamics:** latent + action plane → 8 residual blocks → next latent +
   reward head.
-- **Prediction heads:** policy (8,100 logits), value (categorical, 601 bins over [−300, 300] with MuZero invertible scaling),
+- **Prediction heads:** policy (8,100 logits), value (categorical, 601 bins over [−3, 3] in h-transformed units — sized to the
+  hybrid reward scale where n-step returns live in ≈[−2, 2]; raw-value ceiling
+  ≈ ±15 after inverse transform),
   **moves-left** (categorical over remaining plies, capped at 200), **material-balance**
   (regression, Red-minus-Black piece values computed from the board — no
   engine call), and a **SimSiam projector/predictor** for the consistency loss.

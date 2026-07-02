@@ -133,7 +133,7 @@ class MuZeroConfig:
     repr_blocks: int = 12
     dyn_blocks: int = 8
     value_bins: int = 601
-    value_max: float = 300.0  # support over h-transformed returns
+    value_max: float = 3.0  # h-transformed units; n-step returns live in ~[-2,2]
     reward_bins: int = 21
     reward_max: float = 2.0
     moves_left_max: int = 200
