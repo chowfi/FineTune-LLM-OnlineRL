@@ -9,3 +9,7 @@ wandb/
 *.wandb
 
 deliverables/*
+
+# Python bytecode
+__pycache__/
+*.pyc
