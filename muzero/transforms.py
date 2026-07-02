@@ -23,6 +23,8 @@ def scalar_to_support(
     x: torch.Tensor, vmin: float, vmax: float, bins: int
 ) -> torch.Tensor:
     """Two-hot encoding of scalars onto a linear support. Output: x.shape + (bins,)."""
+    assert bins >= 2, bins
+    x = x.float()
     x = x.clamp(vmin, vmax)
     step = (vmax - vmin) / (bins - 1)
     pos = (x - vmin) / step

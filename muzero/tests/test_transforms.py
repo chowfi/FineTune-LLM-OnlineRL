@@ -21,3 +21,28 @@ def test_support_round_trip():
     # support_to_scalar expects logits; log of the two-hot distribution works
     back = support_to_scalar(torch.log(support + 1e-12), -2.0, 2.0, 21)
     assert torch.allclose(back, x, atol=1e-3)
+
+
+def test_support_edges_and_clamping():
+    x = torch.tensor([[-2.0, 2.0, -5.0, 5.0]])  # exact edges + out-of-range
+    support = scalar_to_support(x, -2.0, 2.0, 21)
+    assert torch.allclose(support.sum(-1), torch.ones(1, 4), atol=1e-6)
+    back = support_to_scalar(torch.log(support + 1e-12), -2.0, 2.0, 21)
+    assert torch.allclose(back, torch.tensor([[-2.0, 2.0, -2.0, 2.0]]), atol=1e-3)
+
+
+def test_value_head_config_round_trip():
+    # value head shape: 601 bins over [-300, 300] on h-transformed scalars
+    from muzero.transforms import h_transform
+
+    raw = torch.tensor([[-2000.0, -1.0, 0.0, 37.5, 2000.0]])
+    hx = h_transform(raw)
+    support = scalar_to_support(hx, -300.0, 300.0, 601)
+    back = support_to_scalar(torch.log(support + 1e-12), -300.0, 300.0, 601)
+    assert torch.allclose(back, hx, atol=1e-2)
+
+
+def test_float64_input_does_not_crash():
+    x = torch.tensor([[0.5]], dtype=torch.float64)
+    support = scalar_to_support(x, -2.0, 2.0, 21)
+    assert support.dtype == torch.float32
