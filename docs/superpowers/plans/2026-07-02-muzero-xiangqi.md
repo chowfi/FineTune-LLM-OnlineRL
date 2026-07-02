@@ -1377,12 +1377,14 @@ class NetRunner:
 
     def initial(self, obs_batch: np.ndarray) -> dict:
         with self.lock, torch.inference_mode():
+            self.net.eval()  # BatchNorm: batch-stats + running-stat mutation otherwise
             obs = torch.from_numpy(np.ascontiguousarray(obs_batch)).to(self.device)
             out = self.net.initial_inference(obs)
         return self._detach(out)
 
     def recurrent(self, hidden: torch.Tensor, actions: np.ndarray) -> dict:
         with self.lock, torch.inference_mode():
+            self.net.eval()  # see initial()
             acts = torch.from_numpy(np.ascontiguousarray(actions)).to(self.device)
             out = self.net.recurrent_inference(hidden, acts)
         return self._detach(out)
