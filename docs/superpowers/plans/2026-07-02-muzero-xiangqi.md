@@ -2362,10 +2362,11 @@ def main():
         start_iteration = ckpt["iteration"]
 
     buffer = ReplayBuffer(cfg)
-    coordinator = SelfPlayCoordinator(cfg, ally, enemy)
+    ally_runner, enemy_runner = NetRunner(ally, device), NetRunner(enemy, device)
+    # enemy_lock: promotion must not swap weights mid-forward-pass (see Task 10)
+    coordinator = SelfPlayCoordinator(cfg, ally, enemy, enemy_lock=enemy_runner.lock)
     if args.resume and "era" in torch.load(args.resume, map_location="cpu"):
         coordinator.era = torch.load(args.resume, map_location="cpu")["era"]
-    ally_runner, enemy_runner = NetRunner(ally, device), NetRunner(enemy, device)
 
     def make_evaluator():
         return PikafishEvaluator(
