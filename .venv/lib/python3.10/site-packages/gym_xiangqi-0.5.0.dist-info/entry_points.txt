@@ -1,0 +1,4 @@
+[console_scripts]
+agent-v-agent = gym_xiangqi.examples.agent_v_agent_demo:main
+player-v-agent = gym_xiangqi.examples.game_mode:main
+

@@ -1,6 +1,4 @@
 # Exclude heavy training data and raw databases
-# data/xiangqi_sft/xiangqi_sft_train.jsonl
-# data/xiangqi_sft/raw/xqdb_masters_40711_UCI_games.pgn 
 
 checkpoints/
 *.pt
@@ -9,3 +7,5 @@ checkpoints/
 
 wandb/
 *.wandb
+
+deliverables/*
