@@ -236,6 +236,7 @@ def main():
     enemy.eval()
     trainer = MuZeroTrainer(cfg, ally)
     start_iteration = 0
+    ckpt = None
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         ally.load_state_dict(ckpt["ally"])
@@ -249,8 +250,9 @@ def main():
     # handed the enemy runner's lock: promotion must not swap weights
     # mid-forward-pass (see Task 10).
     coordinator = SelfPlayCoordinator(cfg, ally, enemy, enemy_lock=enemy_runner.lock)
-    if args.resume and "era" in torch.load(args.resume, map_location="cpu"):
-        coordinator.era = torch.load(args.resume, map_location="cpu")["era"]
+    if ckpt is not None:
+        coordinator.era = ckpt.get("era", 0)
+        coordinator.streak = ckpt.get("streak", 0)
 
     def make_evaluator():
         return PikafishEvaluator(
@@ -277,7 +279,9 @@ def main():
     logger = MetricsLogger(cfg, enabled=not args.no_wandb)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
 
-    if not buffer.games:
+    # buffer is not persisted; resumed runs skip warmstart and refill from
+    # live self-play
+    if start_iteration == 0 and not buffer.games:
         print("[warmstart] generating Pikafish games ...")
         stats = generate_warmstart_games(cfg, buffer, workers[0].evaluator)
         print(f"[warmstart] {stats['games']} games / {stats['plies']} plies")
@@ -335,6 +339,8 @@ def main():
                 if isinstance(v, float)
             )
         )
+        ckpt_path = os.path.join(cfg.checkpoint_dir, "latest.pt")
+        tmp_path = ckpt_path + ".tmp"
         torch.save(
             {
                 "ally": ally.state_dict(),
@@ -342,9 +348,11 @@ def main():
                 "optimizer": trainer.optimizer.state_dict(),
                 "iteration": it + 1,
                 "era": coordinator.era,
+                "streak": coordinator.streak,
             },
-            os.path.join(cfg.checkpoint_dir, "latest.pt"),
+            tmp_path,
         )
+        os.replace(tmp_path, ckpt_path)
 
 
 if __name__ == "__main__":
