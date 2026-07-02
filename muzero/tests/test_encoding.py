@@ -1,6 +1,13 @@
+import numpy as np
 import pytest
 
-from muzero.encoding import index_to_move, move_to_index
+from muzero.encoding import (
+    board_planes,
+    encode_observation,
+    index_to_move,
+    material_balance,
+    move_to_index,
+)
 
 
 def test_move_index_round_trip():
@@ -32,3 +39,41 @@ def test_bad_inputs_raise():
     for bad_idx in (-1, 8100, 10000):
         with pytest.raises(ValueError):
             index_to_move(bad_idx)
+
+
+def _start_board():
+    board = np.zeros((10, 9), dtype=np.int8)
+    back = [8, 6, 4, 2, 1, 3, 5, 7, 9]  # r n b a k a b n r piece ids
+    for c, pid in enumerate(back):
+        board[0, c] = -pid  # black top
+        board[9, c] = pid  # red bottom
+    board[2, 1], board[2, 7] = -10, -11  # black cannons
+    board[7, 1], board[7, 7] = 10, 11  # red cannons
+    for c in range(0, 9, 2):
+        board[3, c] = -(12 + c // 2)  # black pawns
+        board[6, c] = 12 + c // 2  # red pawns
+    return board
+
+
+def test_board_planes_start_position():
+    planes = board_planes(_start_board())
+    assert planes.shape == (14, 10, 9)
+    assert planes.sum() == 32  # 16 pieces per side
+    assert planes[0, 9, 4] == 1.0  # red king plane
+    assert planes[7, 0, 4] == 1.0  # black king plane
+
+
+def test_encode_observation_shape_and_padding():
+    board = _start_board()
+    obs = encode_observation([board], "w", 1, 0, history_length=8)
+    assert obs.shape == (115, 10, 9)
+    assert obs[:14].sum() == 0  # padded oldest history slot is empty
+    assert obs[98:112].sum() == 32  # newest slot holds the board
+    assert obs[112].max() == 1.0  # side-to-move plane (red)
+
+
+def test_material_balance():
+    board = _start_board()
+    assert material_balance(board) == 0.0
+    board[0, 0] = 0  # remove a black rook
+    assert material_balance(board) == 9.0
