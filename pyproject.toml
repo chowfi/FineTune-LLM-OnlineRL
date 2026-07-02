@@ -32,6 +32,10 @@ dependencies = [
     "numpy==1.26.4",
     "pandas==3.0.1",
     "scipy==1.17.1",
+    # Xiangqi PGN/FEN parsing (Xiangqi-R1 paper §3.1 uses this library to transform PGN → FEN)
+    "cchess>=1.25",
+    # Western chess board / UCI engine adapter (used by scripts/benchmark/)
+    "chess>=1.10,<2",
     # Notebook support
     "ipykernel==7.2.0",
     "ipython==9.11.0",
@@ -55,3 +59,24 @@ override-dependencies = [
 dev = [
     "ruff>=0.15.10",
 ]
+web = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+]
+
+[tool.ruff]
+# Generated / runtime artifacts — not project source (AGENTS.md: ruff check .)
+extend-exclude = [
+    "unsloth_compiled_cache",
+    "wandb",
+    "checkpoints",
+    "*.ipynb",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# PEFT monkeypatch must run before torch.distributed imports (see file header).
+"LLM_RL_agent_FSDP.py" = ["E402"]
+# Scripts prepend repo root to sys.path before third-party imports.
+"scripts/*.py" = ["E402"]
+"scripts/**/*.py" = ["E402"]
+"web/**/*.py" = ["E402"]

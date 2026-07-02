@@ -59,16 +59,22 @@ class GreedyEnemyAgent:
             elif score == best_score:
                 best_actions.append(int(a))
         return int(random.choice(best_actions))
+
+
 # ─── Evaluation metrics ───
+
 
 def calculate_win_rate(wins, total_games):
     return (wins / total_games) * 100 if total_games > 0 else 0
 
+
 def average_reward(rewards):
     return sum(rewards) / len(rewards) if rewards else 0
 
+
 def average_episode_length(rounds_list):
     return sum(rounds_list) / len(rounds_list) if rounds_list else 0
+
 
 def reward_variability(rewards):
     return np.std(rewards)
@@ -83,7 +89,10 @@ def _rolling_ma(series: List[float], window: int):
 
 # ─── Evaluation visualizations ───
 
-def plot_episode_lengths(episode_lengths, window_size=3, ally="LLM-Agent", enemy="Random"):
+
+def plot_episode_lengths(
+    episode_lengths, window_size=3, ally="LLM-Agent", enemy="Random"
+):
     plt.figure(figsize=(10, 5))
     xs, ma = _rolling_ma(episode_lengths, window_size)
     if xs is not None:
@@ -96,7 +105,9 @@ def plot_episode_lengths(episode_lengths, window_size=3, ally="LLM-Agent", enemy
     plt.show()
 
 
-def plot_episode_rewards(ally_rewards, enemy_rewards, window_size=3, ally="LLM-Agent", enemy="Random"):
+def plot_episode_rewards(
+    ally_rewards, enemy_rewards, window_size=3, ally="LLM-Agent", enemy="Random"
+):
     plt.figure(figsize=(10, 5))
     for rewards, color, label in (
         (ally_rewards, "cyan", ally),
@@ -122,7 +133,12 @@ def plot_grpo_diagnostics(
     episodes = np.arange(1, len(ally_win_rate_cumulative) + 1)
     fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
 
-    axes[0].plot(episodes, ally_win_rate_cumulative, color="tab:blue", label="Cumulative ally win %")
+    axes[0].plot(
+        episodes,
+        ally_win_rate_cumulative,
+        color="tab:blue",
+        label="Cumulative ally win %",
+    )
     xs, ma = _rolling_ma(list(ally_win_rate_cumulative), window_size)
     if xs is not None:
         axes[0].plot(xs, ma, color="tab:orange", label=f"{window_size}-ep MA")
@@ -131,14 +147,27 @@ def plot_grpo_diagnostics(
     axes[0].legend()
     axes[0].grid(True)
 
-    std_masked = np.ma.masked_invalid(np.asarray(batch_reward_std_per_episode, dtype=float))
-    axes[1].plot(episodes, std_masked, color="tab:green", alpha=0.85, label="Batch σ (episode mean)")
+    std_masked = np.ma.masked_invalid(
+        np.asarray(batch_reward_std_per_episode, dtype=float)
+    )
+    axes[1].plot(
+        episodes,
+        std_masked,
+        color="tab:green",
+        alpha=0.85,
+        label="Batch σ (episode mean)",
+    )
     axes[1].set_ylabel("Batch reward σ (pre-norm)")
     axes[1].set_title("GRPO reward spread per batch")
     axes[1].legend()
     axes[1].grid(True)
 
-    axes[2].plot(episodes, trained_turn_fraction, color="tab:purple", label="Trained / ally turns")
+    axes[2].plot(
+        episodes,
+        trained_turn_fraction,
+        color="tab:purple",
+        label="Trained / ally turns",
+    )
     xs, ma = _rolling_ma(list(trained_turn_fraction), window_size)
     if xs is not None:
         axes[2].plot(xs, ma, color="tab:brown", label=f"{window_size}-ep MA")
@@ -154,6 +183,7 @@ def plot_grpo_diagnostics(
 
 
 # ─── Log helpers ───
+
 
 def training_log_token_truncate(file, num_episode, round, input_token_length=2048):
     with open(file, "a", encoding="utf-8") as f:
@@ -257,6 +287,7 @@ def reset_episode_metrics_csv(filepath: str) -> None:
 
 # ─── Lightweight GRPO trainer for online RL ───
 
+
 class GRPOTrainerOnline:
     """
     Group Relative Policy Optimization for an online game-playing loop.
@@ -271,7 +302,16 @@ class GRPOTrainerOnline:
       4. Loss = -mean(advantage * response_log_prob) + beta * KL
     """
 
-    def __init__(self, model, tokenizer, device, batch_size=8, lr=1e-5, beta=0.1, max_grad_norm=1.0):
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        device,
+        batch_size=8,
+        lr=1e-5,
+        beta=0.1,
+        max_grad_norm=1.0,
+    ):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -304,7 +344,9 @@ class GRPOTrainerOnline:
         response_start = query_ids.size(0)
         response_logits = logits[0, response_start - 1 : -1, :]
         log_probs = F.log_softmax(response_logits.float(), dim=-1)
-        token_log_probs = log_probs.gather(1, response_ids.to(self.device).unsqueeze(1)).squeeze(1)
+        token_log_probs = log_probs.gather(
+            1, response_ids.to(self.device).unsqueeze(1)
+        ).squeeze(1)
         return token_log_probs.sum()
 
     def train_step(self):
@@ -322,7 +364,9 @@ class GRPOTrainerOnline:
         rewards_t = torch.tensor(rewards_batch, dtype=torch.float32)
         reward_std_before_norm = float(rewards_t.std().item())
         if reward_std_before_norm > 1e-4:
-            advantages = (rewards_t - rewards_t.mean()) / (reward_std_before_norm + 1e-8)
+            advantages = (rewards_t - rewards_t.mean()) / (
+                reward_std_before_norm + 1e-8
+            )
         else:
             advantages = rewards_t - rewards_t.mean()
 
@@ -377,9 +421,16 @@ class GRPOTrainerOnline:
 
 # ─── LLM Agent with GRPO ───
 
+
 class Agent(ABC):
     def __init__(
-        self, model, tokenizer, grpo_trainer, max_input_token, device, generate_config_dict=None
+        self,
+        model,
+        tokenizer,
+        grpo_trainer,
+        max_input_token,
+        device,
+        generate_config_dict=None,
     ):
         if generate_config_dict is None:
             generate_config_dict = {
@@ -412,7 +463,10 @@ class Agent(ABC):
 
     @abstractmethod
     def format_observation(
-        self, observation: gym.core.ObsType, env: gym.Env = None, ally_turn_index: int = 0
+        self,
+        observation: gym.core.ObsType,
+        env: gym.Env = None,
+        ally_turn_index: int = 0,
     ) -> str:
         pass
 
@@ -425,7 +479,7 @@ class Agent(ABC):
             messages, tokenize=False, add_generation_prompt=True
         )
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        context_len = inputs['attention_mask'].size(1)
+        context_len = inputs["attention_mask"].size(1)
         self.model.eval()
         if hasattr(self.model, "gradient_checkpointing_disable"):
             self.model.gradient_checkpointing_disable()
@@ -435,7 +489,7 @@ class Agent(ABC):
                 **{
                     key.split("/")[-1]: value
                     for key, value in self.generate_config_dict.items()
-                }
+                },
             )
         if hasattr(self.model, "gradient_checkpointing_enable"):
             self.model.gradient_checkpointing_enable()
@@ -446,7 +500,9 @@ class Agent(ABC):
         return outputs[0]
 
     def act(self, observation, episode, round, env, ally_turn_index: int = 0):
-        message = self.format_observation(observation, env, ally_turn_index=ally_turn_index)
+        message = self.format_observation(
+            observation, env, ally_turn_index=ally_turn_index
+        )
         self.current_episode_messages += [{"role": "user", "content": message}]
         self.current_llm_input += [{"role": "user", "content": message}]
 
@@ -490,7 +546,9 @@ class Agent(ABC):
 
         if is_random:
             piece_id, start, end = action_space_to_move(action)
-            corrected_response = f"Action: {piece_id}, ({start[0]}, {start[1]}), ({end[0]}, {end[1]})"
+            corrected_response = (
+                f"Action: {piece_id}, ({start[0]}, {start[1]}), ({end[0]}, {end[1]})"
+            )
         else:
             corrected_response = response
 
@@ -498,10 +556,14 @@ class Agent(ABC):
         max_train_ctx = 4096
         if len(query_ids) > max_train_ctx:
             query_ids = query_ids[-max_train_ctx:]
-        response_ids = self.tokenizer(corrected_response, return_tensors="pt").input_ids[0]
+        response_ids = self.tokenizer(
+            corrected_response, return_tensors="pt"
+        ).input_ids[0]
         self.current_episode_turn_data.append((query_ids, response_ids, is_random))
 
-        self.current_episode_messages += [{"role": "assistant", "content": corrected_response}]
+        self.current_episode_messages += [
+            {"role": "assistant", "content": corrected_response}
+        ]
         self.current_llm_input += [{"role": "assistant", "content": corrected_response}]
         return is_random, action, response
 
@@ -517,7 +579,7 @@ class Agent(ABC):
                 per_turn = rewards[-1] / max(len(turns), 1)
                 distributed_rewards = [per_turn] * len(turns)
             else:
-                distributed_rewards = rewards[:len(turns)]
+                distributed_rewards = rewards[: len(turns)]
 
             for (q, r, was_random), rew in zip(turns, distributed_rewards):
                 if not was_random:
@@ -542,7 +604,9 @@ class Agent(ABC):
                 if br is not None and np.isfinite(br):
                     batch_reward_stds.append(br)
             if batch_reward_stds:
-                all_stats["grpo/batch_reward_std_mean"] = float(np.mean(batch_reward_stds))
+                all_stats["grpo/batch_reward_std_mean"] = float(
+                    np.mean(batch_reward_stds)
+                )
                 all_stats["grpo/grpo_train_steps"] = len(batch_reward_stds)
             return all_stats
 
@@ -580,7 +644,10 @@ class ChineseChessAgent(Agent):
     EARLY_GAME_ALLY_MOVES = 50
 
     def format_observation(
-        self, observation: gym.core.ObsType, env: gym.Env = None, ally_turn_index: int = 0
+        self,
+        observation: gym.core.ObsType,
+        env: gym.Env = None,
+        ally_turn_index: int = 0,
     ) -> str:
         message = f"The current board looks like this:\n{observation}\n"
         if env is not None:
@@ -590,10 +657,10 @@ class ChineseChessAgent(Agent):
             general_lines = []
             for a in legal_actions:
                 pid, start, end = action_space_to_move(a)
-                name = PIECE_ID_TO_NAME[pid] if pid < len(PIECE_ID_TO_NAME) else 'UNKNOWN'
-                line = (
-                    f"  {pid} ({name}): ({start[0]}, {start[1]}) -> ({end[0]}, {end[1]})"
+                name = (
+                    PIECE_ID_TO_NAME[pid] if pid < len(PIECE_ID_TO_NAME) else "UNKNOWN"
                 )
+                line = f"  {pid} ({name}): ({start[0]}, {start[1]}) -> ({end[0]}, {end[1]})"
                 lines_in_env_order.append(line)
                 if pid == 1:
                     general_lines.append(line)
@@ -715,7 +782,11 @@ if not load_in_8bit:
 # ─── Apply LoRA (new) or load saved adapter (resume) ───
 
 lora_config = LoraConfig(
-    **{key.split("/")[-1]: value for key, value in hyperparams.items() if key.startswith("lora/")}
+    **{
+        key.split("/")[-1]: value
+        for key, value in hyperparams.items()
+        if key.startswith("lora/")
+    }
 )
 
 _infer_adapter = (hyperparams.get("inference/adapter_path") or "").strip()
@@ -734,10 +805,10 @@ else:
 
 if _adapter_dir:
     if not os.path.isdir(_adapter_dir):
-        raise FileNotFoundError(f"LoRA adapter path is not a directory: {_adapter_dir!r}")
-    model = PeftModel.from_pretrained(
-        model, _adapter_dir, is_trainable=_peft_trainable
-    )
+        raise FileNotFoundError(
+            f"LoRA adapter path is not a directory: {_adapter_dir!r}"
+        )
+    model = PeftModel.from_pretrained(model, _adapter_dir, is_trainable=_peft_trainable)
     device = next(model.parameters()).device
     _tok_src = (
         _adapter_dir
@@ -758,6 +829,7 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 model.resize_token_embeddings(len(tokenizer))
+
 
 def count_trainable_params(model):
     total = sum(p.numel() for p in model.parameters())
@@ -781,7 +853,9 @@ def save_lora_checkpoint(checkpoint_path: str, episode: int, label: str = "") ->
         "base_model": hyperparams["model_name"],
         "lora": {k: v for k, v in hyperparams.items() if k.startswith("lora/")},
     }
-    with open(os.path.join(checkpoint_path, "training_meta.json"), "w", encoding="utf-8") as f:
+    with open(
+        os.path.join(checkpoint_path, "training_meta.json"), "w", encoding="utf-8"
+    ) as f:
         json.dump(meta, f, indent=2)
     print(f"[checkpoint] Saved LoRA adapter to {checkpoint_path!r}")
 
@@ -830,7 +904,9 @@ if not _infer_only:
 
     if _record_video:
         if RecordVideo is None:
-            print("RecordVideo not available (install gym>=0.26 or gymnasium); skipping video.")
+            print(
+                "RecordVideo not available (install gym>=0.26 or gymnasium); skipping video."
+            )
         else:
             os.makedirs(_record_dir, exist_ok=True)
             env = RecordVideo(
@@ -885,7 +961,9 @@ def run_inference_record_videos(
     """Load is already done; play N games with RecordVideo (no GRPO updates)."""
     num_games = max(1, int(hyperparams.get("inference/num_games", 1)))
     video_dir = hyperparams.get("inference/video_dir", "./video_inference")
-    enemy_kind = (hyperparams.get("inference/enemy", "random") or "random").strip().lower()
+    enemy_kind = (
+        (hyperparams.get("inference/enemy", "random") or "random").strip().lower()
+    )
     if enemy_kind not in ("random", "greedy"):
         print(f"[inference] Unknown inference/enemy={enemy_kind!r}; using random")
         enemy_kind = "random"
@@ -938,9 +1016,7 @@ def run_inference_record_videos(
                 )
                 if ally_action is None:
                     episode_act_failures += 1
-                    print(
-                        f"[infer g{game} Rd {round_idx}] WARNING act() returned None"
-                    )
+                    print(f"[infer g{game} Rd {round_idx}] WARNING act() returned None")
                 else:
                     episode_ally_turns += 1
                     if used_random_fallback:
@@ -1032,11 +1108,11 @@ if not _infer_only:
     series_batch_reward_std = []
     series_trained_turn_fraction = []
     lifetime_ally_turns = lifetime_random_fallback = lifetime_act_failures = 0
-    
+
     if hyperparams.get("metrics/clear_csv_on_start", True):
         reset_episode_metrics_csv(EPISODE_METRICS_CSV)
         print(f"[metrics] Cleared {EPISODE_METRICS_CSV!r} for this run.\n")
-    
+
     try:
         for episode in trange(1, hyperparams["episodes"] + 1):
             observation = env.reset()
@@ -1055,8 +1131,10 @@ if not _infer_only:
                 if episode >= _greedy_start
                 else f" | greedy mix Random↔Greedy from ep {_greedy_start}"
             )
-            print(f"[Ep {episode}] Opponent (full episode): {_ep_opponent}{_ep_mix_note}")
-    
+            print(
+                f"[Ep {episode}] Opponent (full episode): {_ep_opponent}{_ep_mix_note}"
+            )
+
             while not done:
                 if env.turn == ALLY:
                     used_random_fallback, ally_action, llm_output = ally_agent.act(
@@ -1069,7 +1147,9 @@ if not _infer_only:
                     if ally_action is None:
                         episode_act_failures += 1
                         lifetime_act_failures += 1
-                        print(f"[Ep {episode} Rd {round_idx}] WARNING act() returned None")
+                        print(
+                            f"[Ep {episode} Rd {round_idx}] WARNING act() returned None"
+                        )
                     else:
                         episode_ally_turns += 1
                         if used_random_fallback:
@@ -1088,7 +1168,10 @@ if not _infer_only:
                         )
                     if episode % gap_size == 0 and ally_action is not None:
                         training_log_llm_output(
-                            "chinese_chess_llm_output_log", episode, round_idx, llm_output
+                            "chinese_chess_llm_output_log",
+                            episode,
+                            round_idx,
+                            llm_output,
                         )
                 else:
                     if use_greedy_for_episode:
@@ -1106,7 +1189,7 @@ if not _infer_only:
                         enemy_action,
                         enemy_reward,
                     )
-    
+
                 round_idx += 1
                 if round_idx >= 200:
                     print(
@@ -1117,7 +1200,7 @@ if not _infer_only:
                     done = True
                     truncated_game += 1
                     episode_hit_round_cap = True
-    
+
             episode_lengths.append(round_idx)
             if enemy_reward == 100:
                 enemy_wins += 1
@@ -1125,14 +1208,16 @@ if not _infer_only:
             elif ally_reward == 100:
                 ally_wins += 1
                 winning_rewards.append(current_ally_rewards)
-    
+
             ally_rewards.append(current_ally_rewards)
             enemy_rewards.append(current_enemy_rewards)
-    
+
             lifetime_ally_turns += episode_ally_turns
             lifetime_random_fallback += episode_random_fallback
             random_rate_episode = (
-                100.0 * episode_random_fallback / episode_ally_turns if episode_ally_turns else 0.0
+                100.0 * episode_random_fallback / episode_ally_turns
+                if episode_ally_turns
+                else 0.0
             )
             random_rate_lifetime = (
                 100.0 * lifetime_random_fallback / lifetime_ally_turns
@@ -1144,7 +1229,7 @@ if not _infer_only:
                 if episode_ally_turns
                 else 0.0
             )
-    
+
             episode_stats = {
                 "episode": episode,
                 "episode_length": round_idx,
@@ -1170,10 +1255,10 @@ if not _infer_only:
                 "enemy_random_turns": episode_enemy_random_turns,
                 "enemy_policy": "greedy" if use_greedy_for_episode else "random",
             }
-    
+
             train_stats = ally_agent.terminate_episode()
             episode_stats.update(train_stats)
-    
+
             append_episode_metrics_csv(
                 EPISODE_METRICS_CSV,
                 episode=episode,
@@ -1188,7 +1273,7 @@ if not _infer_only:
                 train_stats=train_stats,
                 enemy_policy="greedy" if use_greedy_for_episode else "random",
             )
-    
+
             series_ally_win_rate_cumulative.append(episode_stats["ally_win_rate"])
             series_trained_turn_fraction.append(trained_turn_fraction)
             br_std_ep = train_stats.get("grpo/batch_reward_std_mean")
@@ -1197,24 +1282,27 @@ if not _infer_only:
             series_batch_reward_std.append(
                 br_std_ep if br_std_ep is not None else float("nan")
             )
-    
+
             wandb.log(episode_stats)
-    
+
             if _ckpt_every > 0 and episode % _ckpt_every == 0:
                 save_lora_checkpoint(
                     os.path.join(_ckpt_root, f"ep_{episode}"),
                     episode,
                     label=f"every_{_ckpt_every}",
                 )
-    
+
             if episode % gap_size == 0:
                 wr = calculate_win_rate(ally_wins, episode)
                 ewr = calculate_win_rate(enemy_wins, episode)
                 tr = calculate_win_rate(truncated_game, episode)
                 br = train_stats.get(
-                    "grpo/batch_reward_std_mean", train_stats.get("grpo/batch_reward_std", "n/a")
+                    "grpo/batch_reward_std_mean",
+                    train_stats.get("grpo/batch_reward_std", "n/a"),
                 )
-                print(f"\n[Ep {episode}] --- periodic summary (every {gap_size} eps) ---")
+                print(
+                    f"\n[Ep {episode}] --- periodic summary (every {gap_size} eps) ---"
+                )
                 print(f"Last episode opponent: {_ep_opponent}")
                 print(
                     f"Wins: ally {ally_wins} ({wr:.1f}%) | enemy {enemy_wins} ({ewr:.1f}%) | "
@@ -1235,14 +1323,14 @@ if not _infer_only:
                     f"mean_rew={train_stats.get('grpo/mean_reward', 'n/a')}"
                 )
                 print("-" * 60)
-    
+
         if episode_lengths:
             save_lora_checkpoint(
                 os.path.join(_ckpt_root, "final"),
                 len(episode_lengths),
                 label="normal_completion",
             )
-    
+
     except Exception:
         print("\n" + "=" * 60)
         print("TRAINING CRASHED — traceback below")
@@ -1268,7 +1356,9 @@ if env is not None:
     env.close()
 
 if not _infer_only:
-    print(f"\nFinal score after {episode} episodes -> Ally Wins: {ally_wins}, Enemy Wins: {enemy_wins}, Truncated Game: {truncated_game}")
+    print(
+        f"\nFinal score after {episode} episodes -> Ally Wins: {ally_wins}, Enemy Wins: {enemy_wins}, Truncated Game: {truncated_game}"
+    )
     print(f"Ally Win Rate: {calculate_win_rate(ally_wins, episode)}%")
     print(f"Enemy Win Rate: {calculate_win_rate(enemy_wins, episode)}%")
     print(f"Truncated Rate: {calculate_win_rate(truncated_game, episode)}%")

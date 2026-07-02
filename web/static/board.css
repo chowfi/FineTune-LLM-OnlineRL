@@ -1,0 +1,322 @@
+:root {
+  --board-bg: #d4b896;
+  --line: #1a0f0a;
+  --red-piece: #c62828;
+  --black-piece: #212121;
+  --highlight: rgba(255, 210, 60, 0.65);
+  --legal-dot: rgba(46, 125, 50, 0.9);
+  --ally-move: rgba(66, 133, 244, 0.45);
+  --engine-move: rgba(156, 39, 176, 0.4);
+  --cell: min(8.2vw, 46px);
+  --piece-size: calc(var(--cell) * 1.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: #2a2520;
+  color: #f5f0e8;
+  min-height: 100vh;
+}
+
+.top-bar {
+  text-align: center;
+  padding: 1rem;
+  background: #1e1a16;
+  border-bottom: 1px solid #444;
+}
+
+.top-bar h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.5rem;
+}
+
+.subtitle {
+  margin: 0 0 0.75rem;
+  opacity: 0.85;
+  font-size: 0.95rem;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.25rem;
+  justify-content: center;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.mode-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.btn {
+  padding: 0.5rem 1.25rem;
+  font-size: 1rem;
+  border: none;
+  border-radius: 6px;
+  background: #c45c26;
+  color: #fff;
+  cursor: pointer;
+}
+
+.btn:hover {
+  background: #e07030;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.layout {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 1rem;
+}
+
+.error-bar {
+  max-width: 52rem;
+  margin-bottom: 0.75rem;
+  padding: 0.65rem 1rem;
+  background: #3d1f1f;
+  border: 1px solid #c45c26;
+  border-radius: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.9rem;
+  line-height: 1.35;
+}
+
+.error-bar.hidden {
+  display: none;
+}
+
+#error-text {
+  flex: 1 1 16rem;
+}
+
+.btn-small {
+  padding: 0.35rem 0.85rem;
+  font-size: 0.85rem;
+}
+
+.status {
+  margin-bottom: 0.75rem;
+  font-size: 1rem;
+  min-height: 1.5em;
+  text-align: center;
+}
+
+.board-wrap {
+  padding: 10px;
+  background: #4a3728;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+/* Pieces sit on line intersections (9×10 points). */
+.board {
+  position: relative;
+  width: calc(var(--cell) * 8 + var(--piece-size));
+  height: calc(var(--cell) * 9 + var(--piece-size));
+  background: linear-gradient(
+    165deg,
+    #e8d4b0 0%,
+    var(--board-bg) 35%,
+    #c9a66e 70%,
+    #e0c8a0 100%
+  );
+  border: 3px solid var(--line);
+  touch-action: manipulation;
+  overflow: hidden;
+}
+
+.board.disabled {
+  pointer-events: none;
+  opacity: 0.92;
+}
+
+.board-lines {
+  position: absolute;
+  left: calc(var(--piece-size) / 2);
+  top: calc(var(--piece-size) / 2);
+  width: calc(var(--cell) * 8);
+  height: calc(var(--cell) * 9);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.board-lines line {
+  stroke: var(--line);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-miterlimit: 2;
+  vector-effect: non-scaling-stroke;
+  fill: none;
+}
+
+.river-overlay {
+  position: absolute;
+  left: calc(var(--piece-size) / 2);
+  top: calc(var(--piece-size) / 2 + 4.5 * var(--cell) - 0.6em);
+  width: calc(var(--cell) * 8);
+  text-align: center;
+  font-size: clamp(0.65rem, 2.2vw, 0.95rem);
+  font-family: "KaiTi", "STKaiti", "PingFang SC", serif;
+  font-weight: 600;
+  color: #5c4033;
+  opacity: 0.9;
+  pointer-events: none;
+  z-index: 1;
+  letter-spacing: 0.35em;
+  line-height: 1;
+}
+
+.intersections {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.intersection {
+  position: absolute;
+  width: var(--piece-size);
+  height: var(--piece-size);
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent !important;
+  outline: none;
+  box-shadow: none;
+  -webkit-tap-highlight-color: transparent;
+  appearance: none;
+  transform: translate(-50%, -50%);
+  cursor: default;
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.intersection:focus,
+.intersection:focus-visible {
+  outline: none;
+  background: transparent !important;
+}
+
+.intersection.selectable {
+  cursor: pointer;
+}
+
+.intersection.selected {
+  background: var(--highlight);
+  border-radius: 50%;
+}
+
+.intersection.legal-target {
+  z-index: 12;
+}
+
+.legal-marker {
+  position: absolute;
+  inset: 4%;
+  border-radius: 50%;
+  border: 3px solid #1b5e20;
+  background: rgba(76, 175, 80, 0.55);
+  box-shadow: 0 0 6px rgba(46, 125, 50, 0.9);
+  z-index: 25;
+  pointer-events: none;
+}
+
+.intersection.ally-from::before,
+.intersection.ally-to::before {
+  content: "";
+  position: absolute;
+  inset: 6%;
+  border: 2px solid #4285f4;
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+.intersection.engine-from::before,
+.intersection.engine-to::before {
+  content: "";
+  position: absolute;
+  inset: 6%;
+  border: 2px dashed #9c27b0;
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+.piece {
+  font-size: calc(var(--piece-size) * 0.68);
+  font-weight: 700;
+  line-height: 1;
+  z-index: 3;
+  pointer-events: none;
+  border-radius: 50%;
+  width: 82%;
+  height: 82%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #faf6ee;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.piece.red {
+  color: var(--red-piece);
+  border: 2px solid var(--red-piece);
+}
+
+.piece.black {
+  color: var(--black-piece);
+  border: 2px solid var(--black-piece);
+}
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.overlay.hidden {
+  display: none;
+}
+
+.overlay-card {
+  background: #1e1a16;
+  padding: 2rem 2.5rem;
+  border-radius: 12px;
+  text-align: center;
+  border: 2px solid #c45c26;
+}
+
+.overlay-text {
+  font-size: 1.75rem;
+  margin: 0 0 1.25rem;
+  font-weight: 700;
+}
+
+/* Status line above the board shows engine progress; hide duplicate footer. */
+.thinking {
+  display: none !important;
+}

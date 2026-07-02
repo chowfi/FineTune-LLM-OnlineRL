@@ -1,0 +1,14 @@
+{
+  "status": "python_exception",
+  "phase": "python_exception",
+  "episode": 13,
+  "round_idx": 88,
+  "ally_return": 7.0,
+  "enemy_return": 0.0,
+  "global_train_step": 644,
+  "pid": 1108984,
+  "hostname": "fchow-gpu",
+  "rank": 0,
+  "traceback_excerpt": "Traceback (most recent call last):\n  File \"/home/fchow/Documents/FineTune-LLM-OnlineRL/LLM_RL_agent_FSDP_v2.py\", line 5868, in <module>\n    log_board_sync(\n  File \"/home/fchow/Documents/FineTune-LLM-OnlineRL/LLM_RL_agent_FSDP_v2.py\", line 1206, in log_board_sync\n    print(payload)\n  File \"/home/fchow/Documents/FineTune-LLM-OnlineRL/.venv/lib/python3.12/site-packages/wandb/sdk/lib/redirect.py\", line 640, in write\n    self._old_write(data)\nOSError: [Errno 5] Input/output error\n",
+  "updated_unix": 1780422870.3399663
+}

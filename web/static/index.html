@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Xiangqi — Play vs ep_40 Engine</title>
+  <link rel="stylesheet" href="/static/board.css" />
+</head>
+<body>
+  <header class="top-bar">
+    <h1>Chinese Chess</h1>
+    <p class="subtitle">Red (ally) vs Black (ep_40 engine)</p>
+    <div class="controls">
+      <span>Red ally:</span>
+      <label class="mode-label">
+        <input type="radio" name="ally-mode" value="human" checked />
+        Human (click moves)
+      </label>
+      <label class="mode-label">
+        <input type="radio" name="ally-mode" value="greedy" />
+        Greedy agent (ε=0)
+      </label>
+      <button type="button" id="btn-new-game" class="btn">New game</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <div id="error-bar" class="error-bar hidden" role="alert">
+      <span id="error-text"></span>
+      <button type="button" id="btn-retry" class="btn btn-small">Retry turn</button>
+    </div>
+    <div id="status" class="status">Loading…</div>
+    <div id="board-wrap" class="board-wrap">
+      <div id="board" class="board" aria-label="Xiangqi board"></div>
+    </div>
+  </main>
+
+  <div id="overlay" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="overlay-card">
+      <p id="overlay-text" class="overlay-text"></p>
+      <button type="button" id="btn-overlay-new" class="btn">New game</button>
+    </div>
+  </div>
+
+  <div id="thinking" class="thinking hidden">Engine thinking…</div>
+
+  <script src="/static/board.js"></script>
+</body>
+</html>

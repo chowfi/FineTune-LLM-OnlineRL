@@ -10,13 +10,16 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
+from torch.distributed.checkpoint.state_dict import (
+    set_model_state_dict,
+    StateDictOptions,
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--mixed-precision", action="store_true")
 args = parser.parse_args()
 
-# Read local_rank, rank, world_size from env 
+# Read local_rank, rank, world_size from env
 rank = int(os.environ["RANK"])
 local_rank = int(os.environ["LOCAL_RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
@@ -27,11 +30,11 @@ mesh = init_device_mesh("cpu", mesh_shape=(world_size,))
 
 if args.mixed_precision:
     fsdp_kwargs = {
-    "mp_policy": MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
-    )
-}
+        "mp_policy": MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+        )
+    }
 
 d_model = 64
 model = nn.Transformer(
@@ -79,7 +82,7 @@ full_sd = torch.load(
     "model_state_dict.pt",
     mmap=True,
     weights_only=True,
-    map_location='cpu',
+    map_location="cpu",
 )
 
 set_model_state_dict(

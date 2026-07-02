@@ -1,0 +1,1 @@
+episode,rounds,ally_return,enemy_return,total_return,outcome,episode_hit_round_cap,trained_turn_fraction,random_move_pct_episode,enemy_policy,grpo_loss,grpo_mean_advantage,grpo_mean_kl,grpo_mean_reward,grpo_batch_reward_std_mean,grpo_batch_reward_std_last,grpo_train_steps

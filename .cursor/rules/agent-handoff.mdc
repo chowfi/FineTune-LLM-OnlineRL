@@ -1,0 +1,27 @@
+---
+description: Keep agents oriented around Xiangqi GRPO and enforce handoff updates
+alwaysApply: true
+---
+
+# Xiangqi GRPO Agent Handoff
+
+This repository's goal is to train an LLM-backed reinforcement-learning agent using GRPO to play Xiangqi.
+
+Before substantive work, read `docs/AGENT_TODO.md` and the relevant section of `docs/ARCHITECTURE.md`.
+
+Before claiming feature/code/doc work is done, or before claiming an experiment/training run finished, failed, or was interrupted, account for:
+
+- `docs/ARCHITECTURE.md`: update when repo map, module responsibilities, scripts, commands, data flow, training behavior, or durable workflow changed.
+- `docs/logs/YYYY-MM-DD-log-<description>.md`: create or update a dated log for feature changes, experiment starts, finishes, failures, interruptions, and conclusions.
+- `docs/AGENT_TODO.md`: move completed work, add next steps, or record blockers.
+
+Final responses after covered work must include:
+
+```text
+Handoff updated:
+- Architecture/repo map: yes/no, reason
+- Log: yes/no, path
+- Agent TODO: yes/no, reason
+```
+
+Do not say "done", "complete", "fixed", or "experiment finished" until the handoff is complete or explicitly marked not applicable with a reason.

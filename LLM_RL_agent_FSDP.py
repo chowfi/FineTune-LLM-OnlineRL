@@ -35,12 +35,15 @@ import peft.tuners.tuners_utils as _peft_tuner_utils
 # PEFT's BaseTuner.forward() calls self.model.forward() directly, which
 # bypasses __call__() and therefore skips FSDP's pre-forward hooks.
 # Patch it to use __call__() so FSDP can unshard parameters before the forward pass.
-_peft_tuner_utils.BaseTuner.forward = lambda self, *args, **kwargs: self.model(*args, **kwargs)
+_peft_tuner_utils.BaseTuner.forward = lambda self, *args, **kwargs: self.model(
+    *args, **kwargs
+)
 
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.checkpoint.state_dict import (
-    get_model_state_dict, StateDictOptions,
+    get_model_state_dict,
+    StateDictOptions,
 )
 from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -52,7 +55,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--mixed-precision", action="store_true")
 args = parser.parse_args()
 
-# Read local_rank, rank, world_size from env 
+# Read local_rank, rank, world_size from env
 rank = int(os.environ["RANK"])
 local_rank = int(os.environ["LOCAL_RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
@@ -74,21 +77,29 @@ if args.mixed_precision:
 
 # ─── Distributed helpers: broadcast arbitrary data from rank 0 ───
 
+
 def broadcast_tensor(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
     """Broadcast a tensor from src to all ranks (in-place)."""
     tensor = tensor.contiguous().cuda()
     dist.broadcast(tensor, src=src)
     return tensor
 
+
 def broadcast_int(value: int, src: int = 0) -> int:
     t = torch.tensor([value], dtype=torch.long, device="cuda")
     dist.broadcast(t, src=src)
     return t.item()
 
+
 def broadcast_bool(value: bool, src: int = 0) -> bool:
     return bool(broadcast_int(int(value), src=src))
 
-def broadcast_input_ids(input_ids: Optional[torch.Tensor], attention_mask: Optional[torch.Tensor], src: int = 0):
+
+def broadcast_input_ids(
+    input_ids: Optional[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    src: int = 0,
+):
     """Broadcast tokenized inputs from rank 0 to all ranks.
     Rank 0 passes the real tensors; other ranks pass None and receive them."""
     if rank == src:
@@ -140,6 +151,7 @@ class GreedyEnemyAgent:
 
 # ─── Reward shaping ───
 
+
 def compute_shaped_reward(
     board_before: np.ndarray,
     ally_action: int,
@@ -171,30 +183,37 @@ def describe_enemy_move(
 ) -> str:
     """One-line text description of what the enemy just did."""
     pid, start, end = action_space_to_move(enemy_action)
-    enemy_name = PIECE_ID_TO_NAME[abs(pid)] if abs(pid) < len(PIECE_ID_TO_NAME) else "UNKNOWN"
+    enemy_name = (
+        PIECE_ID_TO_NAME[abs(pid)] if abs(pid) < len(PIECE_ID_TO_NAME) else "UNKNOWN"
+    )
     target = int(board_before[end[0]][end[1]])
     if target > 0:
-        captured_name = PIECE_ID_TO_NAME[target] if target < len(PIECE_ID_TO_NAME) else "UNKNOWN"
+        captured_name = (
+            PIECE_ID_TO_NAME[target] if target < len(PIECE_ID_TO_NAME) else "UNKNOWN"
+        )
         return (
             f"Enemy moved {enemy_name} from ({start[0]},{start[1]}) to "
             f"({end[0]},{end[1]}), capturing your {captured_name}."
         )
     return (
-        f"Enemy moved {enemy_name} from ({start[0]},{start[1]}) to "
-        f"({end[0]},{end[1]})."
+        f"Enemy moved {enemy_name} from ({start[0]},{start[1]}) to ({end[0]},{end[1]})."
     )
 
 
 # ─── Evaluation metrics ───
 
+
 def calculate_win_rate(wins, total_games):
     return (wins / total_games) * 100 if total_games > 0 else 0
+
 
 def average_reward(rewards):
     return sum(rewards) / len(rewards) if rewards else 0
 
+
 def average_episode_length(rounds_list):
     return sum(rounds_list) / len(rounds_list) if rounds_list else 0
+
 
 def reward_variability(rewards):
     return np.std(rewards)
@@ -209,7 +228,10 @@ def _rolling_ma(series: List[float], window: int):
 
 # ─── Evaluation visualizations ───
 
-def plot_episode_lengths(episode_lengths, window_size=3, ally="LLM-Agent", enemy="Random"):
+
+def plot_episode_lengths(
+    episode_lengths, window_size=3, ally="LLM-Agent", enemy="Random"
+):
     plt.figure(figsize=(10, 5))
     xs, ma = _rolling_ma(episode_lengths, window_size)
     if xs is not None:
@@ -222,7 +244,9 @@ def plot_episode_lengths(episode_lengths, window_size=3, ally="LLM-Agent", enemy
     plt.show()
 
 
-def plot_episode_rewards(ally_rewards, enemy_rewards, window_size=3, ally="LLM-Agent", enemy="Random"):
+def plot_episode_rewards(
+    ally_rewards, enemy_rewards, window_size=3, ally="LLM-Agent", enemy="Random"
+):
     plt.figure(figsize=(10, 5))
     for rewards, color, label in (
         (ally_rewards, "cyan", ally),
@@ -248,7 +272,12 @@ def plot_grpo_diagnostics(
     episodes = np.arange(1, len(ally_win_rate_cumulative) + 1)
     fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
 
-    axes[0].plot(episodes, ally_win_rate_cumulative, color="tab:blue", label="Cumulative ally win %")
+    axes[0].plot(
+        episodes,
+        ally_win_rate_cumulative,
+        color="tab:blue",
+        label="Cumulative ally win %",
+    )
     xs, ma = _rolling_ma(list(ally_win_rate_cumulative), window_size)
     if xs is not None:
         axes[0].plot(xs, ma, color="tab:orange", label=f"{window_size}-ep MA")
@@ -257,14 +286,27 @@ def plot_grpo_diagnostics(
     axes[0].legend()
     axes[0].grid(True)
 
-    std_masked = np.ma.masked_invalid(np.asarray(batch_reward_std_per_episode, dtype=float))
-    axes[1].plot(episodes, std_masked, color="tab:green", alpha=0.85, label="Batch σ (episode mean)")
+    std_masked = np.ma.masked_invalid(
+        np.asarray(batch_reward_std_per_episode, dtype=float)
+    )
+    axes[1].plot(
+        episodes,
+        std_masked,
+        color="tab:green",
+        alpha=0.85,
+        label="Batch σ (episode mean)",
+    )
     axes[1].set_ylabel("Batch reward σ (pre-norm)")
     axes[1].set_title("GRPO reward spread per batch")
     axes[1].legend()
     axes[1].grid(True)
 
-    axes[2].plot(episodes, trained_turn_fraction, color="tab:purple", label="Trained / ally turns")
+    axes[2].plot(
+        episodes,
+        trained_turn_fraction,
+        color="tab:purple",
+        label="Trained / ally turns",
+    )
     xs, ma = _rolling_ma(list(trained_turn_fraction), window_size)
     if xs is not None:
         axes[2].plot(xs, ma, color="tab:brown", label=f"{window_size}-ep MA")
@@ -280,6 +322,7 @@ def plot_grpo_diagnostics(
 
 
 # ─── Log helpers ───
+
 
 def training_log_token_truncate(file, num_episode, round, input_token_length=2048):
     with open(file, "a", encoding="utf-8") as f:
@@ -395,20 +438,20 @@ def reset_episode_metrics_csv(filepath: str) -> None:
 
 _GPU_PEAK_TFLOPS: Dict[str, Dict[str, float]] = {
     "5090": {"bf16": 209.5, "fp32": 104.8, "fp16": 209.5},
-    "5080": {"bf16": 112.0, "fp32": 56.0,  "fp16": 112.0},
-    "4090": {"bf16": 330.0, "fp32": 82.6,  "fp16": 330.0},
-    "4080": {"bf16": 200.0, "fp32": 48.7,  "fp16": 200.0},
-    "3090": {"bf16": 142.0, "fp32": 35.6,  "fp16": 142.0},
-    "3080": {"bf16": 119.0, "fp32": 29.8,  "fp16": 119.0},
-    "h100": {"bf16": 989.0, "fp32": 67.0,  "fp16": 989.0},
-    "h200": {"bf16": 989.0, "fp32": 67.0,  "fp16": 989.0},
-    "a100": {"bf16": 312.0, "fp32": 19.5,  "fp16": 312.0},
+    "5080": {"bf16": 112.0, "fp32": 56.0, "fp16": 112.0},
+    "4090": {"bf16": 330.0, "fp32": 82.6, "fp16": 330.0},
+    "4080": {"bf16": 200.0, "fp32": 48.7, "fp16": 200.0},
+    "3090": {"bf16": 142.0, "fp32": 35.6, "fp16": 142.0},
+    "3080": {"bf16": 119.0, "fp32": 29.8, "fp16": 119.0},
+    "h100": {"bf16": 989.0, "fp32": 67.0, "fp16": 989.0},
+    "h200": {"bf16": 989.0, "fp32": 67.0, "fp16": 989.0},
+    "a100": {"bf16": 312.0, "fp32": 19.5, "fp16": 312.0},
     "a6000": {"bf16": 155.0, "fp32": 38.7, "fp16": 155.0},
-    "a40":  {"bf16": 150.0, "fp32": 37.4,  "fp16": 150.0},
-    "l40s": {"bf16": 362.0, "fp32": 91.6,  "fp16": 362.0},
-    "l40":  {"bf16": 181.0, "fp32": 90.5,  "fp16": 181.0},
-    "a5000": {"bf16": 65.6, "fp32": 27.8,  "fp16": 65.6},
-    "v100": {"bf16": 125.0, "fp32": 15.7,  "fp16": 125.0},
+    "a40": {"bf16": 150.0, "fp32": 37.4, "fp16": 150.0},
+    "l40s": {"bf16": 362.0, "fp32": 91.6, "fp16": 362.0},
+    "l40": {"bf16": 181.0, "fp32": 90.5, "fp16": 181.0},
+    "a5000": {"bf16": 65.6, "fp32": 27.8, "fp16": 65.6},
+    "v100": {"bf16": 125.0, "fp32": 15.7, "fp16": 125.0},
 }
 
 
@@ -469,9 +512,13 @@ class MFUTracker:
     HFU = HFU_flops / (elapsed · peak)
     """
 
-    def __init__(self, model, device_index: int = 0,
-                 mp_policy: Optional[MixedPrecisionPolicy] = None,
-                 gradient_checkpointing: bool = True):
+    def __init__(
+        self,
+        model,
+        device_index: int = 0,
+        mp_policy: Optional[MixedPrecisionPolicy] = None,
+        gradient_checkpointing: bool = True,
+    ):
         self.total_params = sum(p.numel() for p in model.parameters())
         self.trainable_params = sum(
             p.numel() for p in model.parameters() if p.requires_grad
@@ -483,8 +530,9 @@ class MFUTracker:
         self.gpu_peak_flops = self.gpu_peak_tflops * 1e12
         self._history: List[Dict[str, float]] = []
 
-    def compute(self, total_tokens: int, elapsed_sec: float,
-                num_fwd_per_sample: int = 2) -> Dict[str, float]:
+    def compute(
+        self, total_tokens: int, elapsed_sec: float, num_fwd_per_sample: int = 2
+    ) -> Dict[str, float]:
         """Return MFU and HFU metrics for one train_step.
 
         Args:
@@ -509,8 +557,16 @@ class MFUTracker:
 
         mfu_achieved = (mfu_flops / elapsed_sec) / 1e12
         hfu_achieved = (hfu_flops / elapsed_sec) / 1e12
-        mfu = (mfu_flops / elapsed_sec) / self.gpu_peak_flops if self.gpu_peak_flops > 0 else 0.0
-        hfu = (hfu_flops / elapsed_sec) / self.gpu_peak_flops if self.gpu_peak_flops > 0 else 0.0
+        mfu = (
+            (mfu_flops / elapsed_sec) / self.gpu_peak_flops
+            if self.gpu_peak_flops > 0
+            else 0.0
+        )
+        hfu = (
+            (hfu_flops / elapsed_sec) / self.gpu_peak_flops
+            if self.gpu_peak_flops > 0
+            else 0.0
+        )
 
         stats: Dict[str, float] = {
             "mfu/mfu": mfu,
@@ -546,6 +602,7 @@ class MFUTracker:
 
 # ─── Lightweight GRPO trainer for online RL ───
 
+
 class GRPOTrainerOnline:
     """
     Group Relative Policy Optimization for an online game-playing loop.
@@ -560,9 +617,18 @@ class GRPOTrainerOnline:
       4. Loss = -mean(advantage * response_log_prob) + beta * KL
     """
 
-    def __init__(self, model, tokenizer, device, batch_size=8, lr=1e-5, beta=0.1, max_grad_norm=1.0,
-                 mp_policy: Optional[MixedPrecisionPolicy] = None,
-                 grad_accum_steps: int = 4):
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        device,
+        batch_size=8,
+        lr=1e-5,
+        beta=0.1,
+        max_grad_norm=1.0,
+        mp_policy: Optional[MixedPrecisionPolicy] = None,
+        grad_accum_steps: int = 4,
+    ):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -580,7 +646,9 @@ class GRPOTrainerOnline:
 
         _grad_ckpt = getattr(model, "is_gradient_checkpointing", False)
         self.mfu_tracker = MFUTracker(
-            model, device.index or 0, mp_policy=mp_policy,
+            model,
+            device.index or 0,
+            mp_policy=mp_policy,
             gradient_checkpointing=_grad_ckpt,
         )
 
@@ -601,7 +669,9 @@ class GRPOTrainerOnline:
         response_start = query_ids.size(0)
         response_logits = logits[0, response_start - 1 : -1, :]
         log_probs = F.log_softmax(response_logits.float(), dim=-1)
-        token_log_probs = log_probs.gather(1, response_ids.to(self.device).unsqueeze(1)).squeeze(1)
+        token_log_probs = log_probs.gather(
+            1, response_ids.to(self.device).unsqueeze(1)
+        ).squeeze(1)
         return token_log_probs.sum()
 
     def _broadcast_buffer_batch(self):
@@ -653,7 +723,9 @@ class GRPOTrainerOnline:
 
     def train_step(self):
         """GRPO update — all ranks must call this together so FSDP collectives stay in sync."""
-        should_train = broadcast_bool(self.buffer_size() >= self.batch_size if rank == 0 else False)
+        should_train = broadcast_bool(
+            self.buffer_size() >= self.batch_size if rank == 0 else False
+        )
         if not should_train:
             return {}
 
@@ -661,13 +733,14 @@ class GRPOTrainerOnline:
 
         reward_std_before_norm = float(rewards_t.std().item())
         if reward_std_before_norm > 1e-4:
-            advantages = (rewards_t - rewards_t.mean()) / (reward_std_before_norm + 1e-8)
+            advantages = (rewards_t - rewards_t.mean()) / (
+                reward_std_before_norm + 1e-8
+            )
         else:
             advantages = rewards_t - rewards_t.mean()
 
         total_tokens = sum(
-            q.numel() + r.numel()
-            for q, r in zip(query_ids_batch, response_ids_batch)
+            q.numel() + r.numel() for q, r in zip(query_ids_batch, response_ids_batch)
         )
         torch.cuda.synchronize()
         _mfu_t0 = time.perf_counter()
@@ -733,7 +806,9 @@ class GRPOTrainerOnline:
         torch.cuda.synchronize()
         _mfu_elapsed = time.perf_counter() - _mfu_t0
         mfu_stats = self.mfu_tracker.compute(
-            total_tokens, _mfu_elapsed, num_fwd_per_sample=2,
+            total_tokens,
+            _mfu_elapsed,
+            num_fwd_per_sample=2,
         )
 
         torch.cuda.empty_cache()
@@ -754,9 +829,16 @@ class GRPOTrainerOnline:
 
 # ─── LLM Agent with GRPO ───
 
+
 class Agent(ABC):
     def __init__(
-        self, model, tokenizer, grpo_trainer, max_input_token, device, generate_config_dict=None
+        self,
+        model,
+        tokenizer,
+        grpo_trainer,
+        max_input_token,
+        device,
+        generate_config_dict=None,
     ):
         if generate_config_dict is None:
             generate_config_dict = {
@@ -791,7 +873,10 @@ class Agent(ABC):
 
     @abstractmethod
     def format_observation(
-        self, observation: gym.core.ObsType, env: gym.Env = None, ally_turn_index: int = 0,
+        self,
+        observation: gym.core.ObsType,
+        env: gym.Env = None,
+        ally_turn_index: int = 0,
         enemy_move_desc: Optional[str] = None,
     ) -> str:
         pass
@@ -809,7 +894,9 @@ class Agent(ABC):
                 messages, tokenize=False, add_generation_prompt=True
             )
             inputs = self.tokenizer(prompt, return_tensors="pt")
-            ids_bcast, mask_bcast = broadcast_input_ids(inputs.input_ids, inputs.attention_mask)
+            ids_bcast, mask_bcast = broadcast_input_ids(
+                inputs.input_ids, inputs.attention_mask
+            )
         else:
             ids_bcast, mask_bcast = broadcast_input_ids(None, None)
 
@@ -825,7 +912,7 @@ class Agent(ABC):
                     **{
                         key.split("/")[-1]: value
                         for key, value in self.generate_config_dict.items()
-                    }
+                    },
                 )
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
@@ -852,7 +939,9 @@ class Agent(ABC):
 
         if rank == 0:
             message = self.format_observation(
-                observation, env, ally_turn_index=ally_turn_index,
+                observation,
+                env,
+                ally_turn_index=ally_turn_index,
                 enemy_move_desc=self.last_enemy_move_desc,
             )
             self.last_enemy_move_desc = None
@@ -882,7 +971,9 @@ class Agent(ABC):
                     ):
                         self.current_llm_input.pop(1)
                     prompt = self.tokenizer.apply_chat_template(
-                        self.current_llm_input, tokenize=False, add_generation_prompt=True
+                        self.current_llm_input,
+                        tokenize=False,
+                        add_generation_prompt=True,
                     )
                     check = self.tokenizer(prompt, return_tensors="pt")
                     if len(check.input_ids[0]) + 200 < self.max_input_token:
@@ -916,10 +1007,14 @@ class Agent(ABC):
             max_train_ctx = 2048
             if len(query_ids) > max_train_ctx:
                 query_ids = query_ids[-max_train_ctx:]
-            response_ids = self.tokenizer(corrected_response, return_tensors="pt").input_ids[0]
+            response_ids = self.tokenizer(
+                corrected_response, return_tensors="pt"
+            ).input_ids[0]
             self.current_episode_turn_data.append((query_ids, response_ids, is_random))
 
-            self.current_episode_messages += [{"role": "assistant", "content": assistant_msg}]
+            self.current_episode_messages += [
+                {"role": "assistant", "content": assistant_msg}
+            ]
             self.current_llm_input += [{"role": "assistant", "content": assistant_msg}]
             return is_random, action, response
 
@@ -939,11 +1034,13 @@ class Agent(ABC):
         """End an episode. Only rank 0 manages the buffer; all ranks call train_step together."""
         if rank == 0 and train and self.current_episode_turn_data:
             turns = self.current_episode_turn_data
-            shaped = self.current_episode_shaped_rewards[:len(turns)]
+            shaped = self.current_episode_shaped_rewards[: len(turns)]
             raw = self.current_episode_rewards
 
             terminal_reward = raw[-1] if raw else 0.0
-            terminal_bonus = distribute_terminal_bonus(terminal_reward, len(turns), gamma)
+            terminal_bonus = distribute_terminal_bonus(
+                terminal_reward, len(turns), gamma
+            )
 
             for i, ((q, r, was_random), bonus) in enumerate(zip(turns, terminal_bonus)):
                 if not was_random:
@@ -982,7 +1079,9 @@ class Agent(ABC):
                 if hfu_val is not None:
                     hfu_steps.append(hfu_val)
             if batch_reward_stds:
-                all_stats["grpo/batch_reward_std_mean"] = float(np.mean(batch_reward_stds))
+                all_stats["grpo/batch_reward_std_mean"] = float(
+                    np.mean(batch_reward_stds)
+                )
                 all_stats["grpo/grpo_train_steps"] = len(batch_reward_stds)
             if mfu_steps:
                 all_stats["mfu/mean_mfu_episode"] = float(np.mean(mfu_steps))
@@ -1024,7 +1123,10 @@ class ChineseChessAgent(Agent):
     EARLY_GAME_ALLY_MOVES = 50
 
     def format_observation(
-        self, observation: gym.core.ObsType, env: gym.Env = None, ally_turn_index: int = 0,
+        self,
+        observation: gym.core.ObsType,
+        env: gym.Env = None,
+        ally_turn_index: int = 0,
         enemy_move_desc: Optional[str] = None,
     ) -> str:
         message = ""
@@ -1038,10 +1140,10 @@ class ChineseChessAgent(Agent):
             general_lines = []
             for a in legal_actions:
                 pid, start, end = action_space_to_move(a)
-                name = PIECE_ID_TO_NAME[pid] if pid < len(PIECE_ID_TO_NAME) else 'UNKNOWN'
-                line = (
-                    f"  {pid} ({name}): ({start[0]}, {start[1]}) -> ({end[0]}, {end[1]})"
+                name = (
+                    PIECE_ID_TO_NAME[pid] if pid < len(PIECE_ID_TO_NAME) else "UNKNOWN"
                 )
+                line = f"  {pid} ({name}): ({start[0]}, {start[1]}) -> ({end[0]}, {end[1]})"
                 lines_in_env_order.append(line)
                 if pid == 1:
                     general_lines.append(line)
@@ -1158,12 +1260,20 @@ if rank != 0:
         low_cpu_mem_usage=True,
     )
 dist.barrier()
-device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
+device = (
+    torch.device(f"cuda:{local_rank}")
+    if torch.cuda.is_available()
+    else torch.device("cpu")
+)
 
 # ─── Apply LoRA (new) or load saved adapter (resume) ───
 
 lora_config = LoraConfig(
-    **{key.split("/")[-1]: value for key, value in hyperparams.items() if key.startswith("lora/")}
+    **{
+        key.split("/")[-1]: value
+        for key, value in hyperparams.items()
+        if key.startswith("lora/")
+    }
 )
 
 _infer_adapter = (hyperparams.get("inference/adapter_path") or "").strip()
@@ -1182,10 +1292,10 @@ else:
 
 if _adapter_dir:
     if not os.path.isdir(_adapter_dir):
-        raise FileNotFoundError(f"LoRA adapter path is not a directory: {_adapter_dir!r}")
-    model = PeftModel.from_pretrained(
-        model, _adapter_dir, is_trainable=_peft_trainable
-    )
+        raise FileNotFoundError(
+            f"LoRA adapter path is not a directory: {_adapter_dir!r}"
+        )
+    model = PeftModel.from_pretrained(model, _adapter_dir, is_trainable=_peft_trainable)
     _tok_src = (
         _adapter_dir
         if os.path.isfile(os.path.join(_adapter_dir, "tokenizer_config.json"))
@@ -1266,7 +1376,9 @@ def save_lora_checkpoint(checkpoint_path: str, episode: int, label: str = "") ->
             "base_model": hyperparams["model_name"],
             "lora": {k: v for k, v in hyperparams.items() if k.startswith("lora/")},
         }
-        with open(os.path.join(checkpoint_path, "training_meta.json"), "w", encoding="utf-8") as f:
+        with open(
+            os.path.join(checkpoint_path, "training_meta.json"), "w", encoding="utf-8"
+        ) as f:
             json.dump(meta, f, indent=2)
         print(f"[checkpoint] Saved LoRA adapter to {checkpoint_path!r}")
     dist.barrier()
@@ -1318,7 +1430,9 @@ if rank == 0 and not _infer_only:
 
     if _record_video:
         if RecordVideo is None:
-            print("RecordVideo not available (install gym>=0.26 or gymnasium); skipping video.")
+            print(
+                "RecordVideo not available (install gym>=0.26 or gymnasium); skipping video."
+            )
         else:
             os.makedirs(_record_dir, exist_ok=True)
             env = RecordVideo(
@@ -1386,7 +1500,8 @@ def run_inference_record_videos(
                 f"inference recording needs render_mode='rgb_array'. ({e!r})"
             ) from e
         infer_env = RecordVideo(
-            infer_env, video_dir,
+            infer_env,
+            video_dir,
             episode_trigger=lambda episode_id, cap=num_games: episode_id < cap,
             name_prefix="xiangqi_infer",
         )
@@ -1417,7 +1532,13 @@ def run_inference_record_videos(
                     else:
                         observation, enemy_reward, done, _ = step_out
                     current_enemy_rewards += enemy_reward
-                    _log_env_step(game, round_idx, "Enemy (GreedyEnemy)", enemy_action, enemy_reward)
+                    _log_env_step(
+                        game,
+                        round_idx,
+                        "Enemy (GreedyEnemy)",
+                        enemy_action,
+                        enemy_reward,
+                    )
                     round_idx += 1
                     if round_idx >= 200:
                         print(f"[inference g{game} Rd {round_idx}] hit 200-round cap.")
@@ -1433,7 +1554,11 @@ def run_inference_record_videos(
 
             if rank == 0:
                 used_random_fallback, ally_action, llm_output = infer_ally_agent.act(
-                    observation, game, round_idx, infer_env, ally_turn_index=episode_ally_turns,
+                    observation,
+                    game,
+                    round_idx,
+                    infer_env,
+                    ally_turn_index=episode_ally_turns,
                 )
             else:
                 infer_ally_agent.act(None, game, 0, None, ally_turn_index=0)
@@ -1455,8 +1580,14 @@ def run_inference_record_videos(
                 current_ally_rewards += ally_reward
                 infer_ally_agent.assign_reward(ally_reward)
                 if ally_action is not None:
-                    _log_env_step(game, round_idx, "Ally action", ally_action, ally_reward,
-                                  random_fallback=used_random_fallback)
+                    _log_env_step(
+                        game,
+                        round_idx,
+                        "Ally action",
+                        ally_action,
+                        ally_reward,
+                        random_fallback=used_random_fallback,
+                    )
                 round_idx += 1
                 if round_idx >= 200 and not done:
                     print(f"[inference g{game} Rd {round_idx}] hit 200-round cap.")
@@ -1464,8 +1595,10 @@ def run_inference_record_videos(
 
         if rank == 0:
             outcome = (
-                "enemy_win" if enemy_reward == 100
-                else "ally_win" if ally_reward == 100
+                "enemy_win"
+                if enemy_reward == 100
+                else "ally_win"
+                if ally_reward == 100
                 else "other/trunc"
             )
             print(
@@ -1516,8 +1649,11 @@ if not _infer_only:
         print(f"[metrics] Cleared {EPISODE_METRICS_CSV!r} for this run.\n")
 
     try:
-        for episode in (trange(1, hyperparams["episodes"] + 1) if rank == 0 else range(1, hyperparams["episodes"] + 1)):
-
+        for episode in (
+            trange(1, hyperparams["episodes"] + 1)
+            if rank == 0
+            else range(1, hyperparams["episodes"] + 1)
+        ):
             if rank == 0:
                 observation = env.reset()
                 round_idx, done = 1, False
@@ -1536,13 +1672,18 @@ if not _infer_only:
                         current_enemy_rewards += enemy_reward
 
                         enemy_desc = describe_enemy_move(
-                            board_before_enemy, env.state, enemy_action,
+                            board_before_enemy,
+                            env.state,
+                            enemy_action,
                         )
                         ally_agent.set_enemy_move_desc(enemy_desc)
 
                         _log_env_step(
-                            episode, round_idx, "Enemy (GreedyEnemy)",
-                            enemy_action, enemy_reward,
+                            episode,
+                            round_idx,
+                            "Enemy (GreedyEnemy)",
+                            enemy_action,
+                            enemy_reward,
                         )
                         round_idx += 1
                         if round_idx >= 200:
@@ -1569,7 +1710,10 @@ if not _infer_only:
                 if rank == 0:
                     board_before_ally = env.state.copy()
                     used_random_fallback, ally_action, llm_output = ally_agent.act(
-                        observation, episode, round_idx, env,
+                        observation,
+                        episode,
+                        round_idx,
+                        env,
                         ally_turn_index=episode_ally_turns,
                     )
                 else:
@@ -1579,7 +1723,9 @@ if not _infer_only:
                     if ally_action is None:
                         episode_act_failures += 1
                         lifetime_act_failures += 1
-                        print(f"[Ep {episode} Rd {round_idx}] WARNING act() returned None")
+                        print(
+                            f"[Ep {episode} Rd {round_idx}] WARNING act() returned None"
+                        )
                     else:
                         episode_ally_turns += 1
                         if used_random_fallback:
@@ -1588,21 +1734,29 @@ if not _infer_only:
                     current_ally_rewards += ally_reward
 
                     shaped = compute_shaped_reward(
-                        board_before_ally, ally_action, ally_reward,
+                        board_before_ally,
+                        ally_action,
+                        ally_reward,
                         scale=_material_scale,
                     )
                     ally_agent.assign_reward(ally_reward, shaped_reward=shaped)
 
                     if ally_action is not None:
                         _log_env_step(
-                            episode, round_idx, "Ally action",
-                            ally_action, ally_reward,
+                            episode,
+                            round_idx,
+                            "Ally action",
+                            ally_action,
+                            ally_reward,
                             random_fallback=used_random_fallback,
                             shaped_reward=round(shaped, 4),
                         )
                     if episode % gap_size == 0 and ally_action is not None:
                         training_log_llm_output(
-                            "chinese_chess_llm_output_log", episode, round_idx, llm_output
+                            "chinese_chess_llm_output_log",
+                            episode,
+                            round_idx,
+                            llm_output,
                         )
                     round_idx += 1
                     if round_idx >= 200 and not done:
@@ -1632,7 +1786,9 @@ if not _infer_only:
                 lifetime_ally_turns += episode_ally_turns
                 lifetime_random_fallback += episode_random_fallback
                 random_rate_episode = (
-                    100.0 * episode_random_fallback / episode_ally_turns if episode_ally_turns else 0.0
+                    100.0 * episode_random_fallback / episode_ally_turns
+                    if episode_ally_turns
+                    else 0.0
                 )
                 random_rate_lifetime = (
                     100.0 * lifetime_random_fallback / lifetime_ally_turns
@@ -1708,9 +1864,12 @@ if not _infer_only:
                 ewr = calculate_win_rate(enemy_wins, episode)
                 tr = calculate_win_rate(truncated_game, episode)
                 br = train_stats.get(
-                    "grpo/batch_reward_std_mean", train_stats.get("grpo/batch_reward_std", "n/a")
+                    "grpo/batch_reward_std_mean",
+                    train_stats.get("grpo/batch_reward_std", "n/a"),
                 )
-                print(f"\n[Ep {episode}] --- periodic summary (every {gap_size} eps) ---")
+                print(
+                    f"\n[Ep {episode}] --- periodic summary (every {gap_size} eps) ---"
+                )
                 print("Opponent: GreedyEnemy")
                 print(
                     f"Wins: ally {ally_wins} ({wr:.1f}%) | enemy {enemy_wins} ({ewr:.1f}%) | "
@@ -1742,9 +1901,13 @@ if not _infer_only:
                     if _hfu_ep_val is not None:
                         _ep_parts.append(f"ep_mean_hfu={_hfu_ep_val:.4f}")
                     _ep_str = (" | " + " | ".join(_ep_parts)) if _ep_parts else ""
-                    _hfu_str = f" | HFU: {_hfu_val:.4f} ({_hfu_val*100:.2f}%)" if _hfu_val is not None else ""
+                    _hfu_str = (
+                        f" | HFU: {_hfu_val:.4f} ({_hfu_val * 100:.2f}%)"
+                        if _hfu_val is not None
+                        else ""
+                    )
                     print(
-                        f"MFU: {_mfu_val:.4f} ({_mfu_val*100:.2f}%){_hfu_str} | "
+                        f"MFU: {_mfu_val:.4f} ({_mfu_val * 100:.2f}%){_hfu_str} | "
                         f"step_time={_step_sec:.2f}s{_ep_str}"
                     )
                 print("-" * 60)
@@ -1776,13 +1939,17 @@ if not _infer_only:
                 )
             except Exception as save_err:
                 if rank == 0:
-                    print(f"[checkpoint] Could not save interrupted checkpoint: {save_err}")
+                    print(
+                        f"[checkpoint] Could not save interrupted checkpoint: {save_err}"
+                    )
 
 if env is not None:
     env.close()
 
 if not _infer_only and rank == 0:
-    print(f"\nFinal score after {episode} episodes -> Ally Wins: {ally_wins}, Enemy Wins: {enemy_wins}, Truncated Game: {truncated_game}")
+    print(
+        f"\nFinal score after {episode} episodes -> Ally Wins: {ally_wins}, Enemy Wins: {enemy_wins}, Truncated Game: {truncated_game}"
+    )
     print(f"Ally Win Rate: {calculate_win_rate(ally_wins, episode)}%")
     print(f"Enemy Win Rate: {calculate_win_rate(enemy_wins, episode)}%")
     print(f"Truncated Rate: {calculate_win_rate(truncated_game, episode)}%")
@@ -1795,14 +1962,14 @@ if not _infer_only and rank == 0:
         print(
             f"\nMFU lifetime: "
             f"mean={_mfu_summary['mfu/lifetime_mean_mfu']:.4f} "
-            f"({_mfu_summary['mfu/lifetime_mean_mfu']*100:.2f}%) | "
+            f"({_mfu_summary['mfu/lifetime_mean_mfu'] * 100:.2f}%) | "
             f"median={_mfu_summary['mfu/lifetime_median_mfu']:.4f} | "
             f"tflops={_mfu_summary['mfu/lifetime_mean_mfu_tflops']:.2f}"
         )
         print(
             f"HFU lifetime: "
             f"mean={_mfu_summary['mfu/lifetime_mean_hfu']:.4f} "
-            f"({_mfu_summary['mfu/lifetime_mean_hfu']*100:.2f}%) | "
+            f"({_mfu_summary['mfu/lifetime_mean_hfu'] * 100:.2f}%) | "
             f"median={_mfu_summary['mfu/lifetime_median_hfu']:.4f} | "
             f"tflops={_mfu_summary['mfu/lifetime_mean_hfu_tflops']:.2f}"
         )
@@ -1817,4 +1984,3 @@ if not _infer_only and rank == 0:
         )
 
 dist.destroy_process_group()
-    
