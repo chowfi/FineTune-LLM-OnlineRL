@@ -12,3 +12,8 @@ def test_defaults_match_spec():
     assert len(cfg.opening_book) == 10
     assert cfg.input_planes == 14 * cfg.history_length + 3 == 115
     assert len(cfg.loss_weights) == 6
+
+
+def test_input_planes_derived_from_history_length():
+    cfg = MuZeroConfig(history_length=4)
+    assert cfg.input_planes == 59
