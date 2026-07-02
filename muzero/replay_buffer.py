@@ -31,6 +31,7 @@ class GameHistory:
         self.result = None
         self.truncated = False
         self.ally_side = "w"
+        self.buffer_index = 0
 
     def __len__(self):
         return len(self.actions)
@@ -62,6 +63,7 @@ class ReplayBuffer:
             tail = 2 * self.config.truncation_consecutive
             pri[-tail:] *= self.config.truncated_tail_weight
         with self._lock:
+            game.buffer_index = self.total_games_added
             self.games.append(game)
             self.priorities.append(pri)
             self.total_games_added += 1
@@ -177,7 +179,14 @@ class ReplayBuffer:
             self.make_target(self.games[owners[i]], int(i - offsets[owners[i]]))
             for i in picks
         ]
-        return {k: np.stack([s[k] for s in samples]) for k in samples[0]}
+        ages = [
+            self.total_games_added
+            - getattr(self.games[owners[i]], "buffer_index", self.total_games_added)
+            for i in picks
+        ]
+        batch = {k: np.stack([s[k] for s in samples]) for k in samples[0]}
+        batch["mean_buffer_age"] = np.float32(np.mean(ages))
+        return batch
 
     def mean_game_length(self) -> float:
         return float(np.mean([len(g) for g in self.games])) if self.games else 0.0

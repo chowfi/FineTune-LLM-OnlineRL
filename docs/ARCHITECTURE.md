@@ -76,7 +76,17 @@ This project fine-tunes a Large Language Model (specifically `Qwen/Qwen2.5-7B-In
   (engine-gated tests need `PIKAFISH_BIN`). Module map: `config.py` (all
   hyperparameters), `encoding.py`, `transforms.py`, `network.py`, `env.py`,
   `mcts.py`, `selfplay.py`, `replay_buffer.py`, `warmstart.py`, `train.py`,
-  `metrics.py`.
+  `metrics.py`. `selfplay.py`'s `_Game` tracks per-ally-move root-policy
+  entropy and (root value, engine cp) pairs at no extra engine-call cost
+  (the cp already comes back on `env.step`'s `info`); `metrics.py` rolls
+  these into `selfplay/mean_root_entropy`, `selfplay/mean_ally_cp_auc`,
+  `selfplay/value_cp_correlation`, and `selfplay/games_per_promotion`.
+  `replay_buffer.py` stamps each `GameHistory` with a `buffer_index` on
+  `add()` and `sample_batch()` returns a `mean_buffer_age` scalar, which
+  `train.py`'s `MuZeroTrainer.train_batch` pops before tensorizing and
+  reports back as `buffer_age` (aggregated into `loss/buffer_age` by the
+  main loop). Deferred §10 metrics needing extra engine calls or GPU
+  introspection are tracked in `docs/AGENT_TODO.md`.
 
 ### 3d. Inference-only Elo bench (chess + xiangqi)
 - **Description:** `scripts/benchmark/` benchmarks any LLM (default

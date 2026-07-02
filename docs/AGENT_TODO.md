@@ -17,6 +17,7 @@ This document tracks prioritized tasks for AI agents. When starting a new sessio
   - `gym_xiangqi` perpetual-check ("jiang") can set `done` without flipping the turn; env wrapper credits the mover as winner — verify/fix if self-play logs show it.
   - `run_gate`/warmstart count an engine abort (`if not lines: break`) as a draw / `engine_aborted`; watch gate stats for skew.
   - Gumbel MuZero (32–64 sims) is the designed fallback behind the `mcts.py` interface if 800 sims can't hit throughput on one GPU.
+  - Deferred §10 metrics (need extra engine calls / GPU introspection): fraction of ally moves matching Pikafish best; GPU inference batch utilization; per-era win-rate breakdown (era is logged; break out in the wandb UI or a follow-up).
 - `[ ]` **Repo hygiene:** 29 legacy `.pyc` files tracked since `6058b0b` (root `__pycache__/`, `scripts/`, `web/server/`, `unsloth_compiled_cache/__pycache__/`) predate `.gitignore` rules; untrack them in a dedicated cleanup commit on main (leave `unsloth_compiled_cache/` contents otherwise untouched).
 
 

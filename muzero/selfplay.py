@@ -63,6 +63,8 @@ class _Game:
         self.env = env
         self.history = history
         self.opening_uci = opening_uci
+        self.ally_entropies = []
+        self.ally_value_cp_pairs = []
 
 
 class SelfPlayWorker:
@@ -115,8 +117,18 @@ class SelfPlayWorker:
             np.array([v / total for v in visits.values()], dtype=np.float32)
         )
         h.root_values.append(float(root_value))
+        if game.env.side_to_move == game.env.ally_side:  # ally is about to move
+            p = np.array([v / total for v in visits.values()], dtype=np.float64)
+            game.ally_entropies.append(float(-(p * np.log(p + 1e-12)).sum()))
         _, reward, done, info = game.env.step(index_to_move(action))
         h.rewards.append(reward)
+        if (
+            info.get("red_cp") is not None
+            and game.env.side_to_move != game.env.ally_side
+        ):
+            # the ALLY just moved (side flipped); pair its root value with the engine eval
+            ally_cp = info["red_cp"] if game.env.ally_side == "w" else -info["red_cp"]
+            game.ally_value_cp_pairs.append((float(root_value), float(ally_cp)))
         return done, info
 
     def _finish(self, game: _Game) -> dict:
@@ -144,6 +156,16 @@ class SelfPlayWorker:
             "promoted": promoted,
             "final_red_cp": final_red_cp,
             "era": self.coordinator.era,
+            "mean_root_entropy": (
+                float(np.mean(game.ally_entropies)) if game.ally_entropies else 0.0
+            ),
+            "value_cp_pairs": list(game.ally_value_cp_pairs),
+            "mean_ally_cp": (
+                float(np.mean([cp for _, cp in game.ally_value_cp_pairs]))
+                if game.ally_value_cp_pairs
+                else None
+            ),
+            "games_this_era": self.coordinator.games_this_era,
         }
 
     def generate(self, num_games: int) -> list:

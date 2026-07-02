@@ -63,3 +63,24 @@ def test_sample_batch_shapes():
     np.testing.assert_allclose(
         np.asarray(batch["target_policy"]).sum(-1), 1.0, rtol=1e-4
     )
+
+
+def test_sample_batch_returns_mean_buffer_age():
+    cfg = replace(MuZeroConfig(), batch_size=8, unroll_steps=8)
+    buf = ReplayBuffer(cfg)
+    for _ in range(4):
+        buf.add(make_game())
+    batch = buf.sample_batch(8)
+    assert "mean_buffer_age" in batch
+    assert np.asarray(batch["mean_buffer_age"]).ndim == 0
+    assert np.isfinite(batch["mean_buffer_age"])
+    assert batch["mean_buffer_age"] >= 0.0
+
+
+def test_buffer_index_assigned_in_add_order():
+    cfg = replace(MuZeroConfig(), buffer_games=10)
+    buf = ReplayBuffer(cfg)
+    for _ in range(3):
+        buf.add(make_game())
+    assert [g.buffer_index for g in buf.games] == [0, 1, 2]
+    assert buf.total_games_added == 3

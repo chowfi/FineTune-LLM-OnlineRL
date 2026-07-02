@@ -4,11 +4,18 @@ import numpy as np
 import torch
 
 from muzero.config import MuZeroConfig
+from muzero.encoding import move_to_index
+from muzero.env import XiangqiEnv
 from muzero.mcts import NetRunner
 from muzero.network import MuZeroNet
-from muzero.replay_buffer import ReplayBuffer
-from muzero.selfplay import SelfPlayCoordinator, SelfPlayWorker, select_action
-from muzero.tests.helpers import make_evaluator, requires_engine
+from muzero.replay_buffer import GameHistory, ReplayBuffer
+from muzero.selfplay import (
+    SelfPlayCoordinator,
+    SelfPlayWorker,
+    _Game,
+    select_action,
+)
+from muzero.tests.helpers import FakeEvaluator, make_evaluator, requires_engine
 
 
 def test_coordinator_promotes_after_streak():
@@ -56,6 +63,115 @@ def test_concurrent_adds_keep_deques_aligned():
     assert len(buf.games) == len(buf.priorities) == 80
     for g, p in zip(buf.games, buf.priorities):
         assert len(p) == len(g)
+
+
+def _make_worker(cfg, evaluator):
+    ally, enemy = MuZeroNet(cfg), MuZeroNet(cfg)
+    buf = ReplayBuffer(cfg)
+    coord = SelfPlayCoordinator(cfg, ally, enemy)
+    return SelfPlayWorker(
+        cfg,
+        NetRunner(ally, "cpu"),
+        NetRunner(enemy, "cpu"),
+        buf,
+        coord,
+        evaluator,
+        worker_id=0,
+    )
+
+
+def _new_game(cfg, evaluator, ally_side="w"):
+    env = XiangqiEnv(cfg, evaluator)
+    env.reset(ally_side=ally_side)
+    history = GameHistory()
+    history.ally_side = ally_side
+    return _Game(env, history, "e6e5")
+
+
+def test_record_and_step_tracks_ally_entropy_and_cp_pairs():
+    cfg = replace(
+        MuZeroConfig(), channels=16, repr_blocks=1, dyn_blocks=1, device="cpu"
+    )
+    # FakeEvaluator.evaluate_cp always answers "+50 for whoever is to move in
+    # the fen" (standard UCI side-to-move-relative convention). After the
+    # ally ("w") moves, side_to_move flips to "b", so env.red_cp() (which
+    # reports from red's/w's absolute perspective) negates it to -50.
+    evaluator = FakeEvaluator(
+        cp_fn=lambda fen: 50.0, legal_fn=lambda fen: ["a0a1", "a0b0"]
+    )
+    worker = _make_worker(cfg, evaluator)
+    game = _new_game(cfg, evaluator, ally_side="w")
+
+    # 1) ally ("w") to move: entropy recorded pre-step; cp paired post-step
+    # (side flips to "b" once the ally has moved).
+    action = move_to_index("e6e5")
+    visits = {action: 3, move_to_index("e7e6"): 1}
+    done, info = worker._record_and_step(
+        game, action=action, visits=visits, root_value=0.25
+    )
+    assert not done
+    assert len(game.ally_entropies) == 1
+    assert game.ally_entropies[0] > 0.0  # non-degenerate visit distribution
+    assert len(game.ally_value_cp_pairs) == 1
+    root_value, ally_cp = game.ally_value_cp_pairs[0]
+    assert root_value == 0.25
+    assert ally_cp == -50.0  # ally_side == "w" -> red_cp used as-is
+
+    # 2) enemy ("b") to move: no entropy recorded, and no new cp pair (the
+    # ally didn't just move).
+    action2 = move_to_index("e3e4")
+    done2, info2 = worker._record_and_step(
+        game, action=action2, visits={action2: 1}, root_value=-0.1
+    )
+    assert not done2
+    assert len(game.ally_entropies) == 1  # unchanged
+    assert len(game.ally_value_cp_pairs) == 1  # unchanged
+
+
+def test_record_and_step_one_hot_ally_entropy_is_zero():
+    cfg = replace(
+        MuZeroConfig(), channels=16, repr_blocks=1, dyn_blocks=1, device="cpu"
+    )
+    evaluator = FakeEvaluator(cp_fn=lambda fen: 0.0, legal_fn=lambda fen: ["a0a1"])
+    worker = _make_worker(cfg, evaluator)
+    game = _new_game(cfg, evaluator, ally_side="w")
+    action = move_to_index("e6e5")
+    worker._record_and_step(game, action=action, visits={action: 1}, root_value=0.0)
+    assert len(game.ally_entropies) == 1
+    assert abs(game.ally_entropies[0]) < 1e-9  # one-hot visits -> ~0 entropy
+
+
+def test_finish_summary_includes_new_diagnostic_fields():
+    cfg = replace(
+        MuZeroConfig(),
+        channels=16,
+        repr_blocks=1,
+        dyn_blocks=1,
+        device="cpu",
+        max_game_plies=2,
+    )
+    evaluator = FakeEvaluator(
+        cp_fn=lambda fen: 50.0, legal_fn=lambda fen: ["a0a1", "a0b0"]
+    )
+    worker = _make_worker(cfg, evaluator)
+    game = _new_game(cfg, evaluator, ally_side="w")
+    action = move_to_index("e6e5")
+    worker._record_and_step(
+        game,
+        action=action,
+        visits={action: 3, move_to_index("e7e6"): 1},
+        root_value=0.25,
+    )
+    action2 = move_to_index("e3e4")
+    done, _ = worker._record_and_step(
+        game, action=action2, visits={action2: 1}, root_value=-0.1
+    )
+    assert done  # max_game_plies=2 reached
+    summary = worker._finish(game)
+    assert summary["mean_root_entropy"] == game.ally_entropies[0]
+    assert summary["value_cp_pairs"] == [(0.25, -50.0)]
+    assert summary["mean_ally_cp"] == -50.0
+    assert summary["games_this_era"] == 1
 
 
 @requires_engine

@@ -42,6 +42,7 @@ class MuZeroTrainer:
 
     def train_batch(self, batch: dict) -> dict:
         cfg = self.cfg
+        mean_buffer_age = float(batch.pop("mean_buffer_age", 0.0))
         self.net.train()
         b = self._to_tensors(batch)
         B, K = b["actions"].shape
@@ -145,6 +146,7 @@ class MuZeroTrainer:
         self.train_steps += 1
         result = {k: float(v.detach()) for k, v in losses.items()}
         result["total"] = float(total.detach())
+        result["buffer_age"] = mean_buffer_age
         return result
 
 
