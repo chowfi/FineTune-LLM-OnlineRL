@@ -5,6 +5,8 @@ This document tracks prioritized tasks for AI agents. When starting a new sessio
 ## Active Tasks (In Progress)
 *(Add `[ ]` and move tasks here when an agent starts working on them)*
 
+- `[ ]` (2026-07-02) **MuZero for Xiangqi — implementation plan + build:** Design spec approved and committed at `docs/superpowers/specs/2026-07-02-muzero-xiangqi-design.md`. Next: user reviews the spec file; on approval, run superpowers:writing-plans to produce the plan, then implement the `muzero/` package. See `docs/logs/2026-07-02-log-muzero-xiangqi-design.md`.
+
 
 ## Backlog (To Do)
 *(Add new ideas, bug fixes, or feature requests here)*
