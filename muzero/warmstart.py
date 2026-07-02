@@ -100,7 +100,9 @@ def generate_warmstart_games(
             history.to_play_history = list(env.to_play_history)
             history.rep_history = list(env.rep_history)
             history.no_progress_history = list(env.no_progress_history)
-            history.result = env.result or "draw_max_plies"
+            history.truncated = env.truncated
+            history.ally_side = env.ally_side
+            history.result = env.result or "engine_aborted"
             buffer.add(history)
             total_plies += len(history)
             games += 1
