@@ -31,11 +31,14 @@ def select_action(visits: dict, ply: int, temperature_moves: int, rng) -> int:
 class SelfPlayCoordinator:
     """Tracks consecutive ally wins across all workers; promotes the enemy."""
 
-    def __init__(self, config: MuZeroConfig, ally_net, enemy_net):
+    def __init__(self, config: MuZeroConfig, ally_net, enemy_net, enemy_lock=None):
         self.config = config
         self.ally_net = ally_net
         self.enemy_net = enemy_net
         self.lock = threading.Lock()
+        # Serializes the weight swap against enemy-net inference; pass the
+        # enemy NetRunner's lock so promotion can't tear concurrent reads.
+        self.enemy_lock = enemy_lock if enemy_lock is not None else threading.Lock()
         self.streak = 0
         self.era = 0
         self.games_this_era = 0
@@ -45,7 +48,7 @@ class SelfPlayCoordinator:
             self.games_this_era += 1
             self.streak = self.streak + 1 if (ally_won and not draw) else 0
             if self.streak >= self.config.promote_after_consecutive_wins:
-                with torch.no_grad():
+                with self.enemy_lock, torch.no_grad():
                     self.enemy_net.load_state_dict(self.ally_net.state_dict())
                 self.enemy_net.eval()
                 self.streak = 0

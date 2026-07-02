@@ -5,6 +5,7 @@ Observations are reconstructed from stored int8 boards at sample time
 
 from __future__ import annotations
 
+import threading
 from collections import deque
 
 import numpy as np
@@ -42,6 +43,7 @@ class ReplayBuffer:
         self.priorities: deque = deque(maxlen=config.buffer_games)
         self.total_games_added = 0
         self.rng = np.random.default_rng(config.seed)
+        self._lock = threading.Lock()
 
     # -- adding ---------------------------------------------------------------
 
@@ -59,9 +61,10 @@ class ReplayBuffer:
         if game.truncated:
             tail = 2 * self.config.truncation_consecutive
             pri[-tail:] *= self.config.truncated_tail_weight
-        self.games.append(game)
-        self.priorities.append(pri)
-        self.total_games_added += 1
+        with self._lock:
+            self.games.append(game)
+            self.priorities.append(pri)
+            self.total_games_added += 1
 
     # -- targets ----------------------------------------------------------------
 
@@ -160,6 +163,7 @@ class ReplayBuffer:
     # -- sampling ---------------------------------------------------------------
 
     def sample_batch(self, batch_size: int) -> dict:
+        # Not safe to run concurrently with add(); the main loop joins workers first.
         flat, owners = [], []
         for gi, pri in enumerate(self.priorities):
             flat.append(pri)

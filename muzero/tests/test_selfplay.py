@@ -38,6 +38,26 @@ def test_select_action_temperature():
     assert picks == {7, 9}  # sampling explores both
 
 
+def test_concurrent_adds_keep_deques_aligned():
+    import threading as th
+
+    from muzero.tests.test_replay_buffer import make_game
+
+    cfg = replace(MuZeroConfig(), buffer_games=200)
+    buf = ReplayBuffer(cfg)
+    threads = [
+        th.Thread(target=lambda: [buf.add(make_game(length=6)) for _ in range(20)])
+        for _ in range(4)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(buf.games) == len(buf.priorities) == 80
+    for g, p in zip(buf.games, buf.priorities):
+        assert len(p) == len(g)
+
+
 @requires_engine
 def test_selfplay_smoke_generates_games():
     cfg = replace(
