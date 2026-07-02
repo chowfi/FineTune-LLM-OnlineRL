@@ -91,8 +91,9 @@ class Node:
 
 
 class MCTS:
-    def __init__(self, config: MuZeroConfig):
+    def __init__(self, config: MuZeroConfig, rng=None):
         self.config = config
+        self.rng = rng if rng is not None else np.random.default_rng(config.seed)
 
     def run(self, runner: NetRunner, roots_data: list, add_noise: bool) -> list:
         """roots_data: list of (obs (115,10,9) float32, legal action indices).
@@ -105,7 +106,7 @@ class MCTS:
             root = Node(0.0)
             priors = _masked_softmax(out["policy_logits"][g], legal)
             if add_noise:
-                noise = np.random.dirichlet([cfg.dirichlet_alpha] * len(legal))
+                noise = self.rng.dirichlet([cfg.dirichlet_alpha] * len(legal))
                 priors = (
                     1 - cfg.exploration_fraction
                 ) * priors + cfg.exploration_fraction * noise
@@ -176,11 +177,15 @@ class MCTS:
 
     def _backup(self, path: list, leaf_value: float, stats: MinMaxStats):
         cfg = self.config
+        root = path[0]
         v = leaf_value  # perspective of the player to move at the leaf
         for node in reversed(path):
             node.value_sum += v
             node.visit_count += 1
-            stats.update(node.reward + cfg.discount * -v)
+            if node is not root:
+                # Track the exact quantity _select_child normalizes: the
+                # child's running-mean Q from its parent's perspective.
+                stats.update(node.reward + cfg.discount * -node.value())
             v = node.reward + cfg.discount * -v
 
 
