@@ -39,3 +39,9 @@ def test_projection_shapes():
     hidden = torch.randn(4, 16, 10, 9)
     assert net.project(hidden, with_predictor=False).shape == (4, 1024)
     assert net.project(hidden, with_predictor=True).shape == (4, 1024)
+
+
+def test_default_param_count_within_spec():
+    net = MuZeroNet(MuZeroConfig(device="cpu"))
+    params = sum(p.numel() for p in net.parameters()) / 1e6
+    assert 20.0 <= params <= 35.0, params

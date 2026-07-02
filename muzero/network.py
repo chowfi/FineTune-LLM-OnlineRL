@@ -84,8 +84,10 @@ class MuZeroNet(nn.Module):
         self.moves_left_head = _head(ch, 2, 128, cfg.moves_left_max + 1)
         self.material_head = _head(ch, 2, 128, 1)
         self.projector = nn.Sequential(
+            nn.Conv2d(ch, 32, 1),
+            nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(ch * 90, 1024),
+            nn.Linear(32 * 90, 1024),
             nn.LayerNorm(1024),
             nn.ReLU(),
             nn.Linear(1024, 1024),
