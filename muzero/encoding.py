@@ -67,12 +67,20 @@ def encode_observation(
 ) -> np.ndarray:
     """Stack of the last `history_length` boards (oldest first, zero-padded)
     plus side-to-move / repetition / no-progress broadcast planes."""
+    assert side_to_move in ("w", "b"), side_to_move
     hist = list(boards)[-history_length:]
-    stacks = [np.zeros((14, 10, 9), dtype=np.float32)] * (history_length - len(hist))
+    stacks = [
+        np.zeros((14, 10, 9), dtype=np.float32)
+        for _ in range(history_length - len(hist))
+    ]
     stacks = stacks + [board_planes(b) for b in hist]
     stm = np.full((1, 10, 9), 1.0 if side_to_move == "w" else 0.0, dtype=np.float32)
-    rep = np.full((1, 10, 9), min(int(repetition_count), 3) / 3.0, dtype=np.float32)
-    nop = np.full((1, 10, 9), min(int(no_progress), 100) / 100.0, dtype=np.float32)
+    rep = np.full(
+        (1, 10, 9), min(max(int(repetition_count), 0), 3) / 3.0, dtype=np.float32
+    )
+    nop = np.full(
+        (1, 10, 9), min(max(int(no_progress), 0), 100) / 100.0, dtype=np.float32
+    )
     return np.concatenate(stacks + [stm, rep, nop], axis=0)
 
 

@@ -77,3 +77,15 @@ def test_material_balance():
     assert material_balance(board) == 0.0
     board[0, 0] = 0  # remove a black rook
     assert material_balance(board) == 9.0
+
+
+def test_encode_observation_broadcast_planes():
+    board = _start_board()
+    obs = encode_observation([board], "w", 1, 50, history_length=8)
+    assert np.all(obs[112] == 1.0)  # red to move: uniformly 1
+    assert np.allclose(obs[113], 1.0 / 3.0)  # repetition_count=1
+    assert np.allclose(obs[114], 0.5)  # no_progress=50
+    obs_b = encode_observation([board], "b", 3, 200, history_length=8)
+    assert np.all(obs_b[112] == 0.0)  # black to move: uniformly 0
+    assert np.allclose(obs_b[113], 1.0)  # clamped at 3
+    assert np.allclose(obs_b[114], 1.0)  # clamped at 100
