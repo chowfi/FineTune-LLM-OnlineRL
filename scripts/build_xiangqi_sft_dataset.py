@@ -47,10 +47,10 @@ for _p in (ROOT, _HERE):
 
 from tqdm import tqdm
 
-from pikafish_eval import PikafishEvaluator
+from src.pikafish_eval import PikafishEvaluator
 from xiangqi_pgn import iter_positions
 from xiangqi_selfplay import iter_selfplay
-from xiangqi_labels import (
+from src.xiangqi_labels import (
     SIGMA_GOOD,
     is_good_move,
     root_value_red_oriented,

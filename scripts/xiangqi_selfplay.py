@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterator
 
 from cchess import RED, ChessBoard, FULL_INIT_FEN  # type: ignore[attr-defined]
 
-from pikafish_eval import PikafishEvaluator
+from src.pikafish_eval import PikafishEvaluator
 
 
 def _maybe_terminal_winner(board: ChessBoard) -> str | None:

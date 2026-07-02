@@ -20,7 +20,8 @@ This project fine-tunes a Large Language Model (specifically `Qwen/Qwen2.5-7B-In
 - `data/` — SFT datasets, benchmark outputs, calibrated ladder data, and other generated inputs/outputs that are not model checkpoints.
 - `checkpoints/` — LoRA adapters, tokenizer artifacts, optimizer state, enemy adapters, and interrupted-run snapshots from training experiments.
 - `wandb/` — local W&B run artifacts and logs.
-- `.cursor/` — Cursor project rules and hooks. The agent handoff rule and stop hook enforce repo-map/log/task-queue accounting before agents finalize covered work.
+- `.cursor/` — Cursor project rules and hooks (legacy; project now uses Claude Code).
+- `.claude/` — Claude Code project settings. `settings.json` contains a `Stop` hook that injects the 3-step handoff checklist into Claude's context at the end of every turn.
 
 ## Components
 

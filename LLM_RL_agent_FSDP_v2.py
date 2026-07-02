@@ -54,8 +54,8 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from gym_xiangqi.constants import ALLY, PIECE_ID_TO_NAME, PIECE_POINTS
 from gym_xiangqi.utils import action_space_to_move, move_to_action_space
 
-from pikafish_eval import PikafishEvaluator
-from xiangqi_board import (
+from src.pikafish_eval import PikafishEvaluator
+from src.xiangqi_board import (
     COLS,
     algebraic_to_board_coords,
     algebraic_to_engine_move,
@@ -65,7 +65,7 @@ from xiangqi_board import (
     board_to_uci_fen,
     engine_uci_to_algebraic,
 )
-from xiangqi_labels import (
+from src.xiangqi_labels import (
     SIGMA_GOOD,
     is_good_move,
     parse_situation_from_response,
@@ -961,10 +961,10 @@ def evaluate_candidate_response(
 # Logging and episode metrics
 # -----------------------------------------------------------------------------
 
-SYNC_LOG_FILE = "xiangqi_v2_board_sync.log"
-EPISODE_METRICS_CSV = "chinese_chess_episode_metrics_v2.csv"
+SYNC_LOG_FILE = "data/logs/xiangqi_v2_board_sync.log"
+EPISODE_METRICS_CSV = "data/metrics/chinese_chess_episode_metrics_v2.csv"
 # Rank-0 JSON heartbeat (atomic replace). Disable with ``training/run_heartbeat_path: ""``.
-RUN_HEARTBEAT_DEFAULT = "xiangqi_v2_run_heartbeat.json"
+RUN_HEARTBEAT_DEFAULT = "data/xiangqi_v2_run_heartbeat.json"
 
 _EPISODE_METRICS_FIELDNAMES = [
     "episode",

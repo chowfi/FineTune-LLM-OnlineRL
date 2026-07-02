@@ -19,7 +19,7 @@ from web.server.flip_utils import (
     get_flipped_enemy_legal_actions,
 )
 from web.server.logprob_scorer import MoveLogprobScorer
-from xiangqi_board import board_to_graphic, board_to_fen
+from src.xiangqi_board import board_to_graphic, board_to_fen
 
 
 def resolve_play_device(device: str) -> Tuple[torch.device, Dict[str, Any]]:

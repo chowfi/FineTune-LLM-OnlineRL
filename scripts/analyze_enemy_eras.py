@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CSV = ROOT / "chinese_chess_episode_metrics_v2.csv"
+DEFAULT_CSV = ROOT / "data/metrics/chinese_chess_episode_metrics_v2.csv"
 
 # Known sync boundaries when ``game_self_play_enemy_id`` is missing from CSV.
 KNOWN_SYNC_AFTER = (15, 30)

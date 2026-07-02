@@ -5,23 +5,12 @@ This document tracks prioritized tasks for AI agents. When starting a new sessio
 ## Active Tasks (In Progress)
 *(Add `[ ]` and move tasks here when an agent starts working on them)*
 
-- `[ ]` **Xiangqi web play UI:** Run `uv sync --group web` and `scripts/serve_xiangqi_play.py` with `PIKAFISH_BIN` set; play test game vs ep_40 on CPU. See `web/README.md` and `docs/logs/2026-05-28-log-xiangqi-web-play-ui.md`.
-
-- `[ ]` **Ep 23 resume run (adapter-only):** Launch from `checkpoints/xiangqi_grpo_v2/ep_22` with `optimizer.pt` moved aside so `lr=5e-6`, engine alignment, and terminal-win GRPO all apply. Validate `[terminal-win]` logs and nonzero win-episode GRPO stats. See `docs/logs/2026-05-26-log-long-run-grpo-analysis-and-resume-plan.md`.
-  - 2026-05-26 retry failed on first-turn CUDA OOM inside sequential fallback; patched fallback to backprop per sample and skip alignment only on OOM fallback turns. See `docs/logs/2026-05-26-log-ep23-sequential-oom-fallback.md`.
-- `[ ]` Implement `scripts/dry_run.sh` to test the RL loop with a tiny model without requiring massive GPU resources.
-- `[ ]` Run `scripts/benchmark/run_benchmark.py --game both` (default 5 rungs × 20 games + 30 calibration games/pair) once a GPU is free. Requires `uv sync` (to install `python-chess`) and `STOCKFISH_BIN` on PATH. See `docs/logs/2026-05-13-log-llm-chess-xiangqi-elo-bench.md`.
 
 ## Backlog (To Do)
 *(Add new ideas, bug fixes, or feature requests here)*
 
-- `[ ]` **Cursor harness UI verification:** Confirm Cursor loads `.cursor/rules/agent-handoff.mdc` and `.cursor/hooks.json` in the Rules/Hooks settings or Hooks output channel after the project config refreshes. See `docs/logs/2026-07-01-log-cursor-agent-harness.md`.
-- `[ ]` **v2 learning plateau:** After the stopped run documented in `docs/logs/2026-05-11-log-legal-move-sampler.md` (§4 run outcome), diagnose flat `ally_win_rate` / returns (GRPO advantage spread, `grpo/batch_reward_std`, reward among candidates, opponent strength, LR/KL). Consider ablations (`play_best_candidate`, weaker opponent, curriculum).
-- `[ ]` Add unit tests for `ChineseChessAgent.extract_action()` to guarantee regex parsing stability.
-- `[ ]` Verify deterministic behavior for `GreedyEnemyAgent` using static boards.
-- `[ ]` Add a small smoke test or harness for `LLM_RL_agent_FSDP_v2` legal-move sampler + gate reward paths (mock env / tokenizer-free checks where feasible).
-- `[ ]` Add a per-phase split of `game/mean_ally_cp_after_move_red` (opening / middlegame / endgame) so we can see *where* the policy is improving.
-- `[ ]` **Elo bench control arm:** re-run `scripts/benchmark/run_benchmark.py` with the xiangqi SFT adapter loaded on the `LLMPlayer` (e.g. `checkpoints/xiangqi_sft_strategy`) to disambiguate "low pretraining exposure" from "intrinsic transformer difficulty for xiangqi." Reuse the already-calibrated `data/benchmark/xiangqi_ladder_elo.json` (skip the `--recalibrate` flag) so the only changed variable is the model.
+- `[x]` (2026-07-02) **Claude Code migration:** Replaced Cursor agent harness with Claude Code equivalent. Updated `CLAUDE.md` with current project state; created `.claude/settings.json` with a `Stop` hook that enforces handoff accounting. See `docs/logs/2026-07-02-log-claude-code-migration.md`.
+
 
 ## Completed
 *(Move finished tasks here)*

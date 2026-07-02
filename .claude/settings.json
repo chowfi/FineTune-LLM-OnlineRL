@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "printf '{\"hookSpecificOutput\": {\"hookEventName\": \"Stop\", \"additionalContext\": \"HANDOFF CHECKLIST — complete before this session is done:\\n1. Write a dated log to docs/logs/YYYY-MM-DD-log-<description>.md (use docs/logs/template.md)\\n2. Update docs/ARCHITECTURE.md if the repo map or any component changed\\n3. Update docs/AGENT_TODO.md — close finished tasks, add follow-ups\\n\\nIf all three are already done, no action needed.\"}}'"
+          }
+        ]
+      }
+    ]
+  }
+}

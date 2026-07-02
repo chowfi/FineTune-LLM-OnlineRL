@@ -35,8 +35,8 @@ for _p in (ROOT, _HERE):
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from pikafish_eval import PikafishEvaluator
-from xiangqi_labels import (
+from src.pikafish_eval import PikafishEvaluator
+from src.xiangqi_labels import (
     is_good_move,
     parse_situation_from_response,
     root_value_red_oriented,

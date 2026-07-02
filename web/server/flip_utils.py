@@ -8,7 +8,7 @@ import numpy as np
 from gym import Env
 from gym_xiangqi.utils import action_space_to_move, move_to_action_space
 
-from xiangqi_board import algebraic_to_board_coords, board_coords_to_algebraic
+from src.xiangqi_board import algebraic_to_board_coords, board_coords_to_algebraic
 
 
 def action_to_algebraic(action: int) -> str:

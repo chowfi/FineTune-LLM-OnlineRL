@@ -9,11 +9,11 @@ import gym
 import gym_xiangqi  # noqa: F401
 import numpy as np
 
-from pikafish_eval import PikafishEvaluator
+from src.pikafish_eval import PikafishEvaluator
 from web.server.engine_player import EnginePlayer
 from web.server.flip_utils import action_to_algebraic
 from web.server.greedy_agent import pick_greedy_ally_move
-from xiangqi_board import (
+from src.xiangqi_board import (
     algebraic_to_board_coords,
     board_to_fen,
     board_to_graphic,

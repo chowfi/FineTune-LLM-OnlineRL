@@ -1,9 +1,12 @@
 #!/bin/sh
-'''exec' "/Users/fionachow/Documents/NYU/CDS/Spring 2024/DS-GA 3001.005 - Reinforcement Learning/Projects/.venv/bin/python3.10" "$0" "$@"
+'''exec' '/Users/fionachow/Documents/NYU/CDS/Spring 2024/DS-GA 3001.005 - Reinforcement Learning/Projects/.venv/bin/python' "$0" "$@"
 ' '''
+# -*- coding: utf-8 -*-
 import sys
 from gym_xiangqi.examples.game_mode import main
-if __name__ == '__main__':
-    if sys.argv[0].endswith('.exe'):
+if __name__ == "__main__":
+    if sys.argv[0].endswith("-script.pyw"):
+        sys.argv[0] = sys.argv[0][:-11]
+    elif sys.argv[0].endswith(".exe"):
         sys.argv[0] = sys.argv[0][:-4]
     sys.exit(main())

@@ -39,7 +39,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from xiangqi_board import (
+from src.xiangqi_board import (
     algebraic_to_engine_move,
     engine_uci_to_algebraic,
 )
