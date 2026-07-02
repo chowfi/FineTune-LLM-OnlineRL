@@ -13,6 +13,7 @@ This project fine-tunes a Large Language Model (specifically `Qwen/Qwen2.5-7B-In
 - `xiangqi_board.py`, `xiangqi_labels.py` — Xiangqi board utilities and move-label/classification helpers shared by data and evaluation scripts.
 - `scripts/` — runnable utilities for SFT data preparation, SFT training, offline evaluation, enemy-era analysis, benchmark runs, and the local web play server launcher.
 - `scripts/benchmark/` — chess and Xiangqi benchmark harness, engine ladder calibration, prompt adapters, player wrappers, match runner, and Elo estimator.
+- `muzero/` — MuZero/EfficientZero-style Xiangqi agent (tensor world model + MCTS self-play); Pikafish-only legality; independent of the LLM pipeline. Entrypoint `python -m muzero.train`. Spec: `docs/superpowers/specs/2026-07-02-muzero-xiangqi-design.md`.
 - `web/` — FastAPI server and static board UI for human Red vs LoRA-backed Black play.
 - `docs/` — canonical project documentation, including this repo map, Xiangqi metrics notes, the agent task queue, and dated experiment/feature logs.
 - `docs/logs/` — dated logs for feature changes, experiment starts, experiment completions, failures, interruptions, conclusions, and follow-up plans. New logs follow `docs/logs/template.md`.
@@ -58,6 +59,24 @@ This project fine-tunes a Large Language Model (specifically `Qwen/Qwen2.5-7B-In
 
 ### 3e. Local web play (human Red vs LoRA engine)
 - **Description:** `web/` + `scripts/serve_xiangqi_play.py` — FastAPI server and static board UI. Human plays Red; default LoRA checkpoint (e.g. `checkpoints/xiangqi_grpo_v2/ep_40`) plays Black via greedy legal-move logprob scoring on a flipped board. Pikafish validates all moves. See `web/README.md` and `docs/logs/2026-05-28-log-xiangqi-web-play-ui.md`.
+
+### 3f. MuZero Xiangqi (tensor world model + MCTS)
+- **Description:** `muzero/` implements an EfficientZero-style agent per
+  `docs/superpowers/specs/2026-07-02-muzero-xiangqi-design.md`: 115×10×9 board
+  tensors, 8100-action space masked to Pikafish-legal moves, 800-sim pUCT MCTS,
+  K=8 unrolled training with policy/value/reward/moves-left/material/SimSiam
+  losses (~22.1M params at the default 192-channel config), frozen-enemy
+  self-play with promotion after 3 consecutive ally wins, repetition-draw +
+  hopeless-truncation adjudication, Pikafish warm start (MultiPV soft targets),
+  and a periodic fixed-Pikafish gate. Value head uses a 601-bin categorical
+  support over [−3, 3] h-transformed units (sized to the hybrid reward scale).
+  Entrypoint: `python -m muzero.train` (`--smoke` for a tiny end-to-end run,
+  `--resume checkpoints/muzero_xiangqi/latest.pt` to continue; checkpoints are
+  written atomically each iteration). Tests: `uv run pytest muzero/tests`
+  (engine-gated tests need `PIKAFISH_BIN`). Module map: `config.py` (all
+  hyperparameters), `encoding.py`, `transforms.py`, `network.py`, `env.py`,
+  `mcts.py`, `selfplay.py`, `replay_buffer.py`, `warmstart.py`, `train.py`,
+  `metrics.py`.
 
 ### 3d. Inference-only Elo bench (chess + xiangqi)
 - **Description:** `scripts/benchmark/` benchmarks any LLM (default

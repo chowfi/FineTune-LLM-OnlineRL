@@ -5,17 +5,26 @@ This document tracks prioritized tasks for AI agents. When starting a new sessio
 ## Active Tasks (In Progress)
 *(Add `[ ]` and move tasks here when an agent starts working on them)*
 
-- `[ ]` (2026-07-02) **MuZero for Xiangqi — implementation plan + build:** Design spec approved and committed at `docs/superpowers/specs/2026-07-02-muzero-xiangqi-design.md`. Next: user reviews the spec file; on approval, run superpowers:writing-plans to produce the plan, then implement the `muzero/` package. See `docs/logs/2026-07-02-log-muzero-xiangqi-design.md`.
+- `[ ]` (2026-07-02) **MuZero: first run on the training machine.** On the 5090 box with `PIKAFISH_BIN` set: (1) `PIKAFISH_BIN=... uv run pytest muzero/tests -v` to exercise the 5 engine-gated tests, (2) `uv run python -m muzero.train --smoke --no-wandb --iterations 1 --device cpu` end-to-end smoke, (3) launch the real run `uv run python -m muzero.train`. Watch wandb `selfplay/*`, `loss/*`, `gate/*` and note findings in a dated log.
 
 
 ## Backlog (To Do)
 *(Add new ideas, bug fixes, or feature requests here)*
 
-- `[x]` (2026-07-02) **Claude Code migration:** Replaced Cursor agent harness with Claude Code equivalent. Updated `CLAUDE.md` with current project state; created `.claude/settings.json` with a `Stop` hook that enforces handoff accounting. See `docs/logs/2026-07-02-log-claude-code-migration.md`.
+- `[ ]` **MuZero follow-ups from implementation review** (2026-07-02, see `docs/logs/2026-07-02-log-muzero-implementation.md`):
+  - Profile `ReplayBuffer.make_target`/`sample_batch` encoding cost under real training (~140 ms/512-batch measured on CPU); vectorize `board_planes` only if it shows up hot.
+  - AdamW weight decay currently applies to BN/bias params too; split param groups if runs look off.
+  - `gym_xiangqi` perpetual-check ("jiang") can set `done` without flipping the turn; env wrapper credits the mover as winner — verify/fix if self-play logs show it.
+  - `run_gate`/warmstart count an engine abort (`if not lines: break`) as a draw / `engine_aborted`; watch gate stats for skew.
+  - Gumbel MuZero (32–64 sims) is the designed fallback behind the `mcts.py` interface if 800 sims can't hit throughput on one GPU.
+- `[ ]` **Repo hygiene:** 29 legacy `.pyc` files tracked since `6058b0b` (root `__pycache__/`, `scripts/`, `web/server/`, `unsloth_compiled_cache/__pycache__/`) predate `.gitignore` rules; untrack them in a dedicated cleanup commit on main (leave `unsloth_compiled_cache/` contents otherwise untouched).
 
 
 ## Completed
 *(Move finished tasks here)*
+
+- `[x]` (2026-07-02) **MuZero for Xiangqi — design + full implementation:** Spec (`docs/superpowers/specs/2026-07-02-muzero-xiangqi-design.md`) and plan (`docs/superpowers/plans/2026-07-02-muzero-xiangqi.md`) executed via subagent-driven development on branch `muzero-xiangqi` — 14 tasks, each with spec + code-quality review. New `muzero/` package (config, encoding, transforms, network, env, mcts, selfplay, replay_buffer, warmstart, train, metrics) with 34 passing tests (5 engine-gated skips locally). Notable review-driven fixes: value support rescaled [-300,300]→[-3,3] h-units, BatchNorm eval() in NetRunner + SimSiam target branch, MCTS MinMax stats tracking child mean-Q, promotion/buffer thread-safety locks, atomic checkpoints. See `docs/logs/2026-07-02-log-muzero-xiangqi-design.md` and `docs/logs/2026-07-02-log-muzero-implementation.md`.
+- `[x]` (2026-07-02) **Claude Code migration:** Replaced Cursor agent harness with Claude Code equivalent. Updated `CLAUDE.md` with current project state; created `.claude/settings.json` with a `Stop` hook that enforces handoff accounting. See `docs/logs/2026-07-02-log-claude-code-migration.md`.
 
 - `[x]` (2026-07-01) **Cursor agent handoff harness:** Added an always-applied Cursor rule and project `stop` hook requiring final handoff accounting for `docs/ARCHITECTURE.md`, dated `docs/logs/`, and `docs/AGENT_TODO.md`. Added a repo map to `docs/ARCHITECTURE.md`, expanded `docs/logs/template.md`, and documented the design/plan under `docs/superpowers/`. Hook script verification and scoped Ruff check/format passed. See `docs/logs/2026-07-01-log-cursor-agent-harness.md`.
 - `[x]` (2026-05-29) **Self-play enemy Pikafish legality mask:** `generate_self_play_enemy_move()` now applies `apply_pikafish_enemy_legal_mask()` before scoring (matches ally + web UI). New metric `game/enemy_pikafish_prune_rate`. See `docs/logs/2026-05-29-log-self-play-enemy-pikafish-mask.md`. Reviewed eps 5–22 CSV and wandb KL chart. Confirmed all 9 win episodes had `grpo_mean_kl_move=0.0` (pre terminal-win patch); trunc episodes carried bursty updates (ep 20 KL move ~14). Reconciled high KL with learning under `1e-5`: improvements real but updates hot/noisy. Recommended adapter-only resume from `ep_22` with cold optimizer for new `5e-6` / alignment / terminal-win stack. See `docs/logs/2026-05-26-log-long-run-grpo-analysis-and-resume-plan.md`.
