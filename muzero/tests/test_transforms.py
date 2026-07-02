@@ -32,14 +32,15 @@ def test_support_edges_and_clamping():
 
 
 def test_value_head_config_round_trip():
-    # value head shape: 601 bins over [-300, 300] on h-transformed scalars
+    # value head: 601 bins over [-3, 3] in h-transformed units
     from muzero.transforms import h_transform
 
-    raw = torch.tensor([[-2000.0, -1.0, 0.0, 37.5, 2000.0]])
+    raw = torch.tensor([[-2.0, -1.0, 0.0, 0.5, 2.0]])
     hx = h_transform(raw)
-    support = scalar_to_support(hx, -300.0, 300.0, 601)
-    back = support_to_scalar(torch.log(support + 1e-12), -300.0, 300.0, 601)
-    assert torch.allclose(back, hx, atol=1e-2)
+    assert hx.abs().max() < 3.0
+    support = scalar_to_support(hx, -3.0, 3.0, 601)
+    back = support_to_scalar(torch.log(support + 1e-12), -3.0, 3.0, 601)
+    assert torch.allclose(back, hx, atol=1e-3)
 
 
 def test_float64_input_does_not_crash():

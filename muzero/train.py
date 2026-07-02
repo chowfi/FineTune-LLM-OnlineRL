@@ -61,7 +61,8 @@ class MuZeroTrainer:
             "policy": (
                 _soft_ce(out["policy_logits"], b["target_policy"][:, 0])
                 * b["policy_mask"][:, 0]
-            ).mean(),
+            ).sum()
+            / b["policy_mask"][:, 0].sum().clamp(min=1.0),
             "value": _soft_ce(out["value_logits"], value_support[:, 0]).mean(),
             "reward": torch.zeros((), device=b["obs"].device),
             "moves_left": F.cross_entropy(
@@ -75,12 +76,13 @@ class MuZeroTrainer:
             out_k = self.net.recurrent_inference(hidden, b["actions"][:, k - 1])
             hidden = scale_gradient(out_k["hidden"], 0.5)
             latents.append(hidden)
+            pm = b["policy_mask"][:, k]
             losses["policy"] = (
                 losses["policy"]
                 + (
-                    _soft_ce(out_k["policy_logits"], b["target_policy"][:, k])
-                    * b["policy_mask"][:, k]
-                ).mean()
+                    _soft_ce(out_k["policy_logits"], b["target_policy"][:, k]) * pm
+                ).sum()
+                / pm.sum().clamp(min=1.0)
                 / K
             )
             losses["value"] = (
@@ -115,10 +117,12 @@ class MuZeroTrainer:
             )
             dyn_latent = stacked.gather(1, gather).squeeze(1)
             with torch.no_grad():
+                self.net.eval()  # keep BN running stats clean for the target branch
                 target_latent = self.net.representation(b["consistency_obs"])
                 target_proj = self.net.project(
                     normalize_hidden(target_latent), with_predictor=False
                 )
+                self.net.train()
             pred = self.net.project(dyn_latent, with_predictor=True)
             cos = F.cosine_similarity(pred, target_proj.detach(), dim=-1)
             losses["consistency"] = -(cos * mask).sum() / mask.sum().clamp(min=1.0)
