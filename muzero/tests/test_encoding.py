@@ -1,3 +1,5 @@
+import pytest
+
 from muzero.encoding import index_to_move, move_to_index
 
 
@@ -16,3 +18,17 @@ def test_all_indices_decode_and_reencode():
 def test_index_formula():
     # a0 -> square 0, a1 -> square 9: index = 0 * 90 + 9
     assert move_to_index("a0a1") == 9
+
+
+def test_edge_indices_round_trip():
+    for idx in (0, 8099):
+        assert move_to_index(index_to_move(idx)) == idx
+
+
+def test_bad_inputs_raise():
+    for bad_move in ["", "z0a1", "a10a1", "a0a1x"]:
+        with pytest.raises(ValueError):
+            move_to_index(bad_move)
+    for bad_idx in (-1, 8100, 10000):
+        with pytest.raises(ValueError):
+            index_to_move(bad_idx)

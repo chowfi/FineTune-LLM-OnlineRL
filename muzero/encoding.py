@@ -37,5 +37,8 @@ def move_to_index(move: str) -> int:
 
 
 def index_to_move(idx: int) -> str:
-    frm, to = divmod(int(idx), 90)
+    idx = int(idx)
+    if not 0 <= idx < 8100:
+        raise ValueError(f"index out of range: {idx}")
+    frm, to = divmod(idx, 90)
     return board_coords_to_algebraic(frm // 9, frm % 9, to // 9, to % 9)
