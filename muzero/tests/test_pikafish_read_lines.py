@@ -38,14 +38,17 @@ def _make_evaluator_with_payload(payload: bytes):
 
 
 def test_read_lines_returns_promptly_after_perft_output():
-    ev = _make_evaluator_with_payload(b"a0a1: 1\na0a2: 1\nNodes searched: 44\n")
+    # Real Pikafish perft output has a blank line BEFORE and AFTER the
+    # terminator ("\nNodes searched: N\n" + endl) — verified on the engine:
+    # a naive lines[-1] check sees the trailing empty string and keeps waiting.
+    ev = _make_evaluator_with_payload(b"a0a1: 1\na0a2: 1\n\nNodes searched: 44\n\n")
     try:
         start = time.monotonic()
         lines = ev._read_lines(3.0)
         elapsed = time.monotonic() - start
     finally:
         ev.proc.close()
-    assert lines[-1] == "Nodes searched: 44"
+    assert "Nodes searched: 44" in lines
     assert elapsed < 1.0, f"perft read blocked {elapsed:.2f}s (ran to timeout)"
 
 

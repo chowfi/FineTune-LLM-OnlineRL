@@ -50,6 +50,16 @@ uv run pytest muzero/tests -q   # 44 passed, 5 skipped
   no-timeout `_wait` in warmstart's SimpleUciEngine, but missed this shared
   evaluator path).
 
+## 6b. Addendum (same day): first fix was one line too strict
+The v1 early-exit checked `lines[-1]`, but real Pikafish perft output ends
+with a **trailing blank line** (`"\nNodes searched: N\n"` + endl — confirmed
+by piping `go perft 1` into the engine on the training box), so `lines[-1]`
+was `""` and the loop still ran to timeout. The restarted run showed the same
+~15 s/ply signature (engines near-idle: ~6 CPU-seconds over ~7 min). v2 fix
+scans back to the last **non-empty** line; regression-test payload updated to
+the real output shape (leading + trailing blanks). Lesson recorded: validate
+fake-engine fixtures against actual engine output, not idealized output.
+
 ## 7. Conclusion & Next Steps
 - Kill the in-flight run (its buffer is in-memory only; nothing worth keeping),
   `git pull` on the training machine, rerun `uv run python -m muzero.train`.
