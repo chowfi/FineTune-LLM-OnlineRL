@@ -159,8 +159,13 @@ class PikafishEvaluator:
             while b"\n" in self._buf:
                 line_bytes, self._buf = self._buf.split(b"\n", 1)
                 lines.append(line_bytes.decode(errors="replace").strip())
-            if lines and lines[-1].lower().startswith("bestmove"):
-                break
+            if lines:
+                last = lines[-1].lower()
+                # "bestmove" ends a search; "nodes searched" ends perft output.
+                # Without the perft terminator every uncached list_legal_moves
+                # call blocks for the full timeout_sec.
+                if last.startswith("bestmove") or last.startswith("nodes searched"):
+                    break
         return lines
 
     def _read_until(self, done_predicate) -> bool:

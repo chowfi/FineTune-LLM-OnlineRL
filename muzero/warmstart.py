@@ -106,6 +106,11 @@ def generate_warmstart_games(
             buffer.add(history)
             total_plies += len(history)
             games += 1
+            print(
+                f"[warmstart] game {games}: {len(history)} plies ({history.result}) "
+                f"— {total_plies}/{cfg.warmstart_plies} plies",
+                flush=True,
+            )
     finally:
         engine.close()
     return {"plies": total_plies, "games": games}
