@@ -46,8 +46,15 @@ the new mode.
 - Reviewer-driven addition: `test_record_and_step_latest_mode_records_every_move`
   so a silent revert to ally-only diagnostics fails the suite.
 - Frozen-mode behavior verified byte-identical by trace and by the pinned
-  legacy tests (three tests now explicitly opt in to
+  legacy tests (five tests now explicitly opt in to
   `self_play_mode="frozen_enemy"`).
+- Final integration review flagged that warm start and the gate inherit
+  symmetric truncation via the config default. Accepted and documented in the
+  spec (§4 scope note): warm start's red-only asymmetry was an accident of its
+  hardcoded `ally_side="w"`; gate adjudication at ±800cp×6 turns is standard.
+- Coverage trade-off: the engine-gated self-play smoke test now exercises
+  latest mode (the new default); frozen mode retains unit coverage only —
+  backlog item added for a frozen-pinned engine smoke.
 
 ## 6. Repo / Handoff Updates
 - `docs/ARCHITECTURE.md` §3f: self-play modes description replaced.

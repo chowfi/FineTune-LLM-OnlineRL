@@ -44,6 +44,13 @@ streak; observed 60–75% draw rates make promotion partly luck).
   own move, so the mover is always the loser, same as today).
 - `truncation_symmetric=False`: behavior byte-identical to current
   (only the `ally_side` streak counts).
+- **Scope note (decided at final review):** warm start and the fixed-Pikafish
+  gate build `XiangqiEnv` from the same config, so in latest mode they also
+  adjudicate symmetrically. This is intentional: warm start's old red-only
+  asymmetry was an artifact of its hardcoded `ally_side="w"` (symmetric
+  adjudication of engine-vs-engine games is strictly better), and gate games
+  ending when either side is hopeless for 6 turns is standard computer-chess
+  adjudication — it shortens gating and counts decisive positions as wins.
 
 ## 5. Self-play (`muzero/selfplay.py`)
 

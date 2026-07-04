@@ -81,8 +81,9 @@ This project fine-tunes a Large Language Model (specifically `Qwen/Qwen2.5-7B-In
   (engine-gated tests need `PIKAFISH_BIN`). Module map: `config.py` (all
   hyperparameters), `encoding.py`, `transforms.py`, `network.py`, `env.py`,
   `mcts.py`, `selfplay.py`, `replay_buffer.py`, `warmstart.py`, `train.py`,
-  `metrics.py`. `selfplay.py`'s `_Game` tracks per-ally-move root-policy
-  entropy and (root value, engine cp) pairs at no extra engine-call cost
+  `metrics.py`. `selfplay.py`'s `_Game` tracks per-move root-policy
+  entropy and (root value, engine cp) pairs (every move in latest mode,
+  ally moves only in frozen mode) at no extra engine-call cost
   (the cp already comes back on `env.step`'s `info`); `metrics.py` rolls
   these into `selfplay/mean_root_entropy`, `selfplay/mean_ally_cp_auc`,
   `selfplay/value_cp_correlation`, and `selfplay/games_per_promotion`.
