@@ -94,8 +94,15 @@ def _new_game(cfg, evaluator, ally_side="w"):
 
 
 def test_record_and_step_tracks_ally_entropy_and_cp_pairs():
+    # Pinned to frozen_enemy: this test documents ally-only diagnostics,
+    # which only hold in frozen mode (latest mode records every move).
     cfg = replace(
-        MuZeroConfig(), channels=16, repr_blocks=1, dyn_blocks=1, device="cpu"
+        MuZeroConfig(),
+        channels=16,
+        repr_blocks=1,
+        dyn_blocks=1,
+        device="cpu",
+        self_play_mode="frozen_enemy",
     )
     # FakeEvaluator.evaluate_cp always answers "+50 for whoever is to move in
     # the fen" (standard UCI side-to-move-relative convention). After the
@@ -147,6 +154,8 @@ def test_record_and_step_one_hot_ally_entropy_is_zero():
 
 
 def test_finish_summary_includes_new_diagnostic_fields():
+    # Pinned to frozen_enemy: value_cp_pairs is asserted as ally-only here,
+    # which only holds in frozen mode (latest mode records every move).
     cfg = replace(
         MuZeroConfig(),
         channels=16,
@@ -154,6 +163,7 @@ def test_finish_summary_includes_new_diagnostic_fields():
         dyn_blocks=1,
         device="cpu",
         max_game_plies=2,
+        self_play_mode="frozen_enemy",
     )
     evaluator = FakeEvaluator(
         cp_fn=lambda fen: 50.0, legal_fn=lambda fen: ["a0a1", "a0b0"]
@@ -211,3 +221,51 @@ def test_selfplay_smoke_generates_games():
     game = buf.games[0]
     assert 1 <= len(game) <= 6
     assert len(game.boards) == len(game) + 1
+
+
+def test_coordinator_promotion_disabled_in_latest_mode():
+    cfg = replace(
+        MuZeroConfig(), channels=16, repr_blocks=1, dyn_blocks=1, device="cpu"
+    )
+    assert cfg.self_play_mode == "latest"
+    torch.manual_seed(0)
+    ally, enemy = MuZeroNet(cfg), MuZeroNet(cfg)
+    before = [p.detach().clone() for p in enemy.parameters()]
+    coord = SelfPlayCoordinator(cfg, ally, enemy)
+    for _ in range(5):
+        promoted = coord.report_result(ally_won=True, draw=False)
+        assert promoted is False
+    assert coord.era == 0
+    assert all(torch.equal(b, p.detach()) for b, p in zip(before, enemy.parameters()))
+
+
+def test_round_groups_by_mode():
+    """Latest mode: one spec covering all games with noise; frozen mode: the
+    original ally/enemy two-spec split (noise on ally roots only)."""
+
+    def make_worker(mode):
+        cfg = replace(
+            MuZeroConfig(),
+            channels=16,
+            repr_blocks=1,
+            dyn_blocks=1,
+            device="cpu",
+            self_play_mode=mode,
+        )
+        torch.manual_seed(0)
+        net = MuZeroNet(cfg)
+        ally_runner, enemy_runner = NetRunner(net, "cpu"), NetRunner(net, "cpu")
+        coord = SelfPlayCoordinator(cfg, net, net)
+        buf = ReplayBuffer(cfg)
+        return SelfPlayWorker(
+            cfg, ally_runner, enemy_runner, buf, coord, object(), worker_id=0
+        )
+
+    latest = make_worker("latest")
+    assert latest._round_groups([]) == [(latest.ally_runner, None, True)]
+
+    frozen = make_worker("frozen_enemy")
+    assert frozen._round_groups([]) == [
+        (frozen.ally_runner, True, True),
+        (frozen.enemy_runner, False, False),
+    ]

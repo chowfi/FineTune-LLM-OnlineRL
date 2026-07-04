@@ -33,6 +33,7 @@ class SelfPlayCoordinator:
 
     def __init__(self, config: MuZeroConfig, ally_net, enemy_net, enemy_lock=None):
         self.config = config
+        self.promotion_enabled = config.self_play_mode == "frozen_enemy"
         self.ally_net = ally_net
         self.enemy_net = enemy_net
         self.lock = threading.Lock()
@@ -47,7 +48,10 @@ class SelfPlayCoordinator:
         with self.lock:
             self.games_this_era += 1
             self.streak = self.streak + 1 if (ally_won and not draw) else 0
-            if self.streak >= self.config.promote_after_consecutive_wins:
+            if (
+                self.promotion_enabled
+                and self.streak >= self.config.promote_after_consecutive_wins
+            ):
                 with self.enemy_lock, torch.no_grad():
                     self.enemy_net.load_state_dict(self.ally_net.state_dict())
                 self.enemy_net.eval()
@@ -65,6 +69,7 @@ class _Game:
         self.opening_uci = opening_uci
         self.ally_entropies = []
         self.ally_value_cp_pairs = []
+        self.ally_cps = []  # tracked-color cp after its own moves (both modes)
 
 
 class SelfPlayWorker:
@@ -85,6 +90,7 @@ class SelfPlayWorker:
         self.coordinator = coordinator
         self.evaluator = evaluator
         self.worker_id = worker_id
+        self.latest_mode = config.self_play_mode == "latest"
         self.rng = np.random.default_rng(config.seed + worker_id + 1)
         self.mcts = MCTS(config, rng=self.rng)  # seeded noise, thread-local RNG
         self.games_started = 0
@@ -117,18 +123,22 @@ class SelfPlayWorker:
             np.array([v / total for v in visits.values()], dtype=np.float32)
         )
         h.root_values.append(float(root_value))
-        if game.env.side_to_move == game.env.ally_side:  # ally is about to move
+        mover = game.env.side_to_move  # about to move
+        if self.latest_mode or mover == game.env.ally_side:
             p = np.array([v / total for v in visits.values()], dtype=np.float64)
             game.ally_entropies.append(float(-(p * np.log(p + 1e-12)).sum()))
         _, reward, done, info = game.env.step(index_to_move(action))
         h.rewards.append(reward)
-        if (
-            info.get("red_cp") is not None
-            and game.env.side_to_move != game.env.ally_side
-        ):
-            # the ALLY just moved (side flipped); pair its root value with the engine eval
-            ally_cp = info["red_cp"] if game.env.ally_side == "w" else -info["red_cp"]
-            game.ally_value_cp_pairs.append((float(root_value), float(ally_cp)))
+        if info.get("red_cp") is not None:
+            mover_cp = info["red_cp"] if mover == "w" else -info["red_cp"]
+            if self.latest_mode or mover == game.env.ally_side:
+                # root_value is mover-perspective; pair it with mover-persp cp
+                game.ally_value_cp_pairs.append((float(root_value), float(mover_cp)))
+            if mover == game.env.ally_side:
+                ally_cp = (
+                    info["red_cp"] if game.env.ally_side == "w" else -info["red_cp"]
+                )
+                game.ally_cps.append(float(ally_cp))
         return done, info
 
     def _finish(self, game: _Game) -> dict:
@@ -160,13 +170,17 @@ class SelfPlayWorker:
                 float(np.mean(game.ally_entropies)) if game.ally_entropies else 0.0
             ),
             "value_cp_pairs": list(game.ally_value_cp_pairs),
-            "mean_ally_cp": (
-                float(np.mean([cp for _, cp in game.ally_value_cp_pairs]))
-                if game.ally_value_cp_pairs
-                else None
-            ),
+            "mean_ally_cp": (float(np.mean(game.ally_cps)) if game.ally_cps else None),
             "games_this_era": self.coordinator.games_this_era,
         }
+
+    def _round_groups(self, active: list) -> list:
+        """Specs for this round's MCTS calls: (runner, side_filter, noise).
+
+        side_filter None means "all active games" (latest mode)."""
+        if self.latest_mode:
+            return [(self.ally_runner, None, True)]
+        return [(self.ally_runner, True, True), (self.enemy_runner, False, False)]
 
     def generate(self, num_games: int) -> list:
         """Play `num_games` to completion in lockstep; returns game summaries."""
@@ -175,14 +189,12 @@ class SelfPlayWorker:
             self._new_game() for _ in range(min(self.cfg.games_per_worker, num_games))
         ]
         while active:
-            for runner, want_ally in (
-                (self.ally_runner, True),
-                (self.enemy_runner, False),
-            ):
+            for runner, want_ally, add_noise in self._round_groups(active):
                 group = [
                     g
                     for g in active
-                    if (g.env.side_to_move == g.env.ally_side) == want_ally
+                    if want_ally is None
+                    or (g.env.side_to_move == g.env.ally_side) == want_ally
                 ]
                 if not group:
                     continue
@@ -192,7 +204,7 @@ class SelfPlayWorker:
                         [move_to_index(m) for m in g.env.legal_moves()], dtype=np.int64
                     )
                     roots.append((g.env.observation().astype(np.float32), legal))
-                results = self.mcts.run(runner, roots, add_noise=want_ally)
+                results = self.mcts.run(runner, roots, add_noise=add_noise)
                 for g, (visits, root_value) in zip(group, results):
                     action = select_action(
                         visits, g.env.plies, self.cfg.temperature_moves, self.rng
