@@ -45,3 +45,18 @@ def test_default_param_count_within_spec():
     net = MuZeroNet(MuZeroConfig(device="cpu"))
     params = sum(p.numel() for p in net.parameters()) / 1e6
     assert 20.0 <= params <= 35.0, params
+
+
+def test_projector_uses_batchnorm_not_layernorm():
+    # Regression guard for the iteration-30 SimSiam collapse: with a LayerNorm
+    # projector, every input mapped to one direction (pairwise projection
+    # cosine 1.0000) and loss/consistency sat at a meaningless -1.0. SimSiam
+    # requires BatchNorm in the projector (variance across the batch) — see
+    # muzero/diagnose_consistency.py and
+    # docs/logs/2026-07-03-log-simsiam-collapse-fix.md.
+    net = MuZeroNet(tiny_config())
+    projector_norms = [m for m in net.projector if isinstance(m, torch.nn.BatchNorm1d)]
+    predictor_norms = [m for m in net.predictor if isinstance(m, torch.nn.BatchNorm1d)]
+    assert len(projector_norms) >= 2  # hidden BN + affine-free output BN
+    assert len(predictor_norms) >= 1
+    assert not any(isinstance(m, torch.nn.LayerNorm) for m in net.projector)

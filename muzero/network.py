@@ -88,12 +88,20 @@ class MuZeroNet(nn.Module):
             nn.ReLU(),
             nn.Flatten(),
             nn.Linear(32 * 90, 1024),
-            nn.LayerNorm(1024),
+            # SimSiam needs BatchNorm here, not LayerNorm: BN forces variance
+            # ACROSS the batch, which is what stops every input collapsing to
+            # one projection direction (observed at iteration 30 of the first
+            # run: pairwise projection cosine 1.0000 with a LayerNorm projector).
+            nn.BatchNorm1d(1024),
             nn.ReLU(),
             nn.Linear(1024, 1024),
+            nn.BatchNorm1d(1024, affine=False),  # SimSiam-style output BN
         )
         self.predictor = nn.Sequential(
-            nn.Linear(1024, 512), nn.ReLU(), nn.Linear(512, 1024)
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Linear(512, 1024),
         )
 
     def _predict(self, hidden: torch.Tensor) -> dict:
