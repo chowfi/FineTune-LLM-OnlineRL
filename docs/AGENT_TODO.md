@@ -5,6 +5,7 @@ This document tracks prioritized tasks for AI agents. When starting a new sessio
 ## Active Tasks (In Progress)
 *(Add `[ ]` and move tasks here when an agent starts working on them)*
 
+- `[ ]` (2026-07-03) **MuZero: restart training in latest-selfplay mode.** After merging `muzero-latest-selfplay`, runs default to stock MuZero self-play (`self_play_mode="latest"`); the in-flight frozen-enemy run's checkpoint resumes cleanly into either mode (`--resume checkpoints/muzero_xiangqi/latest.pt` — skips warm start), or restart fresh for a clean latest-mode wandb run. Watch `selfplay/red_win_rate` vs `black_win_rate` (first-mover advantage), `gate/*` as the primary progress signal, and compare draw/entropy/value-cp curves against the frozen-enemy run for the ablation writeup.
 - `[ ]` (2026-07-02) **MuZero: first run on the training machine.** On the 5090 box with `PIKAFISH_BIN` set: (1) `PIKAFISH_BIN=... uv run pytest muzero/tests -v` to exercise the 5 engine-gated tests, (2) `uv run python -m muzero.train --smoke --no-wandb --iterations 1 --device cpu` end-to-end smoke, (3) launch the real run `uv run python -m muzero.train`. Watch wandb `selfplay/*`, `loss/*`, `gate/*` and note findings in a dated log.
 
 

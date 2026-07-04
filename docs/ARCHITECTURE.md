@@ -65,10 +65,15 @@ This project fine-tunes a Large Language Model (specifically `Qwen/Qwen2.5-7B-In
   `docs/superpowers/specs/2026-07-02-muzero-xiangqi-design.md`: 115×10×9 board
   tensors, 8100-action space masked to Pikafish-legal moves, 800-sim pUCT MCTS,
   K=8 unrolled training with policy/value/reward/moves-left/material/SimSiam
-  losses (~22.1M params at the default 192-channel config), frozen-enemy
-  self-play with promotion after 3 consecutive ally wins, repetition-draw +
+  losses (~22.1M params at the default 192-channel config), repetition-draw +
   hopeless-truncation adjudication, Pikafish warm start (MultiPV soft targets),
-  and a periodic fixed-Pikafish gate. Value head uses a 601-bin categorical
+  and a periodic fixed-Pikafish gate. Self-play defaults to stock MuZero
+  (`self_play_mode="latest"`): the newest network plays both sides, Dirichlet
+  noise at every root, one batched MCTS group per lockstep round, symmetric
+  hopeless-truncation, no enemy net. The original frozen-enemy scheme
+  (promotion after 3 consecutive ally wins, asymmetric ally-only truncation)
+  remains available as a research ablation via `self_play_mode="frozen_enemy"`.
+  Spec: `docs/superpowers/specs/2026-07-03-muzero-latest-selfplay-design.md`. Value head uses a 601-bin categorical
   support over [−3, 3] h-transformed units (sized to the hybrid reward scale).
   Entrypoint: `python -m muzero.train` (`--smoke` for a tiny end-to-end run,
   `--resume checkpoints/muzero_xiangqi/latest.pt` to continue; checkpoints are
