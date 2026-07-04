@@ -199,6 +199,18 @@ def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
     }
 
 
+def load_checkpoint(path: str, ally, enemy, optimizer, device) -> dict:
+    """Resume helper. Latest-mode checkpoints carry no "enemy" entry; fall
+    back to the ally weights so a checkpoint from either mode loads in
+    either mode."""
+    ckpt = torch.load(path, map_location=device)
+    ally.load_state_dict(ckpt["ally"])
+    if enemy is not ally:
+        enemy.load_state_dict(ckpt.get("enemy", ckpt["ally"]))
+    optimizer.load_state_dict(ckpt["optimizer"])
+    return ckpt
+
+
 def main():
     import argparse
     import copy
@@ -233,24 +245,25 @@ def main():
 
     torch.manual_seed(cfg.seed)
     device = cfg.device if torch.cuda.is_available() or cfg.device == "cpu" else "cpu"
+    latest_mode = cfg.self_play_mode == "latest"
     ally = MuZeroNet(cfg).to(device)
-    enemy = copy.deepcopy(ally).to(device)
-    enemy.eval()
+    # latest mode: no separate enemy net — both sides share the ally.
+    enemy = ally if latest_mode else copy.deepcopy(ally).to(device)
+    if not latest_mode:
+        enemy.eval()
     trainer = MuZeroTrainer(cfg, ally)
     start_iteration = 0
     ckpt = None
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
-        ally.load_state_dict(ckpt["ally"])
-        enemy.load_state_dict(ckpt["enemy"])
-        trainer.optimizer.load_state_dict(ckpt["optimizer"])
+        ckpt = load_checkpoint(args.resume, ally, enemy, trainer.optimizer, device)
         start_iteration = ckpt["iteration"]
 
     buffer = ReplayBuffer(cfg)
-    ally_runner, enemy_runner = NetRunner(ally, device), NetRunner(enemy, device)
+    ally_runner = NetRunner(ally, device)
+    enemy_runner = ally_runner if latest_mode else NetRunner(enemy, device)
     # Runners are created before the coordinator so the coordinator can be
     # handed the enemy runner's lock: promotion must not swap weights
-    # mid-forward-pass (see Task 10).
+    # mid-forward-pass (promotion is disabled entirely in latest mode).
     coordinator = SelfPlayCoordinator(cfg, ally, enemy, enemy_lock=enemy_runner.lock)
     if ckpt is not None:
         coordinator.era = ckpt.get("era", 0)
@@ -343,17 +356,16 @@ def main():
         )
         ckpt_path = os.path.join(cfg.checkpoint_dir, "latest.pt")
         tmp_path = ckpt_path + ".tmp"
-        torch.save(
-            {
-                "ally": ally.state_dict(),
-                "enemy": enemy.state_dict(),
-                "optimizer": trainer.optimizer.state_dict(),
-                "iteration": it + 1,
-                "era": coordinator.era,
-                "streak": coordinator.streak,
-            },
-            tmp_path,
-        )
+        ckpt_data = {
+            "ally": ally.state_dict(),
+            "optimizer": trainer.optimizer.state_dict(),
+            "iteration": it + 1,
+            "era": coordinator.era,
+            "streak": coordinator.streak,
+        }
+        if not latest_mode:
+            ckpt_data["enemy"] = enemy.state_dict()
+        torch.save(ckpt_data, tmp_path)
         os.replace(tmp_path, ckpt_path)
 
 

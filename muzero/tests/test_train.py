@@ -65,3 +65,33 @@ def test_train_batch_reports_finite_buffer_age():
     assert result["buffer_age"] == result["buffer_age"]  # not NaN
     assert result["buffer_age"] >= 0.0
     assert "mean_buffer_age" not in batch  # popped before tensorizing
+
+
+def test_load_checkpoint_without_enemy_key(tmp_path):
+    cfg = replace(
+        MuZeroConfig(), channels=16, repr_blocks=1, dyn_blocks=1, device="cpu"
+    )
+    torch.manual_seed(0)
+    source = MuZeroNet(cfg)
+    trainer_src = MuZeroTrainer(cfg, source)
+    path = tmp_path / "latest.pt"
+    torch.save(
+        {
+            "ally": source.state_dict(),
+            "optimizer": trainer_src.optimizer.state_dict(),
+            "iteration": 7,
+            "era": 0,
+            "streak": 1,
+        },
+        path,
+    )  # note: no "enemy" key, as latest-mode checkpoints are written
+
+    torch.manual_seed(1)
+    ally, enemy = MuZeroNet(cfg), MuZeroNet(cfg)
+    trainer = MuZeroTrainer(cfg, ally)
+    from muzero.train import load_checkpoint
+
+    ckpt = load_checkpoint(str(path), ally, enemy, trainer.optimizer, "cpu")
+    assert ckpt["iteration"] == 7
+    for pa, pe in zip(ally.parameters(), enemy.parameters()):
+        assert torch.equal(pa, pe)  # enemy fell back to ally weights
