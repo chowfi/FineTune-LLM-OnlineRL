@@ -60,6 +60,12 @@ def aggregate_game_summaries(summaries: list) -> dict:
         "selfplay/games_per_promotion": (
             n / promotions if promotions > 0 else float(n)
         ),
+        "selfplay/red_win_rate": sum(1 for s in summaries if s["result"] == "red_win")
+        / n,
+        "selfplay/black_win_rate": sum(
+            1 for s in summaries if s["result"] == "black_win"
+        )
+        / n,
     }
 
 

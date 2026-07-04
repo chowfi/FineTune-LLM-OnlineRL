@@ -100,3 +100,44 @@ def test_aggregate_game_summaries_games_per_promotion_no_promotions():
     summaries = [_base_summary(), _base_summary(), _base_summary(promoted=False)]
     m = aggregate_game_summaries(summaries)
     assert m["selfplay/games_per_promotion"] == 3.0
+
+
+def test_red_black_win_rates():
+    summaries = [
+        {
+            "result": "red_win",
+            "ally_side": "w",
+            "ally_won": True,
+            "draw": False,
+            "plies": 40,
+            "truncated": False,
+            "promoted": False,
+            "final_red_cp": 0.0,
+            "era": 0,
+        },
+        {
+            "result": "black_win",
+            "ally_side": "w",
+            "ally_won": False,
+            "draw": False,
+            "plies": 40,
+            "truncated": False,
+            "promoted": False,
+            "final_red_cp": 0.0,
+            "era": 0,
+        },
+        {
+            "result": "draw_repetition",
+            "ally_side": "b",
+            "ally_won": False,
+            "draw": True,
+            "plies": 40,
+            "truncated": False,
+            "promoted": False,
+            "final_red_cp": 0.0,
+            "era": 0,
+        },
+    ]
+    m = aggregate_game_summaries(summaries)
+    assert m["selfplay/red_win_rate"] == 1 / 3
+    assert m["selfplay/black_win_rate"] == 1 / 3
