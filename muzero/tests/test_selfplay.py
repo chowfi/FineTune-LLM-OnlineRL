@@ -140,6 +140,45 @@ def test_record_and_step_tracks_ally_entropy_and_cp_pairs():
     assert len(game.ally_value_cp_pairs) == 1  # unchanged
 
 
+def test_record_and_step_latest_mode_records_every_move():
+    # Default latest mode: diagnostics cover EVERY move, not just the ally's.
+    cfg = replace(
+        MuZeroConfig(), channels=16, repr_blocks=1, dyn_blocks=1, device="cpu"
+    )
+    assert cfg.self_play_mode == "latest"
+    evaluator = FakeEvaluator(
+        cp_fn=lambda fen: 50.0, legal_fn=lambda fen: ["a0a1", "a0b0"]
+    )
+    worker = _make_worker(cfg, evaluator)
+    game = _new_game(cfg, evaluator, ally_side="w")
+
+    # 1) ally-color ("w") move: entropy + value-cp pair + ally_cps entry.
+    action = move_to_index("e6e5")
+    visits = {action: 3, move_to_index("e7e6"): 1}
+    done, info = worker._record_and_step(
+        game, action=action, visits=visits, root_value=0.25
+    )
+    assert not done
+    assert len(game.ally_entropies) == 1
+    assert game.ally_value_cp_pairs == [(0.25, info["red_cp"])]  # mover "w"
+    assert game.ally_cps == [info["red_cp"]]  # tracked color is "w"
+
+    # 2) enemy-color ("b") move: entropy + value-cp pair recorded too, with
+    # the cp in MOVER (black) perspective; ally_cps stays ally-only.
+    action2 = move_to_index("e3e4")
+    done2, info2 = worker._record_and_step(
+        game, action=action2, visits={action2: 1}, root_value=-0.1
+    )
+    assert not done2
+    assert len(game.ally_entropies) == 2
+    assert len(game.ally_value_cp_pairs) == 2
+    root_value2, cp2 = game.ally_value_cp_pairs[1]
+    assert root_value2 == -0.1
+    assert info2["red_cp"] == 50.0  # black just moved; red is to move (+50)
+    assert cp2 == -info2["red_cp"]  # mover-perspective: negated for black
+    assert len(game.ally_cps) == 1  # unchanged by the enemy-color move
+
+
 def test_record_and_step_one_hot_ally_entropy_is_zero():
     cfg = replace(
         MuZeroConfig(), channels=16, repr_blocks=1, dyn_blocks=1, device="cpu"
