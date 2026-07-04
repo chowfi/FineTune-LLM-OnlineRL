@@ -41,6 +41,10 @@ class MuZeroConfig:
     # Self-play
     num_workers: int = 3
     games_per_worker: int = 28
+    # "latest": stock MuZero — the newest network plays both sides, no enemy.
+    # "frozen_enemy": learner vs frozen snapshot with streak promotion.
+    self_play_mode: str = "latest"
+    truncation_symmetric: bool = True  # derived from self_play_mode in __post_init__
     promote_after_consecutive_wins: int = 3
     max_game_plies: int = 300
     # Red first moves in ENGINE UCI (rank 0 = bottom): central/edge cannon,
@@ -101,3 +105,6 @@ class MuZeroConfig:
 
     def __post_init__(self):
         self.input_planes = 14 * self.history_length + 3
+        if self.self_play_mode not in ("latest", "frozen_enemy"):
+            raise ValueError(f"self_play_mode: {self.self_play_mode!r}")
+        self.truncation_symmetric = self.self_play_mode == "latest"

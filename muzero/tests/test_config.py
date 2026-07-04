@@ -1,3 +1,5 @@
+import pytest
+
 from muzero.config import MuZeroConfig
 
 
@@ -17,3 +19,16 @@ def test_defaults_match_spec():
 def test_input_planes_derived_from_history_length():
     cfg = MuZeroConfig(history_length=4)
     assert cfg.input_planes == 59
+
+
+def test_self_play_mode_defaults_and_derivation():
+    cfg = MuZeroConfig()
+    assert cfg.self_play_mode == "latest"
+    assert cfg.truncation_symmetric is True
+    frozen = MuZeroConfig(self_play_mode="frozen_enemy")
+    assert frozen.truncation_symmetric is False
+
+
+def test_self_play_mode_validation():
+    with pytest.raises(ValueError):
+        MuZeroConfig(self_play_mode="bogus")

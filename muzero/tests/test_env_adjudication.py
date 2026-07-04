@@ -29,7 +29,9 @@ def test_threefold_repetition_is_draw_with_penalty():
 
 
 def test_hopeless_ally_game_truncates_as_loss():
-    cfg = replace(MuZeroConfig(), truncation_consecutive=3)
+    cfg = replace(
+        MuZeroConfig(), truncation_consecutive=3, self_play_mode="frozen_enemy"
+    )
     # evaluate_cp is side-to-move perspective; +900 after every move means the
     # mover always left the opponent at +900, i.e. red is at -900 after red moves.
     env = XiangqiEnv(cfg, FakeEvaluator(cp_fn=lambda fen: 900.0))

@@ -20,7 +20,12 @@ from muzero.tests.helpers import FakeEvaluator, make_evaluator, requires_engine
 
 def test_coordinator_promotes_after_streak():
     cfg = replace(
-        MuZeroConfig(), channels=16, repr_blocks=1, dyn_blocks=1, device="cpu"
+        MuZeroConfig(),
+        channels=16,
+        repr_blocks=1,
+        dyn_blocks=1,
+        device="cpu",
+        self_play_mode="frozen_enemy",
     )
     ally, enemy = MuZeroNet(cfg), MuZeroNet(cfg)
     coord = SelfPlayCoordinator(cfg, ally, enemy)
