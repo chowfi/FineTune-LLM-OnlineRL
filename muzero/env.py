@@ -118,9 +118,11 @@ class XiangqiEnv:
         self.no_progress_history.append(self.no_progress)
 
         cp_after_red = self.red_cp()
-        reward = self._shaping_reward(mover, cp_before_red, cp_after_red)
+        mover_cp_delta = self._mover_cp_delta(mover, cp_before_red, cp_after_red)
+        reward = self._shaping_reward(mover_cp_delta)
         info = {
             "red_cp": cp_after_red,
+            "mover_cp_delta": mover_cp_delta,
             "truncated": False,
             "repetition_penalized": None,
         }
@@ -154,13 +156,18 @@ class XiangqiEnv:
             return None
         return red_cp if mover == "w" else -red_cp
 
-    def _shaping_reward(self, mover: str, cp_before_red, cp_after_red) -> float:
+    def _mover_cp_delta(self, mover: str, cp_before_red, cp_after_red):
+        """Mover-perspective eval change across the mover's own move."""
         if cp_before_red is None or cp_after_red is None:
-            return 0.0
+            return None
         delta_red = cp_after_red - cp_before_red
-        delta = delta_red if mover == "w" else -delta_red
+        return delta_red if mover == "w" else -delta_red
+
+    def _shaping_reward(self, mover_cp_delta) -> float:
+        if mover_cp_delta is None:
+            return 0.0
         return self.config.shaping_weight * float(
-            np.tanh(delta / self.config.shaping_cp_scale)
+            np.tanh(mover_cp_delta / self.config.shaping_cp_scale)
         )
 
     def _position_key(self) -> str:

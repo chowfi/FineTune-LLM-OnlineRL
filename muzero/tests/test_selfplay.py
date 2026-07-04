@@ -308,3 +308,31 @@ def test_round_groups_by_mode():
         (frozen.ally_runner, True, True),
         (frozen.enemy_runner, False, False),
     ]
+
+
+def test_blunder_and_search_kl_tracking():
+    # Constant stm-perspective cp of 150 -> every mover's delta is -300,
+    # beyond the 200cp blunder threshold.
+    cfg = replace(
+        MuZeroConfig(), channels=16, repr_blocks=1, dyn_blocks=1, device="cpu"
+    )
+    evaluator = FakeEvaluator(cp_fn=lambda fen: 150.0, legal_fn=lambda fen: ["a0a1"])
+    worker = _make_worker(cfg, evaluator)
+    game = _new_game(cfg, evaluator, ally_side="w")
+
+    action = move_to_index("e6e5")
+    worker._record_and_step(
+        game, action=action, visits={action: 4}, root_value=0.0, search_kl=0.37
+    )
+    assert game.cp_moves == 1 and game.blunders == 1
+    assert game.search_kls == [0.37]
+
+    # Forced-opening style call (no search): no KL recorded, cp still counted.
+    action2 = move_to_index("e3e4")
+    worker._record_and_step(game, action=action2, visits={action2: 1}, root_value=0.0)
+    assert game.cp_moves == 2 and game.blunders == 2
+    assert game.search_kls == [0.37]
+
+    summary = worker._finish(game)
+    assert summary["blunders"] == 2 and summary["cp_moves"] == 2
+    assert summary["mean_search_kl"] == 0.37

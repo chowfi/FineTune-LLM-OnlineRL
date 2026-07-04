@@ -34,6 +34,11 @@ def aggregate_game_summaries(summaries: list) -> dict:
         corr = np.corrcoef(values, cps)[0, 1]
         correlation = float(corr) if np.isfinite(corr) else 0.0
 
+    total_blunders = sum(s.get("blunders", 0) for s in summaries)
+    total_cp_moves = sum(s.get("cp_moves", 0) for s in summaries)
+    search_kls = [s.get("mean_search_kl") for s in summaries]
+    search_kls = [v for v in search_kls if v is not None]
+
     return {
         "selfplay/win_rate": wins / n,
         "selfplay/draw_rate": draws / n,
@@ -66,6 +71,20 @@ def aggregate_game_summaries(summaries: list) -> dict:
             1 for s in summaries if s["result"] == "black_win"
         )
         / n,
+        # Move quality: fraction of moves whose mover-perspective eval dropped
+        # past the blunder threshold. Should decline steadily if learning.
+        "selfplay/blunder_rate": total_blunders / max(total_cp_moves, 1),
+        # Wins by actual checkmate (not adjudication) — the "learned to
+        # convert" signal that predicts repetition draws falling.
+        "selfplay/mate_win_rate": sum(
+            1
+            for s in summaries
+            if s["result"] in ("red_win", "black_win") and not s["truncated"]
+        )
+        / n,
+        # KL(root visits || raw prior): how much search improves on the raw
+        # policy. Drifts down as the policy internalizes the search.
+        "selfplay/mean_search_kl": (float(np.mean(search_kls)) if search_kls else 0.0),
     }
 
 

@@ -29,10 +29,12 @@ def test_mcts_respects_mask_and_visit_budget():
     ]
     results = MCTS(cfg).run(runner, roots, add_noise=True)
     assert len(results) == 2
-    for (visits, root_value), legal in zip(results, [legal_a, legal_b]):
+    for (visits, root_value, search_kl), legal in zip(results, [legal_a, legal_b]):
         assert sum(visits.values()) == 16
         assert set(visits.keys()) <= set(legal.tolist())
         assert np.isfinite(root_value)
+        # KL(visit distribution || raw pre-noise prior): finite, non-negative.
+        assert np.isfinite(search_kl) and search_kl >= -1e-9
 
 
 def test_backup_stats_track_child_q():

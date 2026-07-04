@@ -172,7 +172,7 @@ def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
                     legal = np.array(
                         [move_to_index(m) for m in env.legal_moves()], dtype=np.int64
                     )
-                    ((visits, _),) = mcts.run(
+                    ((visits, _, _),) = mcts.run(
                         runner,
                         [(env.observation().astype(np.float32), legal)],
                         add_noise=False,

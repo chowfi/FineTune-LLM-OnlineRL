@@ -97,14 +97,17 @@ class MCTS:
 
     def run(self, runner: NetRunner, roots_data: list, add_noise: bool) -> list:
         """roots_data: list of (obs (115,10,9) float32, legal action indices).
-        Returns per game: ({action: visit_count}, root_value)."""
+        Returns per game: ({action: visit_count}, root_value, search_kl) where
+        search_kl = KL(visit distribution || raw pre-noise prior) — how much
+        the search improved on the raw policy ("search gain")."""
         cfg = self.config
         obs_batch = np.stack([obs for obs, _ in roots_data])
         out = runner.initial(obs_batch)
-        roots, stats = [], []
+        roots, stats, raw_priors = [], [], []
         for g, (_, legal) in enumerate(roots_data):
             root = Node(0.0)
             priors = _masked_softmax(out["policy_logits"][g], legal)
+            raw_priors.append(priors)  # noise mixing below builds a new array
             if add_noise:
                 noise = self.rng.dirichlet([cfg.dirichlet_alpha] * len(legal))
                 priors = (
@@ -146,8 +149,9 @@ class MCTS:
                     for p, ch in root.children.items()
                 },
                 root.value(),
+                _search_kl(root, raw_priors[g]),
             )
-            for root in roots
+            for g, root in enumerate(roots)
         ]
 
     def _select_child(self, node: Node, stats: MinMaxStats) -> Node:
@@ -194,6 +198,20 @@ def _expand(node: Node, actions: np.ndarray, priors: np.ndarray, hidden, reward:
     node.cand_priors = np.asarray(priors, dtype=np.float32)
     node.hidden = hidden
     node.reward = reward
+
+
+def _search_kl(root: Node, raw_prior: np.ndarray) -> float:
+    """KL(root visit distribution || raw pre-noise prior), >= 0."""
+    total = sum(ch.visit_count for ch in root.children.values())
+    if total <= 0:
+        return 0.0
+    kl = 0.0
+    for pos, ch in root.children.items():
+        if ch.visit_count == 0:
+            continue
+        pi = ch.visit_count / total
+        kl += pi * math.log(pi / max(float(raw_prior[pos]), 1e-12))
+    return float(kl)
 
 
 def _masked_softmax(logits: np.ndarray, indices: np.ndarray) -> np.ndarray:

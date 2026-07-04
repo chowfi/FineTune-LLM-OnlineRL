@@ -103,3 +103,18 @@ def test_asymmetric_mode_ignores_non_ally_saturation():
     assert env.result == "draw_repetition"
     assert not env.truncated
     assert plies == 8
+
+
+def test_step_reports_mover_cp_delta():
+    # Constant stm-perspective cp c makes every mover's delta -2c: before the
+    # move the mover sees +c; after, the opponent sees +c, i.e. the mover -c.
+    cfg = MuZeroConfig()
+    env = XiangqiEnv(cfg, FakeEvaluator(cp_fn=lambda fen: 150.0))
+    env.reset()
+    _, _, _, info = env.step(SHUFFLE[0])
+    assert info["mover_cp_delta"] == -300.0
+
+    env2 = XiangqiEnv(cfg, FakeEvaluator(cp_fn=lambda fen: None))
+    env2.reset()
+    _, _, _, info2 = env2.step(SHUFFLE[0])
+    assert info2["mover_cp_delta"] is None

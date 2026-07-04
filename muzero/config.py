@@ -65,6 +65,7 @@ class MuZeroConfig:
     # Env rewards / adjudication
     shaping_weight: float = 0.3
     shaping_cp_scale: float = 200.0
+    blunder_cp_threshold: float = 200.0  # mover delta <= -this counts as a blunder
     repetition_penalty: float = -0.3
     repetition_cp_ok: float = -100.0  # penalize repeater whose cp >= this
     repetition_swing_cp: float = 50.0  # "no threat" = cp swing below this

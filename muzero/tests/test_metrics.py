@@ -141,3 +141,46 @@ def test_red_black_win_rates():
     m = aggregate_game_summaries(summaries)
     assert m["selfplay/red_win_rate"] == 1 / 3
     assert m["selfplay/black_win_rate"] == 1 / 3
+
+
+def test_blunder_mate_and_search_kl_metrics():
+    base = {
+        "ally_side": "w",
+        "ally_won": False,
+        "draw": False,
+        "plies": 40,
+        "promoted": False,
+        "final_red_cp": 0.0,
+        "era": 0,
+    }
+    summaries = [
+        {
+            **base,
+            "result": "red_win",
+            "truncated": False,  # genuine mate win
+            "blunders": 2,
+            "cp_moves": 10,
+            "mean_search_kl": 0.4,
+        },
+        {
+            **base,
+            "result": "black_win",
+            "truncated": True,  # adjudicated win
+            "blunders": 1,
+            "cp_moves": 10,
+            "mean_search_kl": 0.2,
+        },
+        {
+            **base,
+            "result": "draw_repetition",
+            "draw": True,
+            "truncated": False,
+            "blunders": 0,
+            "cp_moves": 20,
+            "mean_search_kl": None,
+        },
+    ]
+    m = aggregate_game_summaries(summaries)
+    assert m["selfplay/blunder_rate"] == 3 / 40
+    assert m["selfplay/mate_win_rate"] == 1 / 3  # truncation win excluded
+    assert m["selfplay/mean_search_kl"] == (0.4 + 0.2) / 2  # None skipped

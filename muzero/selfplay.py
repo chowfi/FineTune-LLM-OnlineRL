@@ -70,6 +70,9 @@ class _Game:
         self.ally_entropies = []
         self.ally_value_cp_pairs = []
         self.ally_cps = []  # tracked-color cp after its own moves (both modes)
+        self.blunders = 0  # moves whose mover-perspective eval dropped hard
+        self.cp_moves = 0  # moves with engine eval data (blunder divisor)
+        self.search_kls = []  # per-MCTS-move KL(visits || raw prior)
 
 
 class SelfPlayWorker:
@@ -113,7 +116,12 @@ class SelfPlayWorker:
         self._record_and_step(game, idx, {idx: 1}, root_value=0.0)
 
     def _record_and_step(
-        self, game: _Game, action: int, visits: dict, root_value: float
+        self,
+        game: _Game,
+        action: int,
+        visits: dict,
+        root_value: float,
+        search_kl: float | None = None,
     ):
         h = game.history
         total = sum(visits.values())
@@ -123,12 +131,18 @@ class SelfPlayWorker:
             np.array([v / total for v in visits.values()], dtype=np.float32)
         )
         h.root_values.append(float(root_value))
+        if search_kl is not None:  # None on forced opening moves (no search)
+            game.search_kls.append(float(search_kl))
         mover = game.env.side_to_move  # about to move
         if self.latest_mode or mover == game.env.ally_side:
             p = np.array([v / total for v in visits.values()], dtype=np.float64)
             game.ally_entropies.append(float(-(p * np.log(p + 1e-12)).sum()))
         _, reward, done, info = game.env.step(index_to_move(action))
         h.rewards.append(reward)
+        if info.get("mover_cp_delta") is not None:
+            game.cp_moves += 1
+            if info["mover_cp_delta"] <= -self.cfg.blunder_cp_threshold:
+                game.blunders += 1
         if info.get("red_cp") is not None:
             mover_cp = info["red_cp"] if mover == "w" else -info["red_cp"]
             if self.latest_mode or mover == game.env.ally_side:
@@ -172,6 +186,11 @@ class SelfPlayWorker:
             "value_cp_pairs": list(game.ally_value_cp_pairs),
             "mean_ally_cp": (float(np.mean(game.ally_cps)) if game.ally_cps else None),
             "games_this_era": self.coordinator.games_this_era,
+            "blunders": game.blunders,
+            "cp_moves": game.cp_moves,
+            "mean_search_kl": (
+                float(np.mean(game.search_kls)) if game.search_kls else None
+            ),
         }
 
     def _round_groups(self, active: list) -> list:
@@ -205,11 +224,13 @@ class SelfPlayWorker:
                     )
                     roots.append((g.env.observation().astype(np.float32), legal))
                 results = self.mcts.run(runner, roots, add_noise=add_noise)
-                for g, (visits, root_value) in zip(group, results):
+                for g, (visits, root_value, search_kl) in zip(group, results):
                     action = select_action(
                         visits, g.env.plies, self.cfg.temperature_moves, self.rng
                     )
-                    done, _ = self._record_and_step(g, action, visits, root_value)
+                    done, _ = self._record_and_step(
+                        g, action, visits, root_value, search_kl=search_kl
+                    )
                     if done:
                         summaries.append(self._finish(g))
                         active.remove(g)
