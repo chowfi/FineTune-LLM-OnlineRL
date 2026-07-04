@@ -40,7 +40,7 @@ class XiangqiEnv:
         self.truncated = False
         self._rep_counts: dict = {}
         self._rep_cps: dict = {}
-        self._sat_streak = 0
+        self._sat_streaks = {"w": 0, "b": 0}
         # Per-state histories (index t = state before ply t), used to rebuild
         # observations in the replay buffer.
         self.boards = [self.board.copy()]
@@ -139,10 +139,10 @@ class XiangqiEnv:
         elif self.plies >= self.config.max_game_plies:
             self.result = "draw_max_plies"
         elif self._check_truncation(mover, cp_after_red):
-            self.result = "black_win" if self.ally_side == "w" else "red_win"
+            self.result = "black_win" if mover == "w" else "red_win"
             self.truncated = True
             info["truncated"] = True
-            reward += -1.0  # mover here is always the saturated ally
+            reward += -1.0  # the mover is always the saturated, losing side
 
         info["result"] = self.result
         return self.board, float(reward), self.result is not None, info
@@ -183,13 +183,16 @@ class XiangqiEnv:
         return (max(cps) - min(cps)) < self.config.repetition_swing_cp
 
     def _check_truncation(self, mover: str, cp_after_red) -> bool:
-        if mover != self.ally_side:
+        # Symmetric mode (latest-weights self-play): either color's hopeless
+        # streak truncates. Asymmetric mode (frozen_enemy): ally-only, so the
+        # winning side still practices converting won positions.
+        if not self.config.truncation_symmetric and mover != self.ally_side:
             return False
         mover_cp = self._mover_cp(mover, cp_after_red)
         if mover_cp is None:
             return False
         if mover_cp <= self.config.truncation_cp:
-            self._sat_streak += 1
+            self._sat_streaks[mover] += 1
         else:
-            self._sat_streak = 0
-        return self._sat_streak >= self.config.truncation_consecutive
+            self._sat_streaks[mover] = 0
+        return self._sat_streaks[mover] >= self.config.truncation_consecutive
