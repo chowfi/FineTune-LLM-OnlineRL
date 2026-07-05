@@ -339,3 +339,42 @@ def test_blunder_and_search_kl_tracking():
     summary = worker._finish(game)
     assert summary["blunders"] == 2 and summary["cp_moves"] == 2
     assert summary["mean_search_kl"] == 0.37
+
+
+def test_generate_stores_absolute_actions_for_black():
+    """Catches PARTIAL root-adapter wiring (flip-in without unflip-out, or
+    vice versa): either one-sided bug stores flip_action(a6a5)=a3a4 for
+    black's ply, which this test rejects.
+
+    Note the limits: FakeEvaluator legal strings are ENGINE UCI (rank 0 =
+    bottom), so "a3a4" resolves through env.legal_moves() to internal
+    absolute "a6a5". And because flip_action is an involution, a root with
+    ONE legal move cannot distinguish a correctly-wired adapter from a
+    completely absent one — total absence is instead covered by the
+    engine-gated legal-set bijection test and the training watch criteria."""
+    cfg = replace(
+        MuZeroConfig(),
+        channels=16,
+        repr_blocks=1,
+        dyn_blocks=1,
+        num_simulations=4,
+        interior_topk=4,
+        num_workers=1,
+        games_per_worker=1,
+        max_game_plies=2,
+        device="cpu",
+    )
+    torch.manual_seed(0)
+    evaluator = FakeEvaluator(cp_fn=lambda fen: 0.0, legal_fn=lambda fen: ["a3a4"])
+    ally = MuZeroNet(cfg)
+    buf = ReplayBuffer(cfg)
+    coord = SelfPlayCoordinator(cfg, ally, ally)
+    runner = NetRunner(ally, "cpu")
+    worker = SelfPlayWorker(cfg, runner, runner, buf, coord, evaluator, worker_id=0)
+    summaries = worker.generate(1)
+    assert len(summaries) == 1
+    game = buf.games[0]
+    # ply 0 is the forced red opening (absolute by construction);
+    # ply 1 is black's MCTS move and must be stored ABSOLUTE ("a6a5"):
+    assert game.actions[1] == move_to_index("a6a5")
+    assert list(game.policy_indices[1]) == [move_to_index("a6a5")]

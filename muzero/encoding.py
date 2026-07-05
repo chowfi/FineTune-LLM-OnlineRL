@@ -90,6 +90,13 @@ def mirror_action(idx: int | np.ndarray) -> int | np.ndarray:
     return _transform_action(idx, lambda r: r, lambda c: 8 - c)
 
 
+def absolute_visits(visits: dict, side_to_move: str) -> dict:
+    """MCTS root visits keyed in the mover's canonical frame -> absolute."""
+    if side_to_move == "w":
+        return visits
+    return {flip_action(a): v for a, v in visits.items()}
+
+
 def board_planes(board: np.ndarray) -> np.ndarray:
     """One position -> 14 binary planes (7 red types, then 7 black)."""
     planes = np.zeros((14, 10, 9), dtype=np.float32)

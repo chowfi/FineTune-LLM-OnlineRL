@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from muzero.encoding import (
+    absolute_visits,
     board_planes,
     encode_observation,
     flip_action,
@@ -169,3 +170,13 @@ def test_flip_board_involution_and_color_swap():
     mb = mirror_board(board)
     np.testing.assert_array_equal(mirror_board(mb), board)
     assert mb[6, 8] == 0 and mb[6, 0] > 0
+
+
+def test_absolute_visits():
+    visits = {move_to_index("a6a5"): 7, move_to_index("e6e5"): 3}
+    assert absolute_visits(visits, "w") is visits  # red: identity, no copy
+    unflipped = absolute_visits(visits, "b")
+    assert unflipped == {
+        flip_action(move_to_index("a6a5")): 7,
+        flip_action(move_to_index("e6e5")): 3,
+    }
