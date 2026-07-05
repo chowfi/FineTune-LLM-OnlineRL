@@ -146,7 +146,12 @@ def test_make_target_mirror_consistency():
     g = make_alternating_game(length=6)
     buf.rng = np.random.default_rng(7)
     plain = buf.make_target(g, 0, mirror=False)
-    buf.rng = np.random.default_rng(7)  # same k_c draw for both calls
+    # same k_c draw for both calls: mirror is passed explicitly, which skips
+    # the coin-flip draw, so k_c is rng draw #1 in both branches. If make_target
+    # ever adds an rng draw conditioned on `mirror`, this desyncs and the
+    # consistency_obs assertion below will fail spuriously — fix the draw
+    # order, not the assertion.
+    buf.rng = np.random.default_rng(7)
     mirrored = buf.make_target(g, 0, mirror=True)
     # observations mirror along the column axis, plane-for-plane
     np.testing.assert_array_equal(mirrored["obs"], plain["obs"][:, :, ::-1])
@@ -164,7 +169,7 @@ def test_make_target_mirror_consistency():
     np.testing.assert_array_equal(mirrored["target_material"], plain["target_material"])
 
 
-def test_make_target_default_draws_mirror_from_seeded_rng():
+def test_make_target_is_deterministic_given_seed():
     cfg = replace(MuZeroConfig(), unroll_steps=4, td_steps=2)
     g = make_alternating_game(length=6)
     buf_a, buf_b = ReplayBuffer(cfg), ReplayBuffer(cfg)
