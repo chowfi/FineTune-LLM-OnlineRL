@@ -28,6 +28,18 @@ def select_action(visits: dict, ply: int, temperature_moves: int, rng) -> int:
     return int(rng.choice(actions, p=probs))
 
 
+def canonical_root(env) -> tuple:
+    """(observation, legal action indices) in the mover's canonical frame.
+
+    The observation is already canonical (encode_observation flips for
+    black); this flips the legal indices to match, so MCTS sees a
+    consistent root. Pair with absolute_visits() on the way out."""
+    legal = np.array([move_to_index(m) for m in env.legal_moves()], dtype=np.int64)
+    if env.side_to_move == "b":
+        legal = flip_action(legal)
+    return env.observation().astype(np.float32), legal
+
+
 class SelfPlayCoordinator:
     """Tracks consecutive ally wins across all workers; promotes the enemy."""
 
@@ -215,14 +227,7 @@ class SelfPlayWorker:
                 ]
                 if not group:
                     continue
-                roots = []
-                for g in group:
-                    legal = np.array(
-                        [move_to_index(m) for m in g.env.legal_moves()], dtype=np.int64
-                    )
-                    if g.env.side_to_move == "b":
-                        legal = flip_action(legal)  # canonical frame in ...
-                    roots.append((g.env.observation().astype(np.float32), legal))
+                roots = [canonical_root(g.env) for g in group]  # canonical in ...
                 results = self.mcts.run(runner, roots, add_noise=add_noise)
                 for g, (visits, root_value, search_kl) in zip(group, results):
                     # ... absolute frame out (before storing or stepping)
