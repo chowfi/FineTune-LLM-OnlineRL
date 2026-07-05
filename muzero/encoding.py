@@ -45,6 +45,46 @@ def index_to_move(idx: int) -> str:
     return board_coords_to_algebraic(frm // 9, frm % 9, to // 9, to % 9)
 
 
+def flip_board(board: np.ndarray) -> np.ndarray:
+    """Vertical flip + color swap: the same position seen by the other side.
+
+    Rows reverse (r -> 9-r) and signed piece ids negate, so a black-to-move
+    position maps into the frame red enjoys (own army nearest row 9)."""
+    return np.ascontiguousarray(board[::-1] * -1)
+
+
+def mirror_board(board: np.ndarray) -> np.ndarray:
+    """Left-right mirror (Xiangqi rules are left-right symmetric)."""
+    return np.ascontiguousarray(board[:, ::-1])
+
+
+def _transform_action(idx, row_map, col_map):
+    a = np.asarray(idx, dtype=np.int64)
+    if np.any(a < 0) or np.any(a >= 8100):
+        raise ValueError(f"action index out of range: {idx!r}")
+    frm, to = a // 90, a % 90
+    fr, fc = frm // 9, frm % 9
+    tr, tc = to // 9, to % 9
+    out = (row_map(fr) * 9 + col_map(fc)) * 90 + (row_map(tr) * 9 + col_map(tc))
+    if isinstance(idx, (int, np.integer)):
+        return int(out)
+    return out
+
+
+def flip_action(idx):
+    """Top-bottom mirror of a flat action index (rows r -> 9-r).
+
+    Matches flip_board; accepts a python int or an int array (vectorized)."""
+    return _transform_action(idx, lambda r: 9 - r, lambda c: c)
+
+
+def mirror_action(idx):
+    """Left-right mirror of a flat action index (cols c -> 8-c).
+
+    Matches mirror_board; accepts a python int or an int array."""
+    return _transform_action(idx, lambda r: r, lambda c: 8 - c)
+
+
 def board_planes(board: np.ndarray) -> np.ndarray:
     """One position -> 14 binary planes (7 red types, then 7 black)."""
     planes = np.zeros((14, 10, 9), dtype=np.float32)

@@ -89,3 +89,57 @@ def test_encode_observation_broadcast_planes():
     assert np.all(obs_b[112] == 0.0)  # black to move: uniformly 0
     assert np.allclose(obs_b[113], 1.0)  # clamped at 3
     assert np.allclose(obs_b[114], 1.0)  # clamped at 100
+
+
+def test_flip_action_involutions_exhaustive():
+    from muzero.encoding import flip_action, mirror_action
+
+    idx = np.arange(8100, dtype=np.int64)
+    assert np.array_equal(flip_action(flip_action(idx)), idx)
+    assert np.array_equal(mirror_action(mirror_action(idx)), idx)
+    # the two mirrors act on different axes, so they commute
+    assert np.array_equal(
+        flip_action(mirror_action(idx)), mirror_action(flip_action(idx))
+    )
+
+
+def test_flip_action_scalar_semantics():
+    from muzero.encoding import flip_action, mirror_action
+
+    # black pawn push (3,0)->(4,0) flips to red pawn push (6,0)->(5,0)
+    assert index_to_move(flip_action(move_to_index("a3a4"))) == "a6a5"
+    # left-right mirror: file a -> file i
+    assert index_to_move(mirror_action(move_to_index("a3a4"))) == "i3i4"
+    assert isinstance(flip_action(move_to_index("a3a4")), int)
+
+
+def test_flip_action_rejects_bad_indices():
+    from muzero.encoding import flip_action, mirror_action
+
+    for bad in (-1, 8100):
+        with pytest.raises(ValueError):
+            flip_action(bad)
+        with pytest.raises(ValueError):
+            mirror_action(bad)
+
+
+def test_flip_board_involution_and_color_swap():
+    from muzero.encoding import flip_board, mirror_board
+
+    board = _start_board()
+    # the start position is vertically AND horizontally symmetric at the
+    # piece-type level (raw ids differ left-right, e.g. rook id 8 vs 9,
+    # so we compare via board_planes which is what the network sees)
+    np.testing.assert_array_equal(flip_board(board), board)
+    np.testing.assert_array_equal(
+        board_planes(mirror_board(board)), board_planes(board)
+    )
+    # asymmetric position: remove a red pawn at (6,0)
+    board[6, 0] = 0
+    fb = flip_board(board)
+    np.testing.assert_array_equal(flip_board(fb), board)  # involution
+    assert fb[3, 0] == 0  # the gap lands at the flipped square...
+    assert fb[6, 0] > 0  # ...and black's pawn (color-swapped positive) sits at (6,0)
+    mb = mirror_board(board)
+    np.testing.assert_array_equal(mirror_board(mb), board)
+    assert mb[6, 8] == 0 and mb[6, 0] > 0
