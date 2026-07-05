@@ -70,10 +70,9 @@ def test_board_planes_start_position():
 def test_encode_observation_shape_and_padding():
     board = _start_board()
     obs = encode_observation([board], "w", 1, 0, history_length=8)
-    assert obs.shape == (115, 10, 9)
+    assert obs.shape == (114, 10, 9)
     assert obs[:14].sum() == 0  # padded oldest history slot is empty
     assert obs[98:112].sum() == 32  # newest slot holds the board
-    assert obs[112].max() == 1.0  # side-to-move plane (red)
 
 
 def test_material_balance():
@@ -86,13 +85,26 @@ def test_material_balance():
 def test_encode_observation_broadcast_planes():
     board = _start_board()
     obs = encode_observation([board], "w", 1, 50, history_length=8)
-    assert np.all(obs[112] == 1.0)  # red to move: uniformly 1
-    assert np.allclose(obs[113], 1.0 / 3.0)  # repetition_count=1
-    assert np.allclose(obs[114], 0.5)  # no_progress=50
+    assert np.allclose(obs[112], 1.0 / 3.0)  # repetition_count=1
+    assert np.allclose(obs[113], 0.5)  # no_progress=50
     obs_b = encode_observation([board], "b", 3, 200, history_length=8)
-    assert np.all(obs_b[112] == 0.0)  # black to move: uniformly 0
-    assert np.allclose(obs_b[113], 1.0)  # clamped at 3
-    assert np.allclose(obs_b[114], 1.0)  # clamped at 100
+    assert np.allclose(obs_b[112], 1.0)  # clamped at 3
+    assert np.allclose(obs_b[113], 1.0)  # clamped at 100
+
+
+def test_encode_observation_canonicalizes_black_to_move():
+    board = _start_board()
+    board[6, 0] = 0  # remove a red pawn so the position is asymmetric
+    obs_w = encode_observation([board], "w", 1, 0, history_length=8)
+    obs_b = encode_observation([board], "b", 1, 0, history_length=8)
+    assert obs_w.shape == obs_b.shape == (114, 10, 9)
+    # red to move: newest slot is the absolute board
+    np.testing.assert_array_equal(obs_w[98:112], board_planes(board))
+    # black to move: newest slot is the flipped board (mover's canonical frame)
+    np.testing.assert_array_equal(obs_b[98:112], board_planes(flip_board(board)))
+    # rep / no-progress broadcast planes moved down to 112 / 113
+    assert np.allclose(obs_b[112], 1.0 / 3.0)
+    assert np.allclose(obs_b[113], 0.0)
 
 
 def test_flip_action_involutions_exhaustive():

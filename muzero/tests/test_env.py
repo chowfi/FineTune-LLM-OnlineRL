@@ -30,4 +30,4 @@ def test_observation_shape_with_fake_engine():
     env = XiangqiEnv(MuZeroConfig(), FakeEvaluator())
     env.reset()
     obs = env.observation()
-    assert obs.shape == (115, 10, 9)
+    assert obs.shape == (114, 10, 9)

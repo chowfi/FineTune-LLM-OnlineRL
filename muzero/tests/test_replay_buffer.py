@@ -50,7 +50,7 @@ def test_sample_batch_shapes():
     for _ in range(4):
         buf.add(make_game())
     batch = buf.sample_batch(8)
-    assert batch["obs"].shape == (8, 115, 10, 9)
+    assert batch["obs"].shape == (8, 114, 10, 9)
     assert batch["actions"].shape == (8, 8)
     assert batch["target_policy"].shape == (8, 9, 8100)
     assert batch["policy_mask"].shape == (8, 9)
@@ -58,7 +58,7 @@ def test_sample_batch_shapes():
     assert batch["target_reward"].shape == (8, 8)
     assert batch["target_moves_left"].shape == (8, 9)
     assert batch["target_material"].shape == (8, 9)
-    assert batch["consistency_obs"].shape == (8, 115, 10, 9)
+    assert batch["consistency_obs"].shape == (8, 114, 10, 9)
     assert batch["consistency_k"].shape == (8,)
     np.testing.assert_allclose(
         np.asarray(batch["target_policy"]).sum(-1), 1.0, rtol=1e-4

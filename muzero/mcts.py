@@ -96,7 +96,7 @@ class MCTS:
         self.rng = rng if rng is not None else np.random.default_rng(config.seed)
 
     def run(self, runner: NetRunner, roots_data: list, add_noise: bool) -> list:
-        """roots_data: list of (obs (115,10,9) float32, legal action indices).
+        """roots_data: list of (obs (input_planes,10,9) float32, legal action indices).
         Returns per game: ({action: visit_count}, root_value, search_kl) where
         search_kl = KL(visit distribution || raw pre-noise prior) — how much
         the search improved on the raw policy ("search gain")."""

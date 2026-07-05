@@ -24,8 +24,8 @@ def test_mcts_respects_mask_and_visit_budget():
     legal_a = np.array([5, 100, 8099], dtype=np.int64)
     legal_b = np.array([0, 1, 2, 3], dtype=np.int64)
     roots = [
-        (rng.standard_normal((115, 10, 9)).astype(np.float32), legal_a),
-        (rng.standard_normal((115, 10, 9)).astype(np.float32), legal_b),
+        (rng.standard_normal((114, 10, 9)).astype(np.float32), legal_a),
+        (rng.standard_normal((114, 10, 9)).astype(np.float32), legal_b),
     ]
     results = MCTS(cfg).run(runner, roots, add_noise=True)
     assert len(results) == 2
@@ -69,7 +69,7 @@ def test_mcts_deterministic_with_seeded_rng():
     )
     torch.manual_seed(0)
     net = MuZeroNet(cfg)
-    obs = np.random.default_rng(1).standard_normal((115, 10, 9)).astype(np.float32)
+    obs = np.random.default_rng(1).standard_normal((114, 10, 9)).astype(np.float32)
     legal = np.array([3, 44, 500], dtype=np.int64)
     r1 = MCTS(cfg, rng=np.random.default_rng(5)).run(
         NetRunner(net, "cpu"), [(obs, legal)], add_noise=True
