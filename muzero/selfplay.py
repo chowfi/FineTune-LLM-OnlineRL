@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from muzero.config import MuZeroConfig
-from muzero.encoding import index_to_move, move_to_index
+from muzero.encoding import absolute_visits, flip_action, index_to_move, move_to_index
 from muzero.env import XiangqiEnv
 from muzero.mcts import MCTS, NetRunner
 from muzero.replay_buffer import GameHistory, ReplayBuffer
@@ -26,6 +26,18 @@ def select_action(visits: dict, ply: int, temperature_moves: int, rng) -> int:
         return int(actions[np.argmax(counts)])
     probs = counts / counts.sum()
     return int(rng.choice(actions, p=probs))
+
+
+def canonical_root(env) -> tuple:
+    """(observation, legal action indices) in the mover's canonical frame.
+
+    The observation is already canonical (encode_observation flips for
+    black); this flips the legal indices to match, so MCTS sees a
+    consistent root. Pair with absolute_visits() on the way out."""
+    legal = np.array([move_to_index(m) for m in env.legal_moves()], dtype=np.int64)
+    if env.side_to_move == "b":
+        legal = flip_action(legal)
+    return env.observation().astype(np.float32), legal
 
 
 class SelfPlayCoordinator:
@@ -215,14 +227,11 @@ class SelfPlayWorker:
                 ]
                 if not group:
                     continue
-                roots = []
-                for g in group:
-                    legal = np.array(
-                        [move_to_index(m) for m in g.env.legal_moves()], dtype=np.int64
-                    )
-                    roots.append((g.env.observation().astype(np.float32), legal))
+                roots = [canonical_root(g.env) for g in group]  # canonical in ...
                 results = self.mcts.run(runner, roots, add_noise=add_noise)
                 for g, (visits, root_value, search_kl) in zip(group, results):
+                    # ... absolute frame out (before storing or stepping)
+                    visits = absolute_visits(visits, g.env.side_to_move)
                     action = select_action(
                         visits, g.env.plies, self.cfg.temperature_moves, self.rng
                     )

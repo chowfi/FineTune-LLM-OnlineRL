@@ -16,7 +16,7 @@ class MuZeroConfig:
 
     # Encoding
     history_length: int = 8
-    input_planes: int = 0  # derived: 14 * history_length + 3 (set in __post_init__)
+    input_planes: int = 0  # derived: 14 * history_length + 2 (set in __post_init__)
     action_space: int = 8100  # 90 from-squares x 90 to-squares
 
     # Network
@@ -108,7 +108,7 @@ class MuZeroConfig:
     wandb_project: str = "muzero-xiangqi"
 
     def __post_init__(self):
-        self.input_planes = 14 * self.history_length + 3
+        self.input_planes = 14 * self.history_length + 2
         if self.self_play_mode not in ("latest", "frozen_enemy"):
             raise ValueError(f"self_play_mode: {self.self_play_mode!r}")
         self.truncation_symmetric = self.self_play_mode == "latest"

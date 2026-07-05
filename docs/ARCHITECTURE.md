@@ -62,8 +62,13 @@ This project fine-tunes a Large Language Model (specifically `Qwen/Qwen2.5-7B-In
 
 ### 3f. MuZero Xiangqi (tensor world model + MCTS)
 - **Description:** `muzero/` implements an EfficientZero-style agent per
-  `docs/superpowers/specs/2026-07-02-muzero-xiangqi-design.md`: 115×10×9 board
-  tensors, 8100-action space masked to Pikafish-legal moves, 800-sim pUCT MCTS,
+  `docs/superpowers/specs/2026-07-02-muzero-xiangqi-design.md`: 114×10×9
+  mover-canonical board tensors (2026-07-05: the board is flipped and colors
+  swapped whenever black is to move, so the network always sees "me at the
+  bottom, moving up, my pieces in planes 0–6"; the side-to-move plane was
+  dropped as constant, 115→114 — spec:
+  `docs/superpowers/specs/2026-07-05-muzero-color-canonicalization-design.md`),
+  8100-action space masked to Pikafish-legal moves, 800-sim pUCT MCTS,
   K=8 unrolled training with policy/value/reward/moves-left/material/SimSiam
   losses (~22.1M params at the default 192-channel config), repetition-draw +
   hopeless-truncation adjudication, Pikafish warm start (MultiPV soft targets),
@@ -81,7 +86,15 @@ This project fine-tunes a Large Language Model (specifically `Qwen/Qwen2.5-7B-In
   (engine-gated tests need `PIKAFISH_BIN`). Module map: `config.py` (all
   hyperparameters), `encoding.py`, `transforms.py`, `network.py`, `env.py`,
   `mcts.py`, `selfplay.py`, `replay_buffer.py`, `warmstart.py`, `train.py`,
-  `metrics.py`. `selfplay.py`'s `_Game` tracks per-move root-policy
+  `metrics.py`. **Frame convention:** everything at rest is absolute
+  (`GameHistory`, env, engine FENs, metrics); canonicalization happens only at
+  the network boundary — `encode_observation` flips the board stack for black,
+  `make_target` flips black-ply actions/policy targets and emits
+  mover-perspective material (plus per-sample left-right mirror augmentation
+  from the buffer's seeded RNG), and `selfplay.canonical_root` /
+  `encoding.absolute_visits` adapt MCTS roots in/out (shared by selfplay and
+  the gate). Old 115-plane checkpoints are incompatible — fresh runs only.
+  `selfplay.py`'s `_Game` tracks per-move root-policy
   entropy, (root value, engine cp) pairs (every move in latest mode,
   ally moves only in frozen mode), and tracked-color cp after every ply
   (both movers — sampling only post-own-move biased the mean toward the

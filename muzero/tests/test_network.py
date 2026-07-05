@@ -18,7 +18,7 @@ def test_action_planes():
 def test_inference_shapes():
     cfg = tiny_config()
     net = MuZeroNet(cfg)
-    obs = torch.randn(4, 115, 10, 9)
+    obs = torch.randn(4, 114, 10, 9)
     out = net.initial_inference(obs)
     assert out["hidden"].shape == (4, 16, 10, 9)
     assert out["policy_logits"].shape == (4, 8100)

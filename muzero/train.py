@@ -154,9 +154,10 @@ def _run_gate_rung(cfg: MuZeroConfig, runner, evaluator, opponent_move) -> tuple
     """Ally (MCTS, no noise, argmax) vs `opponent_move(env) -> move | None`.
 
     Returns (wins, draws) over cfg.gate_games with alternating colors."""
-    from muzero.encoding import index_to_move, move_to_index
+    from muzero.encoding import absolute_visits, index_to_move
     from muzero.env import XiangqiEnv
     from muzero.mcts import MCTS
+    from muzero.selfplay import canonical_root
 
     mcts = MCTS(cfg)
     wins = draws = 0
@@ -167,14 +168,9 @@ def _run_gate_rung(cfg: MuZeroConfig, runner, evaluator, opponent_move) -> tuple
         done = False
         while not done:
             if env.side_to_move == ally_side:
-                legal = np.array(
-                    [move_to_index(m) for m in env.legal_moves()], dtype=np.int64
-                )
-                ((visits, _, _),) = mcts.run(
-                    runner,
-                    [(env.observation().astype(np.float32), legal)],
-                    add_noise=False,
-                )
+                obs, legal = canonical_root(env)
+                ((visits, _, _),) = mcts.run(runner, [(obs, legal)], add_noise=False)
+                visits = absolute_visits(visits, env.side_to_move)
                 move = index_to_move(max(visits, key=visits.get))
             else:
                 move = opponent_move(env)

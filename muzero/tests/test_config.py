@@ -12,13 +12,13 @@ def test_defaults_match_spec():
     assert cfg.buffer_games == 1500
     assert cfg.games_per_train_loop == 512
     assert len(cfg.opening_book) == 10
-    assert cfg.input_planes == 14 * cfg.history_length + 3 == 115
+    assert cfg.input_planes == 14 * cfg.history_length + 2 == 114
     assert len(cfg.loss_weights) == 6
 
 
 def test_input_planes_derived_from_history_length():
     cfg = MuZeroConfig(history_length=4)
-    assert cfg.input_planes == 59
+    assert cfg.input_planes == 58
 
 
 def test_self_play_mode_defaults_and_derivation():
