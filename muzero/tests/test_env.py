@@ -31,3 +31,24 @@ def test_observation_shape_with_fake_engine():
     env.reset()
     obs = env.observation()
     assert obs.shape == (114, 10, 9)
+
+
+@requires_engine
+def test_flip_maps_legal_move_sets():
+    """Flipping the board + flipping each legal move must yield exactly the
+    legal-move set of the flipped position (colors swapped, red to move)."""
+    from muzero.encoding import flip_action, flip_board, move_to_index
+    from src.xiangqi_board import board_to_uci_fen, engine_uci_to_algebraic
+
+    evaluator = make_evaluator()
+    cfg = MuZeroConfig()
+    env = XiangqiEnv(cfg, evaluator)
+    env.reset()
+    env.step(engine_uci_to_algebraic("h2e2"))  # red central cannon; black to move
+    black_legal = {move_to_index(m) for m in env.legal_moves()}
+    flipped_fen = board_to_uci_fen(flip_board(env.board), "w")
+    flipped_legal = {
+        move_to_index(engine_uci_to_algebraic(u))
+        for u in evaluator.list_legal_moves(flipped_fen)
+    }
+    assert {flip_action(a) for a in black_legal} == flipped_legal
