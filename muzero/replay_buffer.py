@@ -1,7 +1,7 @@
 """Whole-game FIFO replay buffer with proportional prioritized sampling.
 
 Observations are reconstructed from stored int8 boards at sample time
-(storing encoded 115-plane stacks for 5000 games would need ~30 GB)."""
+(storing encoded 114-plane stacks for 5000 games would need ~30 GB)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,13 @@ from collections import deque
 import numpy as np
 
 from muzero.config import MuZeroConfig
-from muzero.encoding import encode_observation, material_balance
+from muzero.encoding import (
+    encode_observation,
+    flip_action,
+    material_balance,
+    mirror_action,
+    mirror_board,
+)
 
 
 class GameHistory:
@@ -89,19 +95,38 @@ class ReplayBuffer:
             )
         return g
 
-    def _dense_policy(self, game: GameHistory, t: int) -> np.ndarray:
+    def _target_action(self, game: GameHistory, s: int, mirror: bool) -> int:
+        """Stored absolute action -> the frame the network sees at state s."""
+        a = game.actions[s]
+        if mirror:
+            a = mirror_action(a)
+        if game.to_play_history[s] == "b":
+            a = flip_action(a)
+        return a
+
+    def _dense_policy(self, game: GameHistory, t: int, mirror: bool) -> np.ndarray:
+        idx = game.policy_indices[t]
+        if mirror:
+            idx = mirror_action(idx)
+        if game.to_play_history[t] == "b":
+            idx = flip_action(idx)
         dense = np.zeros(self.config.action_space, dtype=np.float32)
-        dense[game.policy_indices[t]] = game.policy_probs[t]
+        dense[idx] = game.policy_probs[t]
         s = dense.sum()
         return dense / s if s > 0 else np.full_like(dense, 1.0 / dense.shape[0])
 
-    def make_target(self, game: GameHistory, t: int) -> dict:
+    def make_target(
+        self, game: GameHistory, t: int, mirror: bool | None = None
+    ) -> dict:
         cfg = self.config
         K, L = cfg.unroll_steps, len(game)
+        if mirror is None:
+            mirror = bool(self.rng.integers(0, 2))  # LR-mirror augmentation
+        boards = [mirror_board(b) for b in game.boards] if mirror else game.boards
         uniform = np.full(cfg.action_space, 1.0 / cfg.action_space, dtype=np.float32)
 
         obs = encode_observation(
-            game.boards[: t + 1],
+            boards[: t + 1],
             game.to_play_history[t],
             game.rep_history[t],
             game.no_progress_history[t],
@@ -110,7 +135,7 @@ class ReplayBuffer:
         actions = np.array(
             [
                 (
-                    game.actions[t + k]
+                    self._target_action(game, t + k, mirror)
                     if t + k < L
                     else int(self.rng.integers(0, cfg.action_space))
                 )
@@ -122,7 +147,7 @@ class ReplayBuffer:
         for k in range(K + 1):
             s = t + k
             if s < L:
-                policies.append(self._dense_policy(game, s))
+                policies.append(self._dense_policy(game, s, mirror))
                 pmask.append(1.0)
                 values.append(self.n_step_value(game, s))
             else:
@@ -130,7 +155,11 @@ class ReplayBuffer:
                 pmask.append(0.0)
                 values.append(0.0)  # absorbing states train value to 0
             moves_left.append(min(max(L - s, 0), cfg.moves_left_max))
-            material.append(material_balance(game.boards[min(s, L)]) / 10.0)
+            sb = min(s, L)
+            mat = material_balance(game.boards[sb]) / 10.0  # mirror-invariant
+            if game.to_play_history[sb] == "b":
+                mat = -mat  # mover-perspective, matching the canonical frame
+            material.append(mat)
         rewards = np.array(
             [game.rewards[t + k] if t + k < L else 0.0 for k in range(K)],
             dtype=np.float32,
@@ -140,7 +169,7 @@ class ReplayBuffer:
         k_c = int(self.rng.integers(1, max_kc + 1)) if max_kc >= 1 else 0
         c_obs = (
             encode_observation(
-                game.boards[: t + k_c + 1],
+                boards[: t + k_c + 1],
                 game.to_play_history[t + k_c],
                 game.rep_history[t + k_c],
                 game.no_progress_history[t + k_c],

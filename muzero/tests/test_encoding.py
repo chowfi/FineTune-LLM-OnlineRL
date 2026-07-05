@@ -143,6 +143,14 @@ def test_flip_action_rejects_bad_indices():
         mirror_action(np.array([1.5]))
 
 
+def test_encode_observation_offsets_generalize_history_length():
+    board = _start_board()
+    obs = encode_observation([board], "w", 1, 50, history_length=4)
+    assert obs.shape == (58, 10, 9)
+    assert np.allclose(obs[56], 1.0 / 3.0)  # rep plane at 14*H
+    assert np.allclose(obs[57], 0.5)  # no-progress plane at 14*H + 1
+
+
 def test_flip_board_involution_and_color_swap():
     board = _start_board()
     # the start position is vertically AND horizontally symmetric at the

@@ -3,6 +3,7 @@ from dataclasses import replace
 import numpy as np
 
 from muzero.config import MuZeroConfig
+from muzero.encoding import flip_action, move_to_index
 from muzero.replay_buffer import GameHistory, ReplayBuffer
 
 
@@ -84,3 +85,56 @@ def test_buffer_index_assigned_in_add_order():
         buf.add(make_game())
     assert [g.buffer_index for g in buf.games] == [0, 1, 2]
     assert buf.total_games_added == 3
+
+
+def make_alternating_game(length=6):
+    """Deterministic game: red plays a6a5, black plays a3a4, one-hot policies.
+
+    Boards hold kings plus one pawn each, with an extra red rook so the
+    material balance is nonzero ((9+1-1)/10 = +0.9 red-perspective)."""
+    g = GameHistory()
+    board = np.zeros((10, 9), dtype=np.int8)
+    board[9, 4], board[0, 4] = 1, -1  # kings
+    board[6, 0], board[3, 0] = 12, -12  # one pawn each
+    board[9, 0] = 8  # extra red rook -> red is +9.0 material
+    for t in range(length + 1):
+        g.boards.append(board.copy())
+        g.to_play_history.append("w" if t % 2 == 0 else "b")
+        g.rep_history.append(1)
+        g.no_progress_history.append(t)
+    for t in range(length):
+        a = move_to_index("a6a5") if t % 2 == 0 else move_to_index("a3a4")
+        g.actions.append(a)
+        g.rewards.append(0.0)
+        g.policy_indices.append(np.array([a], dtype=np.int64))
+        g.policy_probs.append(np.array([1.0], dtype=np.float32))
+        g.root_values.append(0.0)
+    g.result = "draw_max_plies"
+    return g
+
+
+def test_make_target_flips_black_plies_keystone():
+    """THE doorway-consistency test: for every black ply the action and
+    policy target, decoded in the flipped frame, must name the same physical
+    move that was played. A boards-flipped-but-targets-not bug cannot pass."""
+    cfg = replace(MuZeroConfig(), unroll_steps=4, td_steps=2)
+    buf = ReplayBuffer(cfg)
+    g = make_alternating_game(length=6)
+    tgt = buf.make_target(g, 0, mirror=False)
+    for k in range(cfg.unroll_steps):
+        stored = g.actions[k]
+        expected = stored if g.to_play_history[k] == "w" else flip_action(stored)
+        assert tgt["actions"][k] == expected
+        assert int(np.argmax(tgt["target_policy"][k])) == expected
+    # black's a3a4 must literally become red's a6a5 in the canonical frame
+    assert tgt["actions"][1] == move_to_index("a6a5")
+
+
+def test_make_target_material_is_mover_perspective():
+    cfg = replace(MuZeroConfig(), unroll_steps=4, td_steps=2)
+    buf = ReplayBuffer(cfg)
+    g = make_alternating_game(length=6)
+    tgt = buf.make_target(g, 0, mirror=False)
+    for k in range(cfg.unroll_steps + 1):
+        expected = 0.9 if g.to_play_history[k] == "w" else -0.9
+        assert tgt["target_material"][k] == np.float32(expected)
