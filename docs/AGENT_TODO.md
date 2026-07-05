@@ -5,7 +5,7 @@ This document tracks prioritized tasks for AI agents. When starting a new sessio
 ## Active Tasks (In Progress)
 *(Add `[ ]` and move tasks here when an agent starts working on them)*
 
-- `[ ]` (2026-07-03) **MuZero: restart training in latest-selfplay mode.** After merging `muzero-latest-selfplay`, runs default to stock MuZero self-play (`self_play_mode="latest"`); the in-flight frozen-enemy run's checkpoint resumes cleanly into either mode (`--resume checkpoints/muzero_xiangqi/latest.pt` — skips warm start), or restart fresh for a clean latest-mode wandb run. Watch `selfplay/red_win_rate` vs `black_win_rate` (first-mover advantage), `gate/*` as the primary progress signal, and compare draw/entropy/value-cp curves against the frozen-enemy run for the ablation writeup.
+- `[ ]` (2026-07-03, updated 2026-07-05) **MuZero: restart training to pick up the buffer + metrics fixes.** The 2026-07-04/05 latest-mode run (iters 12–80) was audited — see `docs/logs/2026-07-05-log-metrics-audit-and-buffer-fix.md`. `buffer_games` is now 1500 (was 5000; value targets were ~28 iterations stale) and the gate is a two-rung ladder — both need a restart/resume to take effect (`--resume checkpoints/muzero_xiangqi/latest.pt` keeps the net; the buffer is not persisted). Primary signals: `gate/win_rate_random` (expect → 1.0), `selfplay/blunder_rate` ↓, `selfplay/mate_win_rate` ↑, `loss/value` should stop climbing, `selfplay/value_cp_correlation` should trend positive. Note `selfplay/mean_ally_cp_auc` jumps toward ~0 on restart from the metric fix alone — not a strength gain.
 - `[ ]` (2026-07-02) **MuZero: first run on the training machine.** On the 5090 box with `PIKAFISH_BIN` set: (1) `PIKAFISH_BIN=... uv run pytest muzero/tests -v` to exercise the 5 engine-gated tests, (2) `uv run python -m muzero.train --smoke --no-wandb --iterations 1 --device cpu` end-to-end smoke, (3) launch the real run `uv run python -m muzero.train`. Watch wandb `selfplay/*`, `loss/*`, `gate/*` and note findings in a dated log.
 
 
@@ -20,6 +20,11 @@ This document tracks prioritized tasks for AI agents. When starting a new sessio
   - Gumbel MuZero (32–64 sims) is the designed fallback behind the `mcts.py` interface if 800 sims can't hit throughput on one GPU.
   - The engine-gated self-play smoke test now exercises latest mode (the default); add a frozen-pinned (`self_play_mode="frozen_enemy"`) engine smoke on the training machine before relying on the frozen-enemy ablation for the writeup.
   - Deferred §10 metrics (need extra engine calls / GPU introspection): fraction of moves matching Pikafish best (consider sampling every 10th move); GPU inference batch utilization. (2026-07-04: blunder rate, mate-win rate, and search-gain KL are now implemented — see `docs/logs/2026-07-04-log-training-health-metrics.md`.)
+- `[ ]` **MuZero follow-ups from the 2026-07-05 metrics audit** (see `docs/logs/2026-07-05-log-metrics-audit-and-buffer-fix.md`):
+  - If `selfplay/value_cp_correlation` still ~0 after ~30 iterations on the 1500-game buffer: drop `per_alpha` 0.6 → 0.3 (PER priorities are frozen at insertion with no IS correction), then consider reanalyze-style fresh bootstrap values in `make_target`.
+  - If `selfplay/mate_win_rate` stays < 0.1 after ~50 iterations: raise `truncation_consecutive` 6 → 10–12 so games require conversion instead of cp-adjudication.
+  - Per-color blunder-rate metric (split `_Game.blunders` by mover color) to confirm the red/black oscillation mechanism.
+  - On a fresh restart (invalidates checkpoints): color-canonicalize `encoding.py` (flip board + swap plane groups so the mover always plays "up") — removes the structural red/black asymmetry and halves the representation task.
 - `[ ]` **Repo hygiene:** 29 legacy `.pyc` files tracked since `6058b0b` (root `__pycache__/`, `scripts/`, `web/server/`, `unsloth_compiled_cache/__pycache__/`) predate `.gitignore` rules; untrack them in a dedicated cleanup commit on main (leave `unsloth_compiled_cache/` contents otherwise untouched).
 
 

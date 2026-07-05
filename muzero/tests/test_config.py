@@ -9,7 +9,7 @@ def test_defaults_match_spec():
     assert cfg.unroll_steps == 8
     assert cfg.num_workers == 3
     assert cfg.games_per_worker == 28
-    assert cfg.buffer_games == 5000
+    assert cfg.buffer_games == 1500
     assert cfg.games_per_train_loop == 512
     assert len(cfg.opening_book) == 10
     assert cfg.input_planes == 14 * cfg.history_length + 3 == 115

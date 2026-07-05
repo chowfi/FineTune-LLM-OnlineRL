@@ -69,7 +69,10 @@ class _Game:
         self.opening_uci = opening_uci
         self.ally_entropies = []
         self.ally_value_cp_pairs = []
-        self.ally_cps = []  # tracked-color cp after its own moves (both modes)
+        # Tracked-color cp after EVERY ply (both movers). Sampling only after
+        # the tracked side's own moves biased the mean toward the sawtooth
+        # trough (your blunder is priced in, the reply blunder is not).
+        self.ally_cps = []
         self.blunders = 0  # moves whose mover-perspective eval dropped hard
         self.cp_moves = 0  # moves with engine eval data (blunder divisor)
         self.search_kls = []  # per-MCTS-move KL(visits || raw prior)
@@ -148,11 +151,8 @@ class SelfPlayWorker:
             if self.latest_mode or mover == game.env.ally_side:
                 # root_value is mover-perspective; pair it with mover-persp cp
                 game.ally_value_cp_pairs.append((float(root_value), float(mover_cp)))
-            if mover == game.env.ally_side:
-                ally_cp = (
-                    info["red_cp"] if game.env.ally_side == "w" else -info["red_cp"]
-                )
-                game.ally_cps.append(float(ally_cp))
+            ally_cp = info["red_cp"] if game.env.ally_side == "w" else -info["red_cp"]
+            game.ally_cps.append(float(ally_cp))
         return done, info
 
     def _finish(self, game: _Game) -> dict:
@@ -169,7 +169,6 @@ class SelfPlayWorker:
         draw = env.result not in ("red_win", "black_win")
         promoted = self.coordinator.report_result(ally_won=ally_won, draw=draw)
         self.buffer.add(h)
-        final_red_cp = env.red_cp()
         return {
             "result": env.result,
             "ally_side": env.ally_side,
@@ -178,7 +177,6 @@ class SelfPlayWorker:
             "plies": len(h),
             "truncated": env.truncated,
             "promoted": promoted,
-            "final_red_cp": final_red_cp,
             "era": self.coordinator.era,
             "mean_root_entropy": (
                 float(np.mean(game.ally_entropies)) if game.ally_entropies else 0.0

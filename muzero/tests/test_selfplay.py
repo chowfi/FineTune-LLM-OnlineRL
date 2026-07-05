@@ -164,7 +164,8 @@ def test_record_and_step_latest_mode_records_every_move():
     assert game.ally_cps == [info["red_cp"]]  # tracked color is "w"
 
     # 2) enemy-color ("b") move: entropy + value-cp pair recorded too, with
-    # the cp in MOVER (black) perspective; ally_cps stays ally-only.
+    # the cp in MOVER (black) perspective; ally_cps records every ply in the
+    # tracked color's perspective.
     action2 = move_to_index("e3e4")
     done2, info2 = worker._record_and_step(
         game, action=action2, visits={action2: 1}, root_value=-0.1
@@ -176,7 +177,8 @@ def test_record_and_step_latest_mode_records_every_move():
     assert root_value2 == -0.1
     assert info2["red_cp"] == 50.0  # black just moved; red is to move (+50)
     assert cp2 == -info2["red_cp"]  # mover-perspective: negated for black
-    assert len(game.ally_cps) == 1  # unchanged by the enemy-color move
+    # both plies recorded, tracked-color ("w" = red) perspective
+    assert game.ally_cps == [info["red_cp"], info2["red_cp"]]
 
 
 def test_record_and_step_one_hot_ally_entropy_is_zero():
@@ -224,7 +226,8 @@ def test_finish_summary_includes_new_diagnostic_fields():
     summary = worker._finish(game)
     assert summary["mean_root_entropy"] == game.ally_entropies[0]
     assert summary["value_cp_pairs"] == [(0.25, -50.0)]
-    assert summary["mean_ally_cp"] == -50.0
+    # ally ("w") cp after each ply: -50 (post own move), +50 (post reply)
+    assert summary["mean_ally_cp"] == 0.0
     assert summary["games_this_era"] == 1
 
 

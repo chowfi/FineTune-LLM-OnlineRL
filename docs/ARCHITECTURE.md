@@ -82,17 +82,26 @@ This project fine-tunes a Large Language Model (specifically `Qwen/Qwen2.5-7B-In
   hyperparameters), `encoding.py`, `transforms.py`, `network.py`, `env.py`,
   `mcts.py`, `selfplay.py`, `replay_buffer.py`, `warmstart.py`, `train.py`,
   `metrics.py`. `selfplay.py`'s `_Game` tracks per-move root-policy
-  entropy and (root value, engine cp) pairs (every move in latest mode,
-  ally moves only in frozen mode) at no extra engine-call cost
-  (the cp already comes back on `env.step`'s `info`); `metrics.py` rolls
-  these into `selfplay/mean_root_entropy`, `selfplay/mean_ally_cp_auc`,
-  `selfplay/value_cp_correlation`, and `selfplay/games_per_promotion`.
-  `replay_buffer.py` stamps each `GameHistory` with a `buffer_index` on
-  `add()` and `sample_batch()` returns a `mean_buffer_age` scalar, which
-  `train.py`'s `MuZeroTrainer.train_batch` pops before tensorizing and
-  reports back as `buffer_age` (aggregated into `loss/buffer_age` by the
-  main loop). Deferred §10 metrics needing extra engine calls or GPU
-  introspection are tracked in `docs/AGENT_TODO.md`.
+  entropy, (root value, engine cp) pairs (every move in latest mode,
+  ally moves only in frozen mode), and tracked-color cp after every ply
+  (both movers — sampling only post-own-move biased the mean toward the
+  blunder-sawtooth trough), all at no extra engine-call cost (the cp
+  already comes back on `env.step`'s `info`); `metrics.py` rolls these
+  into `selfplay/mean_root_entropy`, `selfplay/mean_ally_cp_auc`, and
+  `selfplay/value_cp_correlation` (2026-07-05: the redundant
+  `selfplay/mean_final_ally_cp` and constant `selfplay/games_per_promotion`
+  were dropped). `replay_buffer.py` stamps each `GameHistory` with a
+  `buffer_index` on `add()` and `sample_batch()` returns a
+  `mean_buffer_age` scalar, which `train.py`'s
+  `MuZeroTrainer.train_batch` pops before tensorizing and reports back as
+  `buffer_age` (logged as `buffer/mean_sampled_age` by the main loop).
+  `buffer_games` is 1500 (~18 iterations at 84 games/loop; the original
+  5000 left value targets ~28 iterations stale — see
+  `docs/logs/2026-07-05-log-metrics-audit-and-buffer-fix.md`). The gate
+  is a two-rung ladder per `run_gate`: `gate/*_random` vs a
+  uniform-random legal mover (resolves early progress) and `gate/*` vs
+  raw Pikafish at `gate_movetime_ms`. Deferred §10 metrics needing extra
+  engine calls or GPU introspection are tracked in `docs/AGENT_TODO.md`.
 
 ### 3d. Inference-only Elo bench (chess + xiangqi)
 - **Description:** `scripts/benchmark/` benchmarks any LLM (default

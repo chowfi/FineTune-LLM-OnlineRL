@@ -73,7 +73,10 @@ class MuZeroConfig:
     truncation_consecutive: int = 6
 
     # Replay / training
-    buffer_games: int = 5000
+    # ~18 iterations of self-play at 84 games/loop. The original 5000 (~60
+    # iterations) left value targets bootstrapped from a ~28-iteration-stale
+    # policy, which showed up as a steadily climbing loss/value.
+    buffer_games: int = 1500
     games_per_train_loop: int = 512
     batch_size: int = 512
     unroll_steps: int = 8

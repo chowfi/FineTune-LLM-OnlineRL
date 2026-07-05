@@ -150,52 +150,80 @@ class MuZeroTrainer:
         return result
 
 
-def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
-    """Ally (MCTS, no noise, argmax) vs raw Pikafish at gate movetime."""
+def _run_gate_rung(cfg: MuZeroConfig, runner, evaluator, opponent_move) -> tuple:
+    """Ally (MCTS, no noise, argmax) vs `opponent_move(env) -> move | None`.
+
+    Returns (wins, draws) over cfg.gate_games with alternating colors."""
     from muzero.encoding import index_to_move, move_to_index
     from muzero.env import XiangqiEnv
     from muzero.mcts import MCTS
+
+    mcts = MCTS(cfg)
+    wins = draws = 0
+    for i in range(cfg.gate_games):
+        ally_side = "w" if i % 2 == 0 else "b"
+        env = XiangqiEnv(cfg, evaluator)
+        env.reset(ally_side=ally_side)
+        done = False
+        while not done:
+            if env.side_to_move == ally_side:
+                legal = np.array(
+                    [move_to_index(m) for m in env.legal_moves()], dtype=np.int64
+                )
+                ((visits, _, _),) = mcts.run(
+                    runner,
+                    [(env.observation().astype(np.float32), legal)],
+                    add_noise=False,
+                )
+                move = index_to_move(max(visits, key=visits.get))
+            else:
+                move = opponent_move(env)
+                if move is None:
+                    break
+            _, _, done, _ = env.step(move)
+        if env.result in ("red_win", "black_win"):
+            if (env.result == "red_win") == (ally_side == "w"):
+                wins += 1
+        else:
+            draws += 1
+    return wins, draws
+
+
+def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
+    """Gate ladder: uniform-random legal mover, then raw Pikafish at gate
+    movetime. The random rung resolves early progress (a net that has
+    learned anything should be near 1.0); the Pikafish rung stays ~0 until
+    the net is enormously stronger."""
     from muzero.warmstart import SimpleUciEngine
     from src.xiangqi_board import engine_uci_to_algebraic
 
+    rng = np.random.default_rng(cfg.seed)
+
+    def random_move(env):
+        moves = env.legal_moves()
+        return str(rng.choice(moves)) if moves else None
+
     engine = SimpleUciEngine(cfg.pikafish_bin, cfg.gate_movetime_ms, multipv=1)
-    mcts = MCTS(cfg)
-    wins = draws = 0
+
+    def engine_move(env):
+        lines = engine.search(env.fen())
+        if not lines:
+            return None
+        return engine_uci_to_algebraic(lines[0][0])
+
+    n = cfg.gate_games
     try:
-        for i in range(cfg.gate_games):
-            ally_side = "w" if i % 2 == 0 else "b"
-            env = XiangqiEnv(cfg, evaluator)
-            env.reset(ally_side=ally_side)
-            done = False
-            while not done:
-                if env.side_to_move == ally_side:
-                    legal = np.array(
-                        [move_to_index(m) for m in env.legal_moves()], dtype=np.int64
-                    )
-                    ((visits, _, _),) = mcts.run(
-                        runner,
-                        [(env.observation().astype(np.float32), legal)],
-                        add_noise=False,
-                    )
-                    move = index_to_move(max(visits, key=visits.get))
-                else:
-                    lines = engine.search(env.fen())
-                    if not lines:
-                        break
-                    move = engine_uci_to_algebraic(lines[0][0])
-                _, _, done, _ = env.step(move)
-            if env.result in ("red_win", "black_win"):
-                if (env.result == "red_win") == (ally_side == "w"):
-                    wins += 1
-            else:
-                draws += 1
+        rand_wins, rand_draws = _run_gate_rung(cfg, runner, evaluator, random_move)
+        pika_wins, pika_draws = _run_gate_rung(cfg, runner, evaluator, engine_move)
     finally:
         engine.close()
-    n = cfg.gate_games
     return {
-        "gate/win_rate": wins / n,
-        "gate/draw_rate": draws / n,
-        "gate/loss_rate": (n - wins - draws) / n,
+        "gate/win_rate_random": rand_wins / n,
+        "gate/draw_rate_random": rand_draws / n,
+        "gate/loss_rate_random": (n - rand_wins - rand_draws) / n,
+        "gate/win_rate": pika_wins / n,
+        "gate/draw_rate": pika_draws / n,
+        "gate/loss_rate": (n - pika_wins - pika_draws) / n,
     }
 
 
@@ -330,7 +358,14 @@ def main():
                 buffer.sample_batch(cfg.batch_size)
             ).items():
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
-        metrics.update({f"loss/{k}": v / num_batches for k, v in loss_sums.items()})
+        metrics.update(
+            {
+                # buffer_age is a sampling diagnostic, not a loss term
+                ("buffer/mean_sampled_age" if k == "buffer_age" else f"loss/{k}"): v
+                / num_batches
+                for k, v in loss_sums.items()
+            }
+        )
         metrics.update(
             {
                 "buffer/games": len(buffer.games),
