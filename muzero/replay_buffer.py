@@ -158,7 +158,11 @@ class ReplayBuffer:
             sb = min(s, L)
             mat = material_balance(game.boards[sb]) / 10.0  # mirror-invariant
             if game.to_play_history[sb] == "b":
-                mat = -mat  # mover-perspective, matching the canonical frame
+                # Mover-perspective, matching the canonical frame. Past game
+                # end (s > L) this deliberately freezes terminal material in
+                # the TERMINAL mover's frame — the absorbing latent is a
+                # fixed point, not an alternating negamax state.
+                mat = -mat
             material.append(mat)
         rewards = np.array(
             [game.rewards[t + k] if t + k < L else 0.0 for k in range(K)],
