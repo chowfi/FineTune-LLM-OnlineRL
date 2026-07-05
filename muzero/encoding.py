@@ -59,6 +59,11 @@ def mirror_board(board: np.ndarray) -> np.ndarray:
 
 
 def _transform_action(idx, row_map, col_map):
+    if not (
+        isinstance(idx, (int, np.integer))
+        or np.issubdtype(np.asarray(idx).dtype, np.integer)
+    ):
+        raise TypeError(f"action index must be integer, got {np.asarray(idx).dtype}")
     a = np.asarray(idx, dtype=np.int64)
     if np.any(a < 0) or np.any(a >= 8100):
         raise ValueError(f"action index out of range: {idx!r}")
@@ -71,14 +76,14 @@ def _transform_action(idx, row_map, col_map):
     return out
 
 
-def flip_action(idx):
+def flip_action(idx: int | np.ndarray) -> int | np.ndarray:
     """Top-bottom mirror of a flat action index (rows r -> 9-r).
 
     Matches flip_board; accepts a python int or an int array (vectorized)."""
     return _transform_action(idx, lambda r: 9 - r, lambda c: c)
 
 
-def mirror_action(idx):
+def mirror_action(idx: int | np.ndarray) -> int | np.ndarray:
     """Left-right mirror of a flat action index (cols c -> 8-c).
 
     Matches mirror_board; accepts a python int or an int array."""

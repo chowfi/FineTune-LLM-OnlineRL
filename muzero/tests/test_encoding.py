@@ -4,8 +4,12 @@ import pytest
 from muzero.encoding import (
     board_planes,
     encode_observation,
+    flip_action,
+    flip_board,
     index_to_move,
     material_balance,
+    mirror_action,
+    mirror_board,
     move_to_index,
 )
 
@@ -92,8 +96,6 @@ def test_encode_observation_broadcast_planes():
 
 
 def test_flip_action_involutions_exhaustive():
-    from muzero.encoding import flip_action, mirror_action
-
     idx = np.arange(8100, dtype=np.int64)
     assert np.array_equal(flip_action(flip_action(idx)), idx)
     assert np.array_equal(mirror_action(mirror_action(idx)), idx)
@@ -104,8 +106,6 @@ def test_flip_action_involutions_exhaustive():
 
 
 def test_flip_action_scalar_semantics():
-    from muzero.encoding import flip_action, mirror_action
-
     # black pawn push (3,0)->(4,0) flips to red pawn push (6,0)->(5,0)
     assert index_to_move(flip_action(move_to_index("a3a4"))) == "a6a5"
     # left-right mirror: file a -> file i
@@ -114,18 +114,24 @@ def test_flip_action_scalar_semantics():
 
 
 def test_flip_action_rejects_bad_indices():
-    from muzero.encoding import flip_action, mirror_action
-
     for bad in (-1, 8100):
         with pytest.raises(ValueError):
             flip_action(bad)
         with pytest.raises(ValueError):
             mirror_action(bad)
+    # an out-of-range element anywhere in an array is rejected too
+    with pytest.raises(ValueError):
+        flip_action(np.array([0, -1, 50]))
+    with pytest.raises(ValueError):
+        mirror_action(np.array([0, -1, 50]))
+    # non-integer input is a TypeError, not silent truncation
+    with pytest.raises(TypeError):
+        flip_action(np.array([1.5]))
+    with pytest.raises(TypeError):
+        mirror_action(np.array([1.5]))
 
 
 def test_flip_board_involution_and_color_swap():
-    from muzero.encoding import flip_board, mirror_board
-
     board = _start_board()
     # the start position is vertically AND horizontally symmetric at the
     # piece-type level (raw ids differ left-right, e.g. rook id 8 vs 9,
