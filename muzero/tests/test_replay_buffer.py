@@ -3,7 +3,7 @@ from dataclasses import replace
 import numpy as np
 
 from muzero.config import MuZeroConfig
-from muzero.encoding import flip_action, move_to_index
+from muzero.encoding import flip_action, mirror_action, move_to_index
 from muzero.replay_buffer import GameHistory, ReplayBuffer
 
 
@@ -138,3 +138,36 @@ def test_make_target_material_is_mover_perspective():
     for k in range(cfg.unroll_steps + 1):
         expected = 0.9 if g.to_play_history[k] == "w" else -0.9
         assert tgt["target_material"][k] == np.float32(expected)
+
+
+def test_make_target_mirror_consistency():
+    cfg = replace(MuZeroConfig(), unroll_steps=4, td_steps=2)
+    buf = ReplayBuffer(cfg)
+    g = make_alternating_game(length=6)
+    buf.rng = np.random.default_rng(7)
+    plain = buf.make_target(g, 0, mirror=False)
+    buf.rng = np.random.default_rng(7)  # same k_c draw for both calls
+    mirrored = buf.make_target(g, 0, mirror=True)
+    # observations mirror along the column axis, plane-for-plane
+    np.testing.assert_array_equal(mirrored["obs"], plain["obs"][:, :, ::-1])
+    np.testing.assert_array_equal(
+        mirrored["consistency_obs"], plain["consistency_obs"][:, :, ::-1]
+    )
+    # every action / policy target mirrors with the boards, never without
+    for k in range(cfg.unroll_steps):
+        assert mirrored["actions"][k] == mirror_action(int(plain["actions"][k]))
+        assert int(np.argmax(mirrored["target_policy"][k])) == mirror_action(
+            int(np.argmax(plain["target_policy"][k]))
+        )
+    # frame-independent targets are identical
+    np.testing.assert_array_equal(mirrored["target_value"], plain["target_value"])
+    np.testing.assert_array_equal(mirrored["target_material"], plain["target_material"])
+
+
+def test_make_target_default_draws_mirror_from_seeded_rng():
+    cfg = replace(MuZeroConfig(), unroll_steps=4, td_steps=2)
+    g = make_alternating_game(length=6)
+    buf_a, buf_b = ReplayBuffer(cfg), ReplayBuffer(cfg)
+    a = buf_a.make_target(g, 0)
+    b = buf_b.make_target(g, 0)
+    np.testing.assert_array_equal(a["obs"], b["obs"])  # same seed -> same draw
