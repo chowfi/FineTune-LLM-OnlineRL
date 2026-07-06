@@ -23,6 +23,10 @@ body {
   min-height: 100vh;
 }
 
+.hidden {
+  display: none;
+}
+
 .top-bar {
   text-align: center;
   padding: 1rem;
