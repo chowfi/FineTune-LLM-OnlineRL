@@ -1,15 +1,43 @@
 # Xiangqi Play UI
 
-Local web app: **you (Red)** vs **ep_40 LoRA policy (Black)**.
+Local web app with two opponents:
+
+- **LLM engine** (default): you (Red) vs the ep_40 LoRA policy (Black).
+- **MuZero engine** (`--engine muzero`): you as **either color** vs the
+  canonical MuZero checkpoint — CPU-friendly, so training can keep running.
 
 ## Requirements
 
 - `PIKAFISH_BIN` pointing at Pikafish (same as training)
-- NVIDIA GPU with ~16GB+ VRAM recommended (default). CPU works but is very slow.
-- Stop other GPU jobs (e.g. training) before starting the play server.
+- LLM mode: NVIDIA GPU with ~16GB+ VRAM recommended; stop other GPU jobs first.
+- MuZero mode: any CPU is fine (no GPU needed, no 7B load).
 - `uv sync --group web`
 
-## Run
+## Play vs MuZero (either color, CPU-friendly)
+
+```bash
+export PIKAFISH_BIN=/path/to/pikafish
+uv run --group web python scripts/serve_xiangqi_play.py --engine muzero
+```
+
+- Uses `checkpoints/muzero_xiangqi/latest.pt` by default (`--ckpt` to
+  override); runs on CPU by default so training can keep going. Old
+  pre-canonicalization (115-plane) checkpoints are rejected at startup.
+- Pick **Red or Black** next to "New game" — as Black, the model moves first
+  automatically.
+- Full training strength (800 simulations): expect ~5–20 s of thinking per
+  move on a laptop CPU. Startup takes seconds (no 7B load).
+- The training-time hopeless-position auto-adjudication is disabled — you
+  always get to finish (or attempt to save) a game. Repetition draws and the
+  300-ply cap still apply.
+- On a Mac: install a macOS Pikafish build, set `PIKAFISH_BIN`, and copy the
+  checkpoint over:
+
+  ```bash
+  scp <box>:~/Documents/FineTune-LLM-OnlineRL/checkpoints/muzero_xiangqi/latest.pt checkpoints/muzero_xiangqi/
+  ```
+
+## Run (LLM engine)
 
 ```bash
 export PIKAFISH_BIN=/home/fchow/bin/pikafish   # adjust path
