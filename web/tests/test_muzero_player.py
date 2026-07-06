@@ -63,3 +63,17 @@ def test_incompatible_checkpoint_raises_actionable_error(tmp_path):
     torch.save({"ally": {}}, ckpt)  # empty state dict -> load_state_dict fails
     with pytest.raises(RuntimeError, match="Incompatible"):
         MuZeroPlayer(str(ckpt), config=tiny_cfg())
+
+
+def test_num_simulations_override_does_not_mutate_caller_config(tmp_path):
+    cfg = tiny_cfg()
+    player = build_player(tmp_path, cfg)  # build_player passes config=cfg
+    assert player.cfg is not cfg  # defensive copy
+    p2_cfg_sims_before = cfg.num_simulations
+    torch.manual_seed(0)
+    net = MuZeroNet(cfg)
+    ckpt = tmp_path / "latest2.pt"
+    torch.save({"ally": net.state_dict()}, ckpt)
+    p2 = MuZeroPlayer(str(ckpt), device="cpu", num_simulations=2, config=cfg)
+    assert p2.cfg.num_simulations == 2
+    assert cfg.num_simulations == p2_cfg_sims_before  # caller cfg unmutated
