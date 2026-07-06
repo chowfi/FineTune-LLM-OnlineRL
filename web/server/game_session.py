@@ -81,6 +81,8 @@ def _winner_from_rewards(ally_reward: float, enemy_reward: float) -> Optional[st
 
 
 class GameSession:
+    engine_kind = "llm"
+
     def __init__(
         self,
         pikafish: PikafishEvaluator,

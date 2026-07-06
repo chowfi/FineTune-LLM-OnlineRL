@@ -33,8 +33,8 @@ if TYPE_CHECKING:
 
 _STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
 
-_session: "Optional[GameSession | MuZeroGameSession]" = None
-_engine: "Optional[EnginePlayer]" = None
+_session: Optional[GameSession | MuZeroGameSession] = None
+_engine: Optional[EnginePlayer] = None
 
 
 class MoveRequest(BaseModel):
@@ -105,14 +105,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Xiangqi Play", lifespan=lifespan)
 
 
-def _require_session() -> "GameSession | MuZeroGameSession":
+def _require_session() -> GameSession | MuZeroGameSession:
     if _session is None:
         raise HTTPException(503, "Game session not initialized")
     return _session
 
 
 def _play_error(
-    status: int, message: str, session: "GameSession | MuZeroGameSession"
+    status: int, message: str, session: GameSession | MuZeroGameSession
 ) -> None:
     snap = session.snapshot()
     detail = {
