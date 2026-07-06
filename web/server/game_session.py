@@ -10,6 +10,7 @@ import gym_xiangqi  # noqa: F401
 import numpy as np
 
 from src.pikafish_eval import PikafishEvaluator
+from web.server.board_view import board_grid
 from web.server.engine_player import EnginePlayer
 from web.server.flip_utils import action_to_algebraic
 from web.server.greedy_agent import pick_greedy_ally_move
@@ -22,25 +23,6 @@ from src.xiangqi_board import (
 )
 
 AllyMode = Literal["human", "greedy"]
-
-_PIECE_FEN = {
-    1: "k",
-    2: "a",
-    3: "a",
-    4: "b",
-    5: "b",
-    6: "n",
-    7: "n",
-    8: "r",
-    9: "r",
-    10: "c",
-    11: "c",
-    12: "p",
-    13: "p",
-    14: "p",
-    15: "p",
-    16: "p",
-}
 
 
 def _mask_actions_from_pikafish(
@@ -89,21 +71,6 @@ def _algebraic_legals_for_side(
     attr = "ally_actions" if ally else "enemy_actions"
     actions = np.where(getattr(env, attr) == 1)[0]
     return [action_to_algebraic(int(a)) for a in actions]
-
-
-def _board_grid(state: np.ndarray) -> List[List[str]]:
-    rows: List[List[str]] = []
-    for row in state:
-        cells: List[str] = []
-        for cell in row:
-            val = int(cell)
-            if val == 0:
-                cells.append(".")
-            else:
-                base = _PIECE_FEN.get(abs(val), "?")
-                cells.append(base.upper() if val > 0 else base)
-        rows.append(cells)
-    return rows
 
 
 def _winner_from_rewards(ally_reward: float, enemy_reward: float) -> Optional[str]:
@@ -162,7 +129,7 @@ class GameSession:
             turn = "none"
 
         return {
-            "board": _board_grid(self.env.state),
+            "board": board_grid(self.env.state),
             "graphic": board_to_graphic(self.env.state),
             "fen": board_to_fen(self.env.state),
             "allyMode": self.ally_mode,
@@ -173,6 +140,8 @@ class GameSession:
             "lastAllyMove": self.last_ally_move,
             "lastEngineMove": self.last_engine_move,
             "engineThinking": self.engine_thinking,
+            "engineKind": "llm",
+            "humanSide": "red",
         }
 
     def legal_targets_from(self, from_sq: str) -> List[str]:
