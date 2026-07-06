@@ -3,23 +3,36 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Xiangqi — Play vs ep_40 Engine</title>
+  <title>Xiangqi — Play</title>
   <link rel="stylesheet" href="/static/board.css" />
 </head>
 <body>
   <header class="top-bar">
     <h1>Chinese Chess</h1>
-    <p class="subtitle">Red (ally) vs Black (ep_40 engine)</p>
+    <p class="subtitle" id="subtitle">Loading…</p>
     <div class="controls">
-      <span>Red ally:</span>
-      <label class="mode-label">
-        <input type="radio" name="ally-mode" value="human" checked />
-        Human (click moves)
-      </label>
-      <label class="mode-label">
-        <input type="radio" name="ally-mode" value="greedy" />
-        Greedy agent (ε=0)
-      </label>
+      <span id="ally-controls">
+        <span>Red ally:</span>
+        <label class="mode-label">
+          <input type="radio" name="ally-mode" value="human" checked />
+          Human (click moves)
+        </label>
+        <label class="mode-label">
+          <input type="radio" name="ally-mode" value="greedy" />
+          Greedy agent (ε=0)
+        </label>
+      </span>
+      <span id="side-controls" class="hidden">
+        <span>You play:</span>
+        <label class="mode-label">
+          <input type="radio" name="human-side" value="red" checked />
+          Red
+        </label>
+        <label class="mode-label">
+          <input type="radio" name="human-side" value="black" />
+          Black
+        </label>
+      </span>
       <button type="button" id="btn-new-game" class="btn">New game</button>
     </div>
   </header>

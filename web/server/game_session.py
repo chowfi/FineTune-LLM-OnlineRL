@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import gym
@@ -10,6 +9,7 @@ import gym_xiangqi  # noqa: F401
 import numpy as np
 
 from src.pikafish_eval import PikafishEvaluator
+from web.server.board_view import board_grid
 from web.server.engine_player import EnginePlayer
 from web.server.flip_utils import action_to_algebraic
 from web.server.greedy_agent import pick_greedy_ally_move
@@ -22,25 +22,6 @@ from src.xiangqi_board import (
 )
 
 AllyMode = Literal["human", "greedy"]
-
-_PIECE_FEN = {
-    1: "k",
-    2: "a",
-    3: "a",
-    4: "b",
-    5: "b",
-    6: "n",
-    7: "n",
-    8: "r",
-    9: "r",
-    10: "c",
-    11: "c",
-    12: "p",
-    13: "p",
-    14: "p",
-    15: "p",
-    16: "p",
-}
 
 
 def _mask_actions_from_pikafish(
@@ -91,21 +72,6 @@ def _algebraic_legals_for_side(
     return [action_to_algebraic(int(a)) for a in actions]
 
 
-def _board_grid(state: np.ndarray) -> List[List[str]]:
-    rows: List[List[str]] = []
-    for row in state:
-        cells: List[str] = []
-        for cell in row:
-            val = int(cell)
-            if val == 0:
-                cells.append(".")
-            else:
-                base = _PIECE_FEN.get(abs(val), "?")
-                cells.append(base.upper() if val > 0 else base)
-        rows.append(cells)
-    return rows
-
-
 def _winner_from_rewards(ally_reward: float, enemy_reward: float) -> Optional[str]:
     if ally_reward >= 100:
         return "red"
@@ -115,6 +81,8 @@ def _winner_from_rewards(ally_reward: float, enemy_reward: float) -> Optional[st
 
 
 class GameSession:
+    engine_kind = "llm"
+
     def __init__(
         self,
         pikafish: PikafishEvaluator,
@@ -162,7 +130,7 @@ class GameSession:
             turn = "none"
 
         return {
-            "board": _board_grid(self.env.state),
+            "board": board_grid(self.env.state),
             "graphic": board_to_graphic(self.env.state),
             "fen": board_to_fen(self.env.state),
             "allyMode": self.ally_mode,
@@ -173,6 +141,10 @@ class GameSession:
             "lastAllyMove": self.last_ally_move,
             "lastEngineMove": self.last_engine_move,
             "engineThinking": self.engine_thinking,
+            # Fixed session metadata for the UI (not derived from ally_mode):
+            # the LLM session always seats the ally as Red.
+            "engineKind": "llm",
+            "humanSide": "red",
         }
 
     def legal_targets_from(self, from_sq: str) -> List[str]:
@@ -295,16 +267,3 @@ class GameSession:
             self.engine_thinking = False
 
         return self.snapshot(), None
-
-
-def build_pikafish() -> PikafishEvaluator:
-    binary = os.environ.get("PIKAFISH_BIN", "").strip()
-    if not binary:
-        raise RuntimeError(
-            "Set PIKAFISH_BIN to your Pikafish executable, e.g. "
-            "export PIKAFISH_BIN=/home/fchow/bin/pikafish"
-        )
-    eng = PikafishEvaluator(binary, depth=8, movetime_ms=200, verbose=False)
-    if not eng.enabled:
-        raise RuntimeError(f"Pikafish failed to start: {binary}")
-    return eng

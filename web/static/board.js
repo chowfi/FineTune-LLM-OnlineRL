@@ -67,14 +67,47 @@ function allyMode() {
   return state?.allyMode || "human";
 }
 
+function humanSide() {
+  return state?.humanSide || "red";
+}
+
+function engineKind() {
+  return state?.engineKind || "llm";
+}
+
+function isHumanPiece(ch, isRed) {
+  if (ch === ".") return false;
+  return humanSide() === "red" ? isRed : !isRed;
+}
+
+function selectedHumanSide() {
+  const el = document.querySelector('input[name="human-side"]:checked');
+  return el ? el.value : "red";
+}
+
+function applyEngineKindUI() {
+  const kind = engineKind();
+  const sideCtl = document.getElementById("side-controls");
+  const allyCtl = document.getElementById("ally-controls");
+  if (sideCtl) sideCtl.classList.toggle("hidden", kind !== "muzero");
+  if (allyCtl) allyCtl.classList.toggle("hidden", kind === "muzero");
+  const sub = document.getElementById("subtitle");
+  if (sub) {
+    sub.textContent =
+      kind === "muzero"
+        ? "Human vs MuZero (canonical net, full-strength search)"
+        : "Red (ally) vs Black (ep_40 engine)";
+  }
+}
+
 function formatApiError(path, status, detail, rawText) {
   if (detail && typeof detail === "object" && detail.message) {
     const parts = [
       `${path} → ${status}: ${detail.message}`,
       detail.turn != null ? `turn=${detail.turn}` : null,
       detail.sideToMove != null ? `sideToMove=${detail.sideToMove}` : null,
-      detail.lastAllyMove ? `lastRed=${detail.lastAllyMove}` : null,
-      detail.lastEngineMove ? `lastBlack=${detail.lastEngineMove}` : null,
+      detail.lastAllyMove ? `lastHuman=${detail.lastAllyMove}` : null,
+      detail.lastEngineMove ? `lastEngine=${detail.lastEngineMove}` : null,
     ].filter(Boolean);
     return parts.join(" · ");
   }
@@ -202,7 +235,10 @@ function updateStatus() {
     return;
   }
   if (state.turn === "human") {
-    statusEl.textContent = "Your turn — click a Red piece";
+    statusEl.textContent =
+      humanSide() === "red"
+        ? "Your turn — click a Red piece"
+        : "Your turn — click a Black piece";
   } else if (state.turn === "greedy") {
     statusEl.textContent = "Greedy ally playing…";
   } else if (state.turn === "engine") {
@@ -289,7 +325,7 @@ function renderBoard() {
       btn.dataset.col = String(col);
       positionIntersection(btn, row, col);
 
-      if (humanTurn && isRed) btn.classList.add("selectable");
+      if (humanTurn && isHumanPiece(ch, isRed)) btn.classList.add("selectable");
       if (selectedFrom === coord) btn.classList.add("selected");
       const isLegalTarget = selectedFrom && legalTargets.includes(coord);
       if (isLegalTarget) {
@@ -344,10 +380,12 @@ async function runEngineMove(gen) {
   }, 1000);
 
   try {
-    state = await postWithRetry("/api/engine/move", null, {
+    const next = await postWithRetry("/api/engine/move", null, {
       gen,
       timeoutMs: ENGINE_FETCH_TIMEOUT_MS,
     });
+    if (!isActive(gen)) return false;
+    state = next;
     clearError();
     return true;
   } finally {
@@ -475,7 +513,7 @@ async function onIntersectionClick(row, col, ch, isRed) {
     return;
   }
 
-  if (!isRed || ch === ".") {
+  if (!isHumanPiece(ch, isRed)) {
     selectedFrom = null;
     legalTargets = [];
     renderBoard();
@@ -512,14 +550,23 @@ async function newGame() {
   overlayEl.classList.add("hidden");
 
   const mode = selectedAllyMode();
+  const side = selectedHumanSide();
   state = await postWithRetry(
     "/api/game/new",
-    { allyMode: mode },
+    { allyMode: mode, humanSide: side },
     { gen, timeoutMs: 30000 }
   );
+  applyEngineKindUI();
   refresh();
 
-  if (mode === "greedy" && !state.gameOver && isActive(gen)) {
+  if (!state.gameOver && state.turn === "engine" && isActive(gen)) {
+    try {
+      await runEngineMove(gen); // human plays Black: model (Red) opens
+    } catch (e) {
+      showError(e.message);
+    }
+  }
+  if (mode === "greedy" && allyMode() === "greedy" && !state.gameOver && isActive(gen)) {
     await runGreedyGameLoop(gen, { firstPlies: true });
   }
 }
@@ -534,9 +581,13 @@ if (btnRetry) {
 async function init() {
   try {
     await syncState();
+    applyEngineKindUI();
     const mode = state.allyMode || "human";
     allyModeInputs.forEach((inp) => {
       inp.checked = inp.value === mode;
+    });
+    document.querySelectorAll('input[name="human-side"]').forEach((inp) => {
+      inp.checked = inp.value === humanSide();
     });
     refresh();
     // Do not auto-start greedy on page load (prevents duplicate loops vs New game).
