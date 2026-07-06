@@ -6,6 +6,7 @@ the model's move, whichever color each is playing."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from muzero.config import MuZeroConfig
@@ -33,10 +34,14 @@ class MuZeroGameSession:
         player: Optional[MuZeroPlayer],
         config: Optional[MuZeroConfig] = None,
     ):
-        cfg = config or MuZeroConfig()
         # Humans get to finish (or save) lost games: disable the training-time
         # hopeless-cp auto-adjudication. Repetition draws + ply cap remain.
-        cfg.truncation_consecutive = 10**9
+        # replace() copies, so a caller-shared config is never mutated.
+        cfg = (
+            replace(config, truncation_consecutive=10**9)
+            if config
+            else MuZeroConfig(truncation_consecutive=10**9)
+        )
         self.cfg = cfg
         self.pikafish = pikafish
         self.player = player
@@ -46,6 +51,8 @@ class MuZeroGameSession:
         self.winner: Optional[str] = None
         self.last_ally_move: Optional[str] = None  # human's last move
         self.last_engine_move: Optional[str] = None  # model's last move
+        # Kept for snapshot parity with GameSession; under the current
+        # sync-in-async runtime it is never observably True from /api/state.
         self.engine_thinking = False
         self.reset(human_side="red")
 
@@ -120,7 +127,13 @@ class MuZeroGameSession:
             return self.snapshot(), "MuZero engine not loaded"
         self.engine_thinking = True
         try:
-            move = self.player.choose_move(self.env)
+            try:
+                move = self.player.choose_move(self.env)
+            except Exception as exc:  # noqa: BLE001 — surfaced to the UI as a 400
+                # Clear before snapshotting: a return expression is evaluated
+                # before `finally` runs, so the flag must be reset here.
+                self.engine_thinking = False
+                return self.snapshot(), f"Engine error: {exc}"
             if move not in self.env.legal_moves():
                 return self.snapshot(), f"Engine produced illegal move {move!r}"
             self.env.step(move)
