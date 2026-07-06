@@ -177,7 +177,7 @@ async def ally_greedy() -> Dict[str, Any]:
 
 @app.post("/api/engine/move")
 async def engine_move() -> Dict[str, Any]:
-    """Apply one engine (Black) move."""
+    """Apply one engine move (Black in LLM mode; either color in MuZero mode)."""
     sess = _require_session()
     snap, err = sess.apply_engine_move()
     if err:

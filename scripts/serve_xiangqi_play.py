@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the local Xiangqi play web server (human Red vs LoRA engine)."""
+"""Run the local Xiangqi play web server (LLM or MuZero opponent)."""
 
 from __future__ import annotations
 

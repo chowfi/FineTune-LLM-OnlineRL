@@ -135,6 +135,7 @@ class MuZeroGameSession:
                 self.engine_thinking = False
                 return self.snapshot(), f"Engine error: {exc}"
             if move not in self.env.legal_moves():
+                self.engine_thinking = False  # snapshot below runs pre-finally
                 return self.snapshot(), f"Engine produced illegal move {move!r}"
             self.env.step(move)
             self.last_engine_move = move
