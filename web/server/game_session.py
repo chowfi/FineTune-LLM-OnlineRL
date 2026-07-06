@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import gym
@@ -266,16 +265,3 @@ class GameSession:
             self.engine_thinking = False
 
         return self.snapshot(), None
-
-
-def build_pikafish() -> PikafishEvaluator:
-    binary = os.environ.get("PIKAFISH_BIN", "").strip()
-    if not binary:
-        raise RuntimeError(
-            "Set PIKAFISH_BIN to your Pikafish executable, e.g. "
-            "export PIKAFISH_BIN=/home/fchow/bin/pikafish"
-        )
-    eng = PikafishEvaluator(binary, depth=8, movetime_ms=200, verbose=False)
-    if not eng.enabled:
-        raise RuntimeError(f"Pikafish failed to start: {binary}")
-    return eng

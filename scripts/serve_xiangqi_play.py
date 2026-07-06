@@ -23,18 +23,33 @@ def main() -> None:
     )
     ap.add_argument(
         "--device",
-        default="cuda",
-        help="Engine device: cuda (default), cpu, or cuda:0",
+        default=None,
+        help="cuda/cpu; default: cuda for llm, cpu for muzero",
     )
     ap.add_argument(
         "--skip-engine",
         action="store_true",
         help="Start without loading the 7B model (human moves only)",
     )
+    ap.add_argument(
+        "--engine",
+        choices=["llm", "muzero"],
+        default="llm",
+        help="Opponent: llm (7B LoRA, default) or muzero (canonical checkpoint)",
+    )
+    ap.add_argument(
+        "--ckpt",
+        default=os.path.join(_ROOT, "checkpoints/muzero_xiangqi/latest.pt"),
+        help="MuZero checkpoint path (muzero mode only)",
+    )
     args = ap.parse_args()
 
     os.environ["XIANGQI_PLAY_ADAPTER"] = args.adapter
-    os.environ["XIANGQI_PLAY_DEVICE"] = args.device
+    os.environ["XIANGQI_PLAY_ENGINE"] = args.engine
+    os.environ["XIANGQI_MUZERO_CKPT"] = args.ckpt
+    os.environ["XIANGQI_PLAY_DEVICE"] = args.device or (
+        "cpu" if args.engine == "muzero" else "cuda"
+    )
     if args.skip_engine:
         os.environ["XIANGQI_PLAY_SKIP_ENGINE"] = "1"
 
