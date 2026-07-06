@@ -106,8 +106,8 @@ function formatApiError(path, status, detail, rawText) {
       `${path} → ${status}: ${detail.message}`,
       detail.turn != null ? `turn=${detail.turn}` : null,
       detail.sideToMove != null ? `sideToMove=${detail.sideToMove}` : null,
-      detail.lastAllyMove ? `lastRed=${detail.lastAllyMove}` : null,
-      detail.lastEngineMove ? `lastBlack=${detail.lastEngineMove}` : null,
+      detail.lastAllyMove ? `lastHuman=${detail.lastAllyMove}` : null,
+      detail.lastEngineMove ? `lastEngine=${detail.lastEngineMove}` : null,
     ].filter(Boolean);
     return parts.join(" · ");
   }
@@ -380,10 +380,12 @@ async function runEngineMove(gen) {
   }, 1000);
 
   try {
-    state = await postWithRetry("/api/engine/move", null, {
+    const next = await postWithRetry("/api/engine/move", null, {
       gen,
       timeoutMs: ENGINE_FETCH_TIMEOUT_MS,
     });
+    if (!isActive(gen)) return false;
+    state = next;
     clearError();
     return true;
   } finally {
@@ -558,7 +560,11 @@ async function newGame() {
   refresh();
 
   if (!state.gameOver && state.turn === "engine" && isActive(gen)) {
-    await runEngineMove(gen); // human plays Black: model (Red) opens
+    try {
+      await runEngineMove(gen); // human plays Black: model (Red) opens
+    } catch (e) {
+      showError(e.message);
+    }
   }
   if (mode === "greedy" && allyMode() === "greedy" && !state.gameOver && isActive(gen)) {
     await runGreedyGameLoop(gen, { firstPlies: true });
@@ -579,6 +585,9 @@ async function init() {
     const mode = state.allyMode || "human";
     allyModeInputs.forEach((inp) => {
       inp.checked = inp.value === mode;
+    });
+    document.querySelectorAll('input[name="human-side"]').forEach((inp) => {
+      inp.checked = inp.value === humanSide();
     });
     refresh();
     // Do not auto-start greedy on page load (prevents duplicate loops vs New game).
