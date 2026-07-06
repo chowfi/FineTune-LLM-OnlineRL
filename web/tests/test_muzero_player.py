@@ -10,8 +10,7 @@ from web.server.muzero_player import MuZeroPlayer
 
 
 def tiny_cfg(**over):
-    return replace(
-        MuZeroConfig(),
+    defaults = dict(
         channels=16,
         repr_blocks=1,
         dyn_blocks=1,
@@ -19,8 +18,9 @@ def tiny_cfg(**over):
         interior_topk=4,
         max_game_plies=4,
         device="cpu",
-        **over,
     )
+    defaults.update(over)
+    return replace(MuZeroConfig(), **defaults)
 
 
 def build_player(tmp_path, cfg):
