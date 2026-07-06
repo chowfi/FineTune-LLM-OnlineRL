@@ -6,6 +6,8 @@ from typing import List
 
 import numpy as np
 
+# gym_xiangqi piece ids (abs value) -> FEN letter:
+# 1=king, 2/3=advisor, 4/5=elephant, 6/7=horse, 8/9=rook, 10/11=cannon, 12-16=pawn
 PIECE_FEN = {
     1: "k",
     2: "a",

@@ -140,6 +140,8 @@ class GameSession:
             "lastAllyMove": self.last_ally_move,
             "lastEngineMove": self.last_engine_move,
             "engineThinking": self.engine_thinking,
+            # Fixed session metadata for the UI (not derived from ally_mode):
+            # the LLM session always seats the ally as Red.
             "engineKind": "llm",
             "humanSide": "red",
         }
