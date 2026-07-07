@@ -186,18 +186,27 @@ def _run_gate_rung(cfg: MuZeroConfig, runner, evaluator, opponent_move) -> tuple
 
 
 def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
-    """Gate ladder: uniform-random legal mover, then raw Pikafish at gate
-    movetime. The random rung resolves early progress (a net that has
-    learned anything should be near 1.0); the Pikafish rung stays ~0 until
-    the net is enormously stronger."""
+    """Gate ladder: uniform-random legal mover, then a capture-greedy
+    heuristic mover, then raw Pikafish at gate movetime. The random rung
+    resolves early progress (a net that has learned anything should be near
+    1.0); the capture-greedy rung is a mid-ladder rung between random and
+    the engine; the Pikafish rung stays ~0 until the net is enormously
+    stronger."""
+    from muzero.gate_opponents import greedy_capture_move
     from muzero.warmstart import SimpleUciEngine
     from src.xiangqi_board import engine_uci_to_algebraic
 
     rng = np.random.default_rng(cfg.seed)
+    # Separate generator so adding the greedy rung does not perturb the
+    # random rung's historical move sequence.
+    greedy_rng = np.random.default_rng(cfg.seed + 1)
 
     def random_move(env):
         moves = env.legal_moves()
         return str(rng.choice(moves)) if moves else None
+
+    def greedy_move(env):
+        return greedy_capture_move(env, greedy_rng)
 
     engine = SimpleUciEngine(cfg.pikafish_bin, cfg.gate_movetime_ms, multipv=1)
 
@@ -210,6 +219,7 @@ def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
     n = cfg.gate_games
     try:
         rand_wins, rand_draws = _run_gate_rung(cfg, runner, evaluator, random_move)
+        greedy_wins, greedy_draws = _run_gate_rung(cfg, runner, evaluator, greedy_move)
         pika_wins, pika_draws = _run_gate_rung(cfg, runner, evaluator, engine_move)
     finally:
         engine.close()
@@ -217,6 +227,9 @@ def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
         "gate/win_rate_random": rand_wins / n,
         "gate/draw_rate_random": rand_draws / n,
         "gate/loss_rate_random": (n - rand_wins - rand_draws) / n,
+        "gate/win_rate_greedy": greedy_wins / n,
+        "gate/draw_rate_greedy": greedy_draws / n,
+        "gate/loss_rate_greedy": (n - greedy_wins - greedy_draws) / n,
         "gate/win_rate": pika_wins / n,
         "gate/draw_rate": pika_draws / n,
         "gate/loss_rate": (n - pika_wins - pika_draws) / n,

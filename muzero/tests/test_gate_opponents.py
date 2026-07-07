@@ -96,3 +96,43 @@ def test_king_capture_outranks_everything():
     moves = ["e4a4", "e4i4"]
     rng = np.random.default_rng(0)
     assert greedy_capture_move(StubEnv(board, moves), rng) == "e4i4"
+
+
+def test_gate_rung_plays_greedy_without_engine(tmp_path):
+    """_run_gate_rung + greedy opponent runs on FakeEvaluator (no Pikafish)."""
+    import torch
+    from dataclasses import replace
+
+    from muzero.config import MuZeroConfig
+    from muzero.mcts import NetRunner
+    from muzero.network import MuZeroNet
+    from muzero.tests.helpers import FakeEvaluator
+    from muzero.train import _run_gate_rung
+
+    cfg = replace(
+        MuZeroConfig(),
+        channels=16,
+        repr_blocks=1,
+        dyn_blocks=1,
+        num_simulations=4,
+        interior_topk=4,
+        gate_games=2,
+        max_game_plies=2,
+        device="cpu",
+    )
+    torch.manual_seed(0)
+    runner = NetRunner(MuZeroNet(cfg), "cpu")
+
+    def legal(fen):
+        stm = fen.split()[1]
+        return ["a3a4"] if stm == "w" else ["i6i5"]
+
+    evaluator = FakeEvaluator(cp_fn=lambda fen: 0.0, legal_fn=legal)
+    rng = np.random.default_rng(0)
+
+    def greedy(env):
+        return greedy_capture_move(env, rng)
+
+    wins, draws = _run_gate_rung(cfg, runner, evaluator, greedy)
+    assert 0 <= wins + draws <= cfg.gate_games  # both 2-ply games complete
+    assert draws == 2  # max_game_plies=2 -> both games drawn at the cap
