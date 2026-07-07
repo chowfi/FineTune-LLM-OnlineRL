@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+import pytest
 import torch
 
 from muzero.arena import (
@@ -50,8 +51,14 @@ def test_discover_checkpoints_sorts_by_iteration(tmp_path):
     save_tiny(archive, "iter_0020.pt", 20, seed=2)
     extra = save_tiny(tmp_path, "iter80-prebufferfix.pt", 81, seed=3)
     found = discover_checkpoints(str(archive), extras=[str(extra)])
-    assert [c.label for c in found] == ["iter_0020", "iter_0040", "iter80-prebufferfix"]
+    assert [c.label for c in found] == ["iter_0020", "iter_0040", "iter_0081"]
     assert [c.iteration for c in found] == [20, 40, 81]
+    # an extra with the same iteration as an archive file is the same
+    # weights by construction — deduped, archive entry kept
+    dup = save_tiny(tmp_path, "latest.pt", 40, seed=4)
+    found = discover_checkpoints(str(archive), extras=[str(dup)])
+    assert [c.iteration for c in found] == [20, 40]
+    assert found[-1].path.endswith("iter_0040.pt")
 
 
 def test_games_needed_respects_existing_rows():
@@ -83,6 +90,27 @@ def test_play_pair_writes_valid_rows(tmp_path):
         assert r["sims"] == cfg.num_simulations
     # max_game_plies=2 forces draws in this stub world
     assert all(r["result"] == "draw" for r in rows)
+
+
+def test_play_pair_start_offset_advances_openings(tmp_path):
+    a = save_tiny(tmp_path, "iter_0020.pt", 20, seed=1)
+    b = save_tiny(tmp_path, "iter_0040.pt", 40, seed=2)
+    cfg = tiny_cfg()
+    first = play_pair(
+        cfg, fake_evaluator(), ("a", str(a)), ("b", str(b)), n_games=2, start=0
+    )
+    later = play_pair(
+        cfg, fake_evaluator(), ("a", str(a)), ("b", str(b)), n_games=2, start=2
+    )
+    assert {r["opening"] for r in first} != {r["opening"] for r in later}
+
+
+def test_dead_engine_raises_instead_of_fake_draw(tmp_path):
+    a = save_tiny(tmp_path, "iter_0020.pt", 20, seed=1)
+    b = save_tiny(tmp_path, "iter_0040.pt", 40, seed=2)
+    dead = FakeEvaluator(cp_fn=lambda fen: 0.0, legal_fn=lambda fen: [])
+    with pytest.raises(RuntimeError, match="no legal moves"):
+        play_pair(tiny_cfg(), dead, ("a", str(a)), ("b", str(b)), n_games=1)
 
 
 def test_fit_arena_elo_anchors_oldest_and_rates_winner_higher():
