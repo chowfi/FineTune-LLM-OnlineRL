@@ -68,6 +68,26 @@ def test_black_greedy_captures_red_pieces():
     assert greedy_capture_move(StubEnv(board, moves), rng) == "e5i5"
 
 
+def test_returns_plain_python_str():
+    board = empty_board()
+    board[4, 4] = 10
+    pick = greedy_capture_move(StubEnv(board, ["e4e5"]), np.random.default_rng(0))
+    assert type(pick) is str  # not np.str_ — callers compare/serialize these
+
+
+def test_seeded_rng_is_reproducible():
+    board = empty_board()
+    board[4, 4] = 10
+    board[4, 0] = -12
+    board[4, 8] = -13  # tied pawn captures -> rng actually consulted
+    moves = ["e4a4", "e4i4", "e4e5"]
+    rng_a = np.random.default_rng(42)
+    rng_b = np.random.default_rng(42)
+    seq_a = [greedy_capture_move(StubEnv(board, moves), rng_a) for _ in range(10)]
+    seq_b = [greedy_capture_move(StubEnv(board, moves), rng_b) for _ in range(10)]
+    assert seq_a == seq_b
+
+
 def test_king_capture_outranks_everything():
     board = empty_board()
     board[4, 4] = 10
