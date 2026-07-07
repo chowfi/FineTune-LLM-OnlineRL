@@ -192,10 +192,13 @@ def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
     1.0); the capture-greedy rung is a mid-ladder rung between random and
     the engine; the Pikafish rung stays ~0 until the net is enormously
     stronger."""
+    import time
+
     from muzero.gate_opponents import greedy_capture_move
     from muzero.warmstart import SimpleUciEngine
     from src.xiangqi_board import engine_uci_to_algebraic
 
+    t0 = time.monotonic()
     rng = np.random.default_rng(cfg.seed)
     # Separate generator so adding the greedy rung does not perturb the
     # random rung's historical move sequence.
@@ -233,6 +236,7 @@ def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
         "gate/win_rate": pika_wins / n,
         "gate/draw_rate": pika_draws / n,
         "gate/loss_rate": (n - pika_wins - pika_draws) / n,
+        "gate/seconds": time.monotonic() - t0,
     }
 
 

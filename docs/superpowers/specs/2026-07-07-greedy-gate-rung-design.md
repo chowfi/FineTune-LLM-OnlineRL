@@ -52,8 +52,11 @@ def greedy_capture_move(env, rng) -> str | None
   sequence).
 - New metrics: `gate/win_rate_greedy`, `gate/draw_rate_greedy`,
   `gate/loss_rate_greedy`. Existing keys unchanged.
-- Cost: +`gate_games` (20) games per gate, opponent moves are engine-free
-  (legality lookups only) — a few extra minutes every 10 iterations.
+- Cost: +`gate_games` (20) games per gate. The dominant cost of every rung
+  is the ALLY's own 800-sim search (~half the plies), so a third rung adds
+  ~50% to total gate time (~5% of overall training throughput at
+  `gate_every_loops=10`). Accepted trade — this rung is the primary
+  strength instrument. `gate/seconds` makes the cost observable.
 
 ### 2c. Rollout
 
