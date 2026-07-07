@@ -95,3 +95,31 @@ def test_load_checkpoint_without_enemy_key(tmp_path):
     assert ckpt["iteration"] == 7
     for pa, pe in zip(ally.parameters(), enemy.parameters()):
         assert torch.equal(pa, pe)  # enemy fell back to ally weights
+
+
+def test_maybe_archive_checkpoint(tmp_path):
+    from muzero.train import maybe_archive_checkpoint
+
+    cfg = replace(
+        MuZeroConfig(),
+        channels=16,
+        repr_blocks=1,
+        dyn_blocks=1,
+        device="cpu",
+        checkpoint_dir=str(tmp_path),
+        checkpoint_archive_every=20,
+    )
+    net = MuZeroNet(cfg)
+    assert maybe_archive_checkpoint(cfg, net, iteration=19) is None
+    path = maybe_archive_checkpoint(cfg, net, iteration=20)
+    assert path is not None and path.endswith("archive/iter_0020.pt")
+    ckpt = torch.load(path, map_location="cpu")
+    assert set(ckpt) == {"ally", "iteration"}
+    assert ckpt["iteration"] == 20
+    # disabled when the interval is 0
+    cfg0 = replace(cfg, checkpoint_archive_every=0)
+    assert maybe_archive_checkpoint(cfg0, net, iteration=20) is None
+    # existing archives are never overwritten (resume-from-older protection)
+    before = (tmp_path / "archive" / "iter_0020.pt").read_bytes()
+    assert maybe_archive_checkpoint(cfg, net, iteration=20) is None
+    assert (tmp_path / "archive" / "iter_0020.pt").read_bytes() == before

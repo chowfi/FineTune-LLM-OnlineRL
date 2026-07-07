@@ -111,9 +111,21 @@ This project fine-tunes a Large Language Model (specifically `Qwen/Qwen2.5-7B-In
   `buffer_games` is 1500 (~18 iterations at 84 games/loop; the original
   5000 left value targets ~28 iterations stale — see
   `docs/logs/2026-07-05-log-metrics-audit-and-buffer-fix.md`). The gate
-  is a two-rung ladder per `run_gate`: `gate/*_random` vs a
-  uniform-random legal mover (resolves early progress) and `gate/*` vs
-  raw Pikafish at `gate_movetime_ms`. Deferred §10 metrics needing extra
+  is a three-rung ladder per `run_gate` (2026-07-07): `gate/*_random` vs
+  a uniform-random legal mover, `gate/*_greedy` vs the capture-greedy
+  opponent in `gate_opponents.py` (the primary tactical-strength
+  instrument), and `gate/*` vs raw Pikafish at `gate_movetime_ms`;
+  `gate/seconds` records ladder cost (each rung is dominated by the
+  ally's own 800-sim search, so three rungs ≈ +50% gate time vs two).
+  **Strength over time:** `maybe_archive_checkpoint` saves ally-weights
+  snapshots to `checkpoints/muzero_xiangqi/archive/iter_NNNN.pt` every
+  `checkpoint_archive_every=20` iterations (never overwrites, non-fatal
+  on failure, ~90 MB each ≈ 2.5 GiB/week — no pruning yet); the offline
+  `python -m muzero.arena` plays adjacent archived checkpoints (openings
+  × colors, gate play path), accumulates `data/arena/games.jsonl`
+  (gitignored), and fits relative Elo via
+  `scripts/benchmark/elo_estimator.fit_ratings` (oldest anchored at 0,
+  `data/arena/ratings.json`; ±~80 Elo per 20-game step). Deferred §10 metrics needing extra
   engine calls or GPU introspection are tracked in `docs/AGENT_TODO.md`.
 
 ### 3d. Inference-only Elo bench (chess + xiangqi)

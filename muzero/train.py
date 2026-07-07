@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -186,18 +188,30 @@ def _run_gate_rung(cfg: MuZeroConfig, runner, evaluator, opponent_move) -> tuple
 
 
 def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
-    """Gate ladder: uniform-random legal mover, then raw Pikafish at gate
-    movetime. The random rung resolves early progress (a net that has
-    learned anything should be near 1.0); the Pikafish rung stays ~0 until
-    the net is enormously stronger."""
+    """Gate ladder: uniform-random legal mover, then a capture-greedy
+    heuristic mover, then raw Pikafish at gate movetime. The random rung
+    resolves early progress (a net that has learned anything should be near
+    1.0); the capture-greedy rung is a mid-ladder rung between random and
+    the engine; the Pikafish rung stays ~0 until the net is enormously
+    stronger."""
+    import time
+
+    from muzero.gate_opponents import greedy_capture_move
     from muzero.warmstart import SimpleUciEngine
     from src.xiangqi_board import engine_uci_to_algebraic
 
+    t0 = time.monotonic()
     rng = np.random.default_rng(cfg.seed)
+    # Separate generator so adding the greedy rung does not perturb the
+    # random rung's historical move sequence.
+    greedy_rng = np.random.default_rng(cfg.seed + 1)
 
     def random_move(env):
         moves = env.legal_moves()
         return str(rng.choice(moves)) if moves else None
+
+    def greedy_move(env):
+        return greedy_capture_move(env, greedy_rng)
 
     engine = SimpleUciEngine(cfg.pikafish_bin, cfg.gate_movetime_ms, multipv=1)
 
@@ -210,6 +224,7 @@ def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
     n = cfg.gate_games
     try:
         rand_wins, rand_draws = _run_gate_rung(cfg, runner, evaluator, random_move)
+        greedy_wins, greedy_draws = _run_gate_rung(cfg, runner, evaluator, greedy_move)
         pika_wins, pika_draws = _run_gate_rung(cfg, runner, evaluator, engine_move)
     finally:
         engine.close()
@@ -217,9 +232,13 @@ def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
         "gate/win_rate_random": rand_wins / n,
         "gate/draw_rate_random": rand_draws / n,
         "gate/loss_rate_random": (n - rand_wins - rand_draws) / n,
+        "gate/win_rate_greedy": greedy_wins / n,
+        "gate/draw_rate_greedy": greedy_draws / n,
+        "gate/loss_rate_greedy": (n - greedy_wins - greedy_draws) / n,
         "gate/win_rate": pika_wins / n,
         "gate/draw_rate": pika_draws / n,
         "gate/loss_rate": (n - pika_wins - pika_draws) / n,
+        "gate/seconds": time.monotonic() - t0,
     }
 
 
@@ -235,10 +254,27 @@ def load_checkpoint(path: str, ally, enemy, optimizer, device) -> dict:
     return ckpt
 
 
+def maybe_archive_checkpoint(cfg: MuZeroConfig, ally, iteration: int):
+    """Ally-weights-only snapshot for the Elo arena (spec 2026-07-07)."""
+    every = cfg.checkpoint_archive_every
+    if every <= 0 or iteration % every != 0:
+        return None
+    archive_dir = os.path.join(cfg.checkpoint_dir, "archive")
+    os.makedirs(archive_dir, exist_ok=True)
+    path = os.path.join(archive_dir, f"iter_{iteration:04d}.pt")
+    if os.path.exists(path):
+        # A resumed run is retracing archived iterations (e.g. rolled back
+        # to an older checkpoint) — keep the original snapshot.
+        return None
+    tmp = path + ".tmp"
+    torch.save({"ally": ally.state_dict(), "iteration": iteration}, tmp)
+    os.replace(tmp, path)
+    return path
+
+
 def main():
     import argparse
     import copy
-    import os
 
     from src.pikafish_eval import PikafishEvaluator
 
@@ -398,6 +434,12 @@ def main():
             ckpt_data["enemy"] = enemy.state_dict()
         torch.save(ckpt_data, tmp_path)
         os.replace(tmp_path, ckpt_path)
+        try:
+            archived = maybe_archive_checkpoint(cfg, ally, it + 1)
+            if archived:
+                print(f"[iter {it}] archived -> {archived}", flush=True)
+        except OSError as exc:
+            print(f"[iter {it}] archive failed (continuing): {exc}", flush=True)
 
 
 if __name__ == "__main__":

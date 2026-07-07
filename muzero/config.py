@@ -105,6 +105,9 @@ class MuZeroConfig:
     device: str = "cuda"
     seed: int = 0
     checkpoint_dir: str = "checkpoints/muzero_xiangqi"
+    # Every N iterations, also save a permanent ally-weights snapshot to
+    # checkpoint_dir/archive/iter_NNNN.pt for the Elo arena. 0 disables.
+    checkpoint_archive_every: int = 20
     wandb_project: str = "muzero-xiangqi"
 
     def __post_init__(self):

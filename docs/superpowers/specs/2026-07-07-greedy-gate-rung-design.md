@@ -47,13 +47,16 @@ def greedy_capture_move(env, rng) -> str | None
 
 - Add a third rung between random and Pikafish, reusing `_run_gate_rung`
   unchanged: opponent callable closes over a seeded rng
-  (`np.random.default_rng(cfg.seed)` — a separate generator from the random
-  rung's so adding the rung does not perturb the random rung's move
+  (`np.random.default_rng(cfg.seed + 1)` — a separate generator from the
+  random rung's so adding the rung does not perturb the random rung's move
   sequence).
 - New metrics: `gate/win_rate_greedy`, `gate/draw_rate_greedy`,
   `gate/loss_rate_greedy`. Existing keys unchanged.
-- Cost: +`gate_games` (20) games per gate, opponent moves are engine-free
-  (legality lookups only) — a few extra minutes every 10 iterations.
+- Cost: +`gate_games` (20) games per gate. The dominant cost of every rung
+  is the ALLY's own 800-sim search (~half the plies), so a third rung adds
+  ~50% to total gate time (~5% of overall training throughput at
+  `gate_every_loops=10`). Accepted trade — this rung is the primary
+  strength instrument. `gate/seconds` makes the cost observable.
 
 ### 2c. Rollout
 
