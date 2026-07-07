@@ -36,10 +36,15 @@ training loop (offline tool, run on demand); GUI.
 
 ### 2b. Arena (`muzero/arena.py`, run as `python -m muzero.arena`)
 
-- **Checkpoint discovery:** all `archive/iter_*.pt` files, sorted by
-  iteration, plus optional extra checkpoints via `--extra path[:label]`
-  (repeatable) so `iter80-prebufferfix.pt` and `latest.pt` can join the pool.
-  Player labels = `iter_0080`-style names.
+- **Checkpoint discovery:** all `archive/iter_*.pt` files, sorted
+  NUMERICALLY by iteration, plus optional extra checkpoints via `--extra
+  path` (repeatable) so `latest.pt` can join the pool. Extras are
+  auto-relabeled to canonical `iter_NNNN` from their embedded iteration
+  (prevents label drift when `latest.pt` changes between runs), and
+  same-iteration duplicates are deduped keeping the archive entry.
+  (As-built note: `iter80-prebufferfix.pt` is a PRE-canonicalization
+  115-plane checkpoint and cannot load — the curve starts with the
+  canonical run's own archives.)
 - **Pairing:** adjacent checkpoints only (sorted order) — linear cost, and
   the Bradley–Terry chain composes ratings transitively.
 - **Games per pair:** `--games-per-pair` (default 20) = the 10 book openings
@@ -53,11 +58,14 @@ training loop (offline tool, run on demand); GUI.
   (repetition draws, 300-ply cap, cp-adjudication ACTIVE as in training —
   arena games should end decisively like training games; requires
   `PIKAFISH_BIN` for legality/eval, same as the gate).
-- **Output:** appends per-game rows to
-  `data/arena/games.jsonl` (`{"white": label, "black": label, "result":
-  "white"|"black"|"draw", "sims": N, "timestamp": ...}`) so repeated runs
-  accumulate; skips pairs that already have `>= games-per-pair` recorded
-  games at the current sims (idempotent re-runs as the archive grows).
+- **Output:** appends per-game rows to `data/arena/games.jsonl`
+  (`{"white": label, "black": label, "result": "win"|"loss"|"draw"
+  (white-perspective, the elo_estimator convention), "sims": N,
+  "opening": engine-uci}`) so repeated runs accumulate; skips pairs that
+  already have `>= games-per-pair` recorded games at the current sims, and
+  top-ups continue the opening/color rotation where the file left off
+  (idempotent re-runs as the archive grows, no duplicated deterministic
+  games).
 - **Elo fit:** reuse `scripts/benchmark/elo_estimator.fit_ratings` (verify
   the result-string convention against `_result_signs` at implementation
   time), anchoring the OLDEST checkpoint at 0. Print a table
