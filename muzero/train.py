@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -252,10 +254,23 @@ def load_checkpoint(path: str, ally, enemy, optimizer, device) -> dict:
     return ckpt
 
 
+def maybe_archive_checkpoint(cfg: MuZeroConfig, ally, iteration: int):
+    """Ally-weights-only snapshot for the Elo arena (spec 2026-07-07)."""
+    every = cfg.checkpoint_archive_every
+    if every <= 0 or iteration % every != 0:
+        return None
+    archive_dir = os.path.join(cfg.checkpoint_dir, "archive")
+    os.makedirs(archive_dir, exist_ok=True)
+    path = os.path.join(archive_dir, f"iter_{iteration:04d}.pt")
+    tmp = path + ".tmp"
+    torch.save({"ally": ally.state_dict(), "iteration": iteration}, tmp)
+    os.replace(tmp, path)
+    return path
+
+
 def main():
     import argparse
     import copy
-    import os
 
     from src.pikafish_eval import PikafishEvaluator
 
@@ -415,6 +430,7 @@ def main():
             ckpt_data["enemy"] = enemy.state_dict()
         torch.save(ckpt_data, tmp_path)
         os.replace(tmp_path, ckpt_path)
+        maybe_archive_checkpoint(cfg, ally, it + 1)
 
 
 if __name__ == "__main__":
