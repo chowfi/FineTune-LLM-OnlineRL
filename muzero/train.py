@@ -262,6 +262,10 @@ def maybe_archive_checkpoint(cfg: MuZeroConfig, ally, iteration: int):
     archive_dir = os.path.join(cfg.checkpoint_dir, "archive")
     os.makedirs(archive_dir, exist_ok=True)
     path = os.path.join(archive_dir, f"iter_{iteration:04d}.pt")
+    if os.path.exists(path):
+        # A resumed run is retracing archived iterations (e.g. rolled back
+        # to an older checkpoint) — keep the original snapshot.
+        return None
     tmp = path + ".tmp"
     torch.save({"ally": ally.state_dict(), "iteration": iteration}, tmp)
     os.replace(tmp, path)
@@ -430,7 +434,12 @@ def main():
             ckpt_data["enemy"] = enemy.state_dict()
         torch.save(ckpt_data, tmp_path)
         os.replace(tmp_path, ckpt_path)
-        maybe_archive_checkpoint(cfg, ally, it + 1)
+        try:
+            archived = maybe_archive_checkpoint(cfg, ally, it + 1)
+            if archived:
+                print(f"[iter {it}] archived -> {archived}", flush=True)
+        except OSError as exc:
+            print(f"[iter {it}] archive failed (continuing): {exc}", flush=True)
 
 
 if __name__ == "__main__":

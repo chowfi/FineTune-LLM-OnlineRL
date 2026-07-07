@@ -119,3 +119,7 @@ def test_maybe_archive_checkpoint(tmp_path):
     # disabled when the interval is 0
     cfg0 = replace(cfg, checkpoint_archive_every=0)
     assert maybe_archive_checkpoint(cfg0, net, iteration=20) is None
+    # existing archives are never overwritten (resume-from-older protection)
+    before = (tmp_path / "archive" / "iter_0020.pt").read_bytes()
+    assert maybe_archive_checkpoint(cfg, net, iteration=20) is None
+    assert (tmp_path / "archive" / "iter_0020.pt").read_bytes() == before
