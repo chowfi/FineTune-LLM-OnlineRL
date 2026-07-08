@@ -63,7 +63,12 @@ class MuZeroConfig:
     )
 
     # Env rewards / adjudication
-    shaping_weight: float = 0.3
+    # 2026-07-08: shaping cut 0.3 -> 0.1. The dense material nudges taught
+    # blunder avoidance (0.71 -> ~0.25) but plateaued iters ~48-210 while
+    # diluting the terminal win signal; greedy-gate baseline before this
+    # change: 0.40/0.35/0.95/0.45/0.60/0.60 (iters 159-209). Revert if the
+    # greedy win rate falls below that band for 3+ gates.
+    shaping_weight: float = 0.1
     shaping_cp_scale: float = 200.0
     blunder_cp_threshold: float = 200.0  # mover delta <= -this counts as a blunder
     repetition_penalty: float = -0.3
