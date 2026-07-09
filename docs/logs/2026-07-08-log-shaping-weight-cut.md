@@ -41,7 +41,20 @@ uv run python -m muzero.train --resume checkpoints/muzero_xiangqi/latest.pt
   (mean ≈ 0.56, ±80 Elo-scale noise at 20 games); blunder ~0.25;
   mate ~0.06 (spikes to 0.14); value_cp_corr ~0.46; Elo anchor points
   archived at iters 160/180/200.
-- Post-change: (record the next 3+ greedy gates and the arena Elo step here.)
+- Post-change greedy gates (iters 219–269): **0.75, 0.95, 0.85, 0.85, 0.50,
+  0.55** — mean ≈ 0.74 vs pre-change 0.56 (pooled 89/120 vs 67/120 wins,
+  z ≈ 3.0 before correcting for within-gate clumping; the protocol's first
+  three readings all cleared the baseline mean → **verdict: knob worked**).
+  Later 0.50/0.55 readings show churn persists — a band shift up, not
+  variance eliminated.
+- Mate rate: record highs post-change — 0.179 (iters 223, 261), **0.202
+  (iter 272, all-time high)**; running average ~0.11 vs ~0.08 before.
+- **First-ever non-losses vs full Pikafish:** gate draws 0.10 at iter 249
+  and 0.05 at iter 269 (all prior gates were 100% losses).
+- Blunder rate: ~0.25 band throughout, 60+ iterations post-change — the
+  feared regression never appeared. Consistency loss reached new bests
+  (−0.956). Arena Elo step still pending (archives 160–260 now straddle the
+  change).
 
 ## 5. Qualitative Outcome
 
