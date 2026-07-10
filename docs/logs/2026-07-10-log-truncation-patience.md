@@ -45,8 +45,25 @@ uv run python -m muzero.train --resume checkpoints/muzero_xiangqi/latest.pt
 - Pre-change baseline: mate rate ~0.10 (spikes 0.179–0.202); greedy gate
   band 0.50–1.00 (mean 0.74); truncation_rate ~0.72; mean_plies ~100;
   Elo +180 at iter 260 (oldest-anchored); blunder ~0.25.
-- Post-change: (record 3+ gates, mate-rate trend, truncation_rate/mean_plies
-  shift, next arena points here.)
+- Post-change (iters 322–337, first 16 iters):
+  - truncation_rate ~0.55 (from ~0.72) and mean_plies ~119 (from ~100) —
+    both predicted mechanical shifts landed.
+  - Gate 1 of 3 (iter 329): greedy 0.90/0.00/0.10 (top of old band despite
+    the stingier referee — new baseline anchor), random 1.00, Pikafish 0/20;
+    gate/seconds 2044 (longer games, as predicted).
+  - mate_win_rate mean ~0.13 (baseline ~0.10), two 0.202 readings, noisy
+    (0.048 at 337) — below the >0.15-sustained success bar; too early.
+  - repetition_draw_rate ~0.31 band — clear of the 0.45 revert line but
+    drifted up slightly; primary watch metric.
+  - blunder_rate steady ~0.25; loss/value up to ~5.3 and value_cp_corr
+    0.68→~0.57 = expected recalibration to longer games + buffer refill
+    after restart (mean_sampled_age climbing toward ~750 equilibrium).
+- Arena 2026-07-10 (run under old rules via config pin, pairs through 320):
+  ratings DISCONTINUOUS with the 2026-07-09 fit on the same stored pairs
+  (160→180 gap +392 vs +102 from what should be identical games) and the
+  +1701 total is contradicted by both gates — magnitudes untrusted pending
+  a games.jsonl audit (sims values + per-pair W/D/L). Curve SHAPE (monotonic
+  climb, flat 300→320) remains consistent with gate history.
 
 ## 5. Qualitative Outcome
 
