@@ -53,8 +53,14 @@ uv run python -m muzero.train --resume checkpoints/muzero_xiangqi/latest.pt
   and 0.05 at iter 269 (all prior gates were 100% losses).
 - Blunder rate: ~0.25 band throughout, 60+ iterations post-change — the
   feared regression never appeared. Consistency loss reached new bests
-  (−0.956). Arena Elo step still pending (archives 160–260 now straddle the
-  change).
+  (−0.956).
+- **Arena Elo (2026-07-09, ±~80/step at 20 games/pair):** 160→0, 180→+102,
+  200→+80, 220→+81, 240→+123, 260→+180, 274→+135. Shape: early gain, then
+  FLAT 180→220 (the plateau, spanning the change at iter 211), then a climb
+  +81→+123→+180 across 220→260 (~+2.5 Elo/iter vs ~0 before) — the
+  predicted slope-break, corroborating the greedy-gate verdict with a
+  second independent instrument. The 274 dip (−45) is a single 20-game
+  step, within noise / churn.
 
 ## 5. Qualitative Outcome
 
