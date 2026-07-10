@@ -75,7 +75,14 @@ class MuZeroConfig:
     repetition_cp_ok: float = -100.0  # penalize repeater whose cp >= this
     repetition_swing_cp: float = 50.0  # "no threat" = cp swing below this
     truncation_cp: float = -800.0
-    truncation_consecutive: int = 6
+    # 2026-07-10: 6 -> 12 (experiment #2, after the shaping cut banked at
+    # greedy-gate ~0.74). A stingier referee forces winners to actually
+    # convert: more real endgame practice, more genuine mates (the model's
+    # weakest observed skill). Baseline before this change: mate rate ~0.10,
+    # greedy gate 0.50-1.00 band (mean 0.74, iters 219-319). Revert if
+    # repetition-draw rate balloons past ~0.45 sustained or the greedy band
+    # degrades for 3+ gates.
+    truncation_consecutive: int = 12
 
     # Replay / training
     # ~18 iterations of self-play at 84 games/loop. The original 5000 (~60
