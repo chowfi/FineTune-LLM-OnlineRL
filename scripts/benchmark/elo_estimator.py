@@ -34,6 +34,11 @@ from scipy.optimize import minimize
 
 LN10 = math.log(10.0)
 
+# The optimiser works in natural log-strength units (rating * ELO_SCALE) so
+# gradients are O(1); in raw Elo units the likelihood changes by ~0.006 per
+# point and L-BFGS-B terminates far from the optimum on flat chain graphs.
+ELO_SCALE = LN10 / 400.0
+
 
 def _result_signs(result: str) -> Tuple[bool, bool, bool]:
     r = result.lower()
@@ -44,9 +49,12 @@ def _neg_log_likelihood(
     free_params: np.ndarray,
     games: List[Dict[str, str]],
     free_player_idx: Dict[str, int],
-    fixed_ratings: Dict[str, float],
+    fixed_nat: Dict[str, float],
 ) -> float:
-    """``free_params`` = [<ratings for free players>..., log_theta_minus_zero]."""
+    """``free_params`` = [<nat-unit ratings for free players>..., log_theta].
+
+    Ratings here (free and fixed) are in nat units (Elo * ELO_SCALE).
+    """
     log_theta = float(free_params[-1])
     theta = math.exp(log_theta) if log_theta >= 0.0 else 1.0
     nll = 0.0
@@ -56,14 +64,14 @@ def _neg_log_likelihood(
         rw = (
             float(free_params[free_player_idx[w_id]])
             if w_id in free_player_idx
-            else float(fixed_ratings[w_id])
+            else float(fixed_nat[w_id])
         )
         rb = (
             float(free_params[free_player_idx[b_id]])
             if b_id in free_player_idx
-            else float(fixed_ratings[b_id])
+            else float(fixed_nat[b_id])
         )
-        log_diff = (rw - rb) * LN10 / 400.0
+        log_diff = rw - rb
 
         if g["result"] == "win":
             nll += math.log1p(theta * math.exp(-log_diff))
@@ -109,6 +117,8 @@ def fit_ratings(
                 seen.add(pid)
                 all_players.append(pid)
 
+    fixed_nat = {p: r * ELO_SCALE for p, r in fixed_ratings.items()}
+
     free_players = [p for p in all_players if p not in fixed_ratings]
     if not free_players:
         # Nothing to fit; just compute the NLL at the fixed ratings + initial theta.
@@ -117,31 +127,40 @@ def fit_ratings(
         return (
             dict(fixed_ratings),
             initial_theta,
-            _neg_log_likelihood(x, games, free_idx, fixed_ratings),
+            _neg_log_likelihood(x, games, free_idx, fixed_nat),
         )
 
     free_player_idx = {p: i for i, p in enumerate(free_players)}
     n_free = len(free_players)
 
+    # Start free players at the anchors' level, not a hardcoded 1500: with a
+    # 0-anchored scale (the arena), a 1500 starting offset puts the optimiser
+    # in a near-flat region and it can terminate long before the true
+    # optimum, inflating every rating.
+    default_init = (
+        float(np.mean(list(fixed_ratings.values()))) if fixed_ratings else 1500.0
+    )
     x0 = np.zeros(n_free + 1, dtype=float)
     for p, i in free_player_idx.items():
-        x0[i] = float(initial_ratings.get(p, 1500.0))
+        x0[i] = float(initial_ratings.get(p, default_init)) * ELO_SCALE
     x0[-1] = math.log(max(1.0, float(initial_theta)))
 
-    bounds = [(-3000.0, 5000.0)] * n_free + [(math.log(1.0), math.log(10.0))]
+    bounds = [(-3000.0 * ELO_SCALE, 5000.0 * ELO_SCALE)] * n_free + [
+        (math.log(1.0), math.log(10.0))
+    ]
 
     res = minimize(
         _neg_log_likelihood,
         x0=x0,
-        args=(games, free_player_idx, fixed_ratings),
+        args=(games, free_player_idx, fixed_nat),
         method="L-BFGS-B",
         bounds=bounds,
-        options={"maxiter": int(max_iter), "ftol": 1e-9},
+        options={"maxiter": int(max_iter), "ftol": 1e-12, "gtol": 1e-8},
     )
 
     fitted = dict(fixed_ratings)
     for p, i in free_player_idx.items():
-        fitted[p] = float(res.x[i])
+        fitted[p] = float(res.x[i]) / ELO_SCALE
     theta = float(math.exp(res.x[-1]))
     return fitted, theta, float(res.fun)
 

@@ -125,3 +125,31 @@ def test_fit_arena_elo_anchors_oldest_and_rates_winner_higher():
     ratings = fit_arena_elo(rows, order=["old", "new"])
     assert ratings["old"] == 0.0
     assert 100.0 < ratings["new"] < 400.0  # ~+190 for 75%
+
+
+def test_fit_arena_elo_long_chain_converges():
+    # Regression (2026-07-10): with 9+ players the optimiser used to stall
+    # far from the optimum (every rating inflated by hundreds of Elo) because
+    # free players were initialised 1500 above the 0-anchor on a nearly flat
+    # likelihood. Each adjacent pair here scores 12.5/20 for the newer player
+    # (~+90 Elo per step), so no rating may exceed ~150 per step.
+    order = [f"iter_{20 * (i + 1):04d}" for i in range(10)]
+    rows = []
+    for old, new in zip(order, order[1:]):
+        for i in range(20):
+            white, black = (new, old) if i % 2 == 0 else (old, new)
+            if i < 8:  # newer wins 8
+                result = "win" if white == new else "loss"
+            elif i < 11:  # newer loses 3
+                result = "loss" if white == new else "win"
+            else:  # 9 draws
+                result = "draw"
+            rows.append({"white": white, "black": black, "result": result, "sims": 2})
+    ratings = fit_arena_elo(rows, order=order)
+    assert ratings[order[0]] == 0.0
+    steps = [
+        b - a
+        for a, b in zip([ratings[p] for p in order], [ratings[p] for p in order[1:]])
+    ]
+    assert all(0.0 < s < 150.0 for s in steps), steps
+    assert ratings[order[-1]] < 9 * 150.0

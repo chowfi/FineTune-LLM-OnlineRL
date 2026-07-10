@@ -59,11 +59,18 @@ uv run python -m muzero.train --resume checkpoints/muzero_xiangqi/latest.pt
     0.68→~0.57 = expected recalibration to longer games + buffer refill
     after restart (mean_sampled_age climbing toward ~750 equilibrium).
 - Arena 2026-07-10 (run under old rules via config pin, pairs through 320):
-  ratings DISCONTINUOUS with the 2026-07-09 fit on the same stored pairs
-  (160→180 gap +392 vs +102 from what should be identical games) and the
-  +1701 total is contradicted by both gates — magnitudes untrusted pending
-  a games.jsonl audit (sims values + per-pair W/D/L). Curve SHAPE (monotonic
-  climb, flat 300→320) remains consistent with gate history.
+  the raw table (180→+392 … 320→+1701) was a FITTER BUG, not real strength —
+  `fit_ratings` initialised free players at Elo 1500 vs the 0-anchor and
+  L-BFGS-B (optimising in raw Elo units, ~0.006 nll per point) stalled far
+  from the optimum once the chain grew to 9 free players. games.jsonl audit
+  showed healthy close pairs (e.g. 160-180: 8W 9D 3L). Fixed in
+  `scripts/benchmark/elo_estimator.py` (optimise in nat units, init at
+  anchor mean, tighter ftol/gtol; regression test in
+  `muzero/tests/test_arena.py`). Converged refit of the same 200 games:
+  160→0, 180→100, 200→78, 220→78, 240→120, 260→176, **280→276, 300→373,
+  320→353** — reproduces the 2026-07-09 table for old points and extends
+  the experiment-#1 climb through 300, flat 300→320 (matches gate
+  consolidation). End-of-era anchor for experiment #2: ~+350 at iter 320.
 
 ## 5. Qualitative Outcome
 
