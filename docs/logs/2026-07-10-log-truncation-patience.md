@@ -45,6 +45,19 @@ uv run python -m muzero.train --resume checkpoints/muzero_xiangqi/latest.pt
 - Pre-change baseline: mate rate ~0.10 (spikes 0.179–0.202); greedy gate
   band 0.50–1.00 (mean 0.74); truncation_rate ~0.72; mean_plies ~100;
   Elo +180 at iter 260 (oldest-anchored); blunder ~0.25.
+- Post-change update (iters 322–385, six gates): greedy gate **0.90, 0.95,
+  0.70, 1.00, 1.00, 1.00** (mean ~0.93 vs old-band 0.74 — three consecutive
+  perfect 20/20s, despite the stingier-referee caveat predicting the
+  opposite bias). mate_win_rate last ~30 iters ~0.17–0.18 sustained
+  (record 0.298 at iter 359; repeated 0.20+ readings) — clears the >0.15
+  success bar. Pikafish gate DRAW 0.05 at iter 379 (third-ever non-loss).
+  repetition_draw_rate ~0.27 avg, single 0.43 blip, trending down — revert
+  tripwire never approached. blunder ~0.25 unchanged; loss/value plateaued
+  ~6.0 and value_cp_corr recovering ~0.6 (recalibration done; buffer at
+  equilibrium, mean_sampled_age ~740). New-era archives: 340/360/380.
+  **Verdict: success on gate + mate-rate instruments; awaiting arena
+  top-up (340/360/380 + latest, new rules, no config pin) to confirm and
+  bank.**
 - Post-change (iters 322–337, first 16 iters):
   - truncation_rate ~0.55 (from ~0.72) and mean_plies ~119 (from ~100) —
     both predicted mechanical shifts landed.
