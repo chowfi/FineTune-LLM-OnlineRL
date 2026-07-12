@@ -113,7 +113,14 @@ uv run python -m muzero.train --resume checkpoints/muzero_xiangqi/latest.pt
 
 ## 7. Conclusion & Next Steps
 
-Restart to activate; continue periodic arena top-ups; judge after 3+ gates
-AND enough iterations for endgame data to accumulate (~30–40 iters). Queued
-next if endgames improve but hanging pieces persist: engine-game seeding
-(5–10% Pikafish games per iteration).
+**VERDICT (2026-07-12): SUCCESS — BANKED.** All pre-registered criteria met:
+mate_win_rate ~0.18–0.19 sustained (bar 0.15; record 0.310 at iter 422);
+arena 2026-07-12 (fixed fitter, new-era pairs under new rules): 320→356,
+**340→464, 360→641, 380→725** — +369 Elo across iters 320–380 (~+6.2/iter),
+the steepest era of the run (vs ~+3.7/iter in experiment #1, ~+1.3 early).
+The gates-7–12 greedy dip (0.45–0.80) is overruled: it coincided with the
+fastest arena climb → churn + draw-caveat, not regression. The iter-386
+extra point (+813, 20 games, 6 iters after 380) is noise — ignore.
+Truncation stays at 12. Next knob candidate if hanging pieces persist at
+the board (user to judge via web UI): engine-game seeding (5–10% Pikafish
+games per iteration).
