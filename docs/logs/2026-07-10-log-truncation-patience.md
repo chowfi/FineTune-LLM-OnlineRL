@@ -45,6 +45,18 @@ uv run python -m muzero.train --resume checkpoints/muzero_xiangqi/latest.pt
 - Pre-change baseline: mate rate ~0.10 (spikes 0.179–0.202); greedy gate
   band 0.50–1.00 (mean 0.74); truncation_rate ~0.72; mean_plies ~100;
   Elo +180 at iter 260 (oldest-anchored); blunder ~0.25.
+- Arena 2026-07-13 (through iter 440 + latest=448): 340→487, 360→672,
+  380→760, then **flat 380–440** (400→700, 420→680, 440→762 — steps within
+  ±80 noise, net +2). Experiment-#2 climb (+386 across 320–380) banked and
+  consolidated; same flattening shape that closed experiment #1. Greedy
+  churn in gates 8–16 retroactively reads as an accurate plateau signal,
+  not noise. 448 endpoint (+909, 20 games) = noisy latest-extra, ignore.
+  NOTE: losses began declining ~iter 445 (after this table's range) — top
+  up the arena once iter_0500 archives before declaring a plateau; if
+  460–500 stay flat, that's the protocol signal for experiment #3
+  (candidate: engine-game seeding, pending user's web-UI hanging-pieces
+  verdict). Pre-writeup diagnostic: one non-adjacent pair (160 vs 440) to
+  calibrate lineage inflation in the chained total.
 - Post-change update 3 (iters 445–481, gates 13–16): steady-grind phase.
   mate_win_rate ~0.20 mean (spikes 0.286/0.298), fully consolidated. All
   losses now declining together (value 5.97→5.79, total →6.34, material
