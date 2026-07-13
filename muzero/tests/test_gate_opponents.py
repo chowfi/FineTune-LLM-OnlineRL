@@ -139,9 +139,11 @@ def test_gate_rung_plays_greedy_without_engine(tmp_path):
 
 
 def test_run_gate_reports_pika_nodes_rung(monkeypatch):
-    """run_gate constructs the weak engine with nodes=cfg.gate_pika_nodes,
-    closes both engines, emits the new metric keys, and no random-rung
-    keys. Engines are faked at muzero.warmstart (run_gate's import site)."""
+    """run_gate constructs the weak engine with nodes=cfg.gate_pika_nodes and
+    routes the middle rung's searches through it (weak rung fully before the
+    full-strength rung, no interleaving), closes both engines, emits the new
+    metric keys, and no random-rung keys. Engines are faked at
+    muzero.warmstart (run_gate's import site)."""
     import torch
     from dataclasses import replace
 
@@ -155,12 +157,15 @@ def test_run_gate_reports_pika_nodes_rung(monkeypatch):
     instances = []
 
     class FakeEngine:
+        calls = []  # class attribute: nodes-value of each search() call, in order
+
         def __init__(self, binary_path, movetime_ms, multipv, nodes=None):
             self.nodes = nodes
             self.closed = False
             instances.append(self)
 
         def search(self, fen):
+            FakeEngine.calls.append(self.nodes)
             stm = fen.split()[1]
             # ENGINE-UCI (bottom-origin ranks): engine_uci_to_algebraic
             # maps "a6a5" -> "a3a4" and "i3i4" -> "i6i5", the FakeEvaluator's
@@ -197,6 +202,11 @@ def test_run_gate_reports_pika_nodes_rung(monkeypatch):
     # full-strength engine first (nodes=None), then the weak rung's engine
     assert [e.nodes for e in instances] == [None, 128]
     assert all(e.closed for e in instances)
+    # the weak rung (nodes=128) plays before the full-strength rung (None),
+    # with no interleaving — catches an accidental rung/engine swap
+    calls = FakeEngine.calls
+    assert calls.count(128) > 0 and calls.count(None) > 0
+    assert calls == [128] * calls.count(128) + [None] * calls.count(None)
     for key in (
         "gate/win_rate_pika_nodes",
         "gate/draw_rate_pika_nodes",

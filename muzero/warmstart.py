@@ -31,11 +31,15 @@ class SimpleUciEngine:
             text=True,
             bufsize=1,
         )
-        self._cmd("uci")
-        self._wait("uciok")
-        self._cmd(f"setoption name MultiPV value {multipv}")
-        self._cmd("isready")
-        self._wait("readyok")
+        try:
+            self._cmd("uci")
+            self._wait("uciok")
+            self._cmd(f"setoption name MultiPV value {multipv}")
+            self._cmd("isready")
+            self._wait("readyok")
+        except Exception:
+            self.proc.kill()
+            raise
 
     def _cmd(self, line: str):
         self.proc.stdin.write(line + "\n")

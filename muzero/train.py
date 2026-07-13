@@ -240,8 +240,10 @@ def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
             cfg, runner, evaluator, engine_mover(engine)
         )
     finally:
-        engine.close()
-        weak_engine.close()
+        try:
+            engine.close()
+        finally:
+            weak_engine.close()
     return {
         "gate/win_rate_greedy": greedy_wins / n,
         "gate/draw_rate_greedy": greedy_draws / n,
