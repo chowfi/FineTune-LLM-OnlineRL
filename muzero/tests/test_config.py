@@ -32,3 +32,7 @@ def test_self_play_mode_defaults_and_derivation():
 def test_self_play_mode_validation():
     with pytest.raises(ValueError):
         MuZeroConfig(self_play_mode="bogus")
+
+
+def test_gate_pika_nodes_default():
+    assert MuZeroConfig().gate_pika_nodes == 128
