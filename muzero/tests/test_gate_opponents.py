@@ -136,3 +136,75 @@ def test_gate_rung_plays_greedy_without_engine(tmp_path):
     wins, draws = _run_gate_rung(cfg, runner, evaluator, greedy)
     assert 0 <= wins + draws <= cfg.gate_games  # both 2-ply games complete
     assert draws == 2  # max_game_plies=2 -> both games drawn at the cap
+
+
+def test_run_gate_reports_pika_nodes_rung(monkeypatch):
+    """run_gate constructs the weak engine with nodes=cfg.gate_pika_nodes,
+    closes both engines, emits the new metric keys, and no random-rung
+    keys. Engines are faked at muzero.warmstart (run_gate's import site)."""
+    import torch
+    from dataclasses import replace
+
+    import muzero.warmstart as warmstart
+    from muzero.config import MuZeroConfig
+    from muzero.mcts import NetRunner
+    from muzero.network import MuZeroNet
+    from muzero.tests.helpers import FakeEvaluator
+    from muzero.train import run_gate
+
+    instances = []
+
+    class FakeEngine:
+        def __init__(self, binary_path, movetime_ms, multipv, nodes=None):
+            self.nodes = nodes
+            self.closed = False
+            instances.append(self)
+
+        def search(self, fen):
+            stm = fen.split()[1]
+            # ENGINE-UCI (bottom-origin ranks): engine_uci_to_algebraic
+            # maps "a6a5" -> "a3a4" and "i3i4" -> "i6i5", the FakeEvaluator's
+            # legal algebraic moves below.
+            return [("a6a5" if stm == "w" else "i3i4", 0.0)]
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(warmstart, "SimpleUciEngine", FakeEngine)
+
+    cfg = replace(
+        MuZeroConfig(),
+        channels=16,
+        repr_blocks=1,
+        dyn_blocks=1,
+        num_simulations=4,
+        interior_topk=4,
+        gate_games=2,
+        max_game_plies=2,
+        gate_pika_nodes=128,
+        device="cpu",
+    )
+    torch.manual_seed(0)
+    runner = NetRunner(MuZeroNet(cfg), "cpu")
+
+    def legal(fen):
+        stm = fen.split()[1]
+        return ["a3a4"] if stm == "w" else ["i6i5"]
+
+    evaluator = FakeEvaluator(cp_fn=lambda fen: 0.0, legal_fn=legal)
+    metrics = run_gate(cfg, runner, evaluator)
+
+    # full-strength engine first (nodes=None), then the weak rung's engine
+    assert [e.nodes for e in instances] == [None, 128]
+    assert all(e.closed for e in instances)
+    for key in (
+        "gate/win_rate_pika_nodes",
+        "gate/draw_rate_pika_nodes",
+        "gate/loss_rate_pika_nodes",
+        "gate/win_rate_greedy",
+        "gate/win_rate",
+        "gate/seconds",
+    ):
+        assert key in metrics
+    assert metrics["gate/pika_nodes"] == 128.0
+    assert not any(k.endswith("_random") for k in metrics)
