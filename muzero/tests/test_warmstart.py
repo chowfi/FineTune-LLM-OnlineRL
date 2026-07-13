@@ -32,3 +32,53 @@ def test_warmstart_fills_buffer():
     g = buf.games[0]
     assert len(g.policy_indices[0]) >= 1
     assert abs(g.root_values[0]) <= 1.0
+
+
+def test_go_command_modes():
+    """nodes=None keeps movetime search; nodes=N switches to node-limited.
+    Constructed via __new__ so no engine process is spawned."""
+    eng = SimpleUciEngine.__new__(SimpleUciEngine)
+    eng.movetime_ms = 10
+    eng.nodes = None
+    assert eng._go_command() == "go movetime 10"
+    eng.nodes = 128
+    assert eng._go_command() == "go nodes 128"
+
+
+@requires_engine
+def test_node_limited_search_returns_move():
+    eng = SimpleUciEngine(PIKAFISH_BIN, movetime_ms=10, multipv=1, nodes=8)
+    try:
+        lines = eng.search(START_FEN)
+    finally:
+        eng.close()
+    assert lines and len(lines[0][0]) == 4
+
+
+def test_init_kills_process_on_handshake_failure(monkeypatch):
+    """A dead/silent engine binary must not leak the spawned subprocess."""
+    import io
+
+    import pytest
+
+    import muzero.warmstart as warmstart
+
+    class FakeProc:
+        def __init__(self):
+            self.killed = False
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO("")  # immediate EOF -> "engine died"
+
+        def kill(self):
+            self.killed = True
+
+    holder = {}
+
+    def fake_popen(*args, **kwargs):
+        holder["proc"] = FakeProc()
+        return holder["proc"]
+
+    monkeypatch.setattr(warmstart.subprocess, "Popen", fake_popen)
+    with pytest.raises(RuntimeError, match="engine died"):
+        SimpleUciEngine("nonexistent-binary", movetime_ms=10, multipv=1)
+    assert holder["proc"].killed

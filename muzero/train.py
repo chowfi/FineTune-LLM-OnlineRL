@@ -188,12 +188,13 @@ def _run_gate_rung(cfg: MuZeroConfig, runner, evaluator, opponent_move) -> tuple
 
 
 def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
-    """Gate ladder: uniform-random legal mover, then a capture-greedy
-    heuristic mover, then raw Pikafish at gate movetime. The random rung
-    resolves early progress (a net that has learned anything should be near
-    1.0); the capture-greedy rung is a mid-ladder rung between random and
-    the engine; the Pikafish rung stays ~0 until the net is enormously
-    stronger."""
+    """Gate ladder: capture-greedy heuristic mover, then Pikafish limited to
+    cfg.gate_pika_nodes search nodes (graded mid-rung; bump protocol
+    documented in config.py), then raw Pikafish at gate movetime. The
+    uniform-random rung was retired 2026-07-13 after ~300 iterations pinned
+    at 1.0 (spec: docs/superpowers/specs/
+    2026-07-13-node-limited-pika-rung-design.md); its gate/*_random history
+    remains in wandb."""
     import time
 
     from muzero.gate_opponents import greedy_capture_move
@@ -201,40 +202,56 @@ def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
     from src.xiangqi_board import engine_uci_to_algebraic
 
     t0 = time.monotonic()
-    rng = np.random.default_rng(cfg.seed)
-    # Separate generator so adding the greedy rung does not perturb the
-    # random rung's historical move sequence.
+    # seed+1 preserved from the retired-random-rung era so the greedy rung's
+    # historical move sequence is unchanged.
     greedy_rng = np.random.default_rng(cfg.seed + 1)
-
-    def random_move(env):
-        moves = env.legal_moves()
-        return str(rng.choice(moves)) if moves else None
 
     def greedy_move(env):
         return greedy_capture_move(env, greedy_rng)
 
     engine = SimpleUciEngine(cfg.pikafish_bin, cfg.gate_movetime_ms, multipv=1)
+    try:
+        weak_engine = SimpleUciEngine(
+            cfg.pikafish_bin,
+            cfg.gate_movetime_ms,
+            multipv=1,
+            nodes=cfg.gate_pika_nodes,
+        )
+    except Exception:
+        engine.close()
+        raise
 
-    def engine_move(env):
-        lines = engine.search(env.fen())
-        if not lines:
-            return None
-        return engine_uci_to_algebraic(lines[0][0])
+    def engine_mover(eng):
+        def move(env):
+            lines = eng.search(env.fen())
+            if not lines:
+                return None
+            return engine_uci_to_algebraic(lines[0][0])
+
+        return move
 
     n = cfg.gate_games
     try:
-        rand_wins, rand_draws = _run_gate_rung(cfg, runner, evaluator, random_move)
         greedy_wins, greedy_draws = _run_gate_rung(cfg, runner, evaluator, greedy_move)
-        pika_wins, pika_draws = _run_gate_rung(cfg, runner, evaluator, engine_move)
+        weak_wins, weak_draws = _run_gate_rung(
+            cfg, runner, evaluator, engine_mover(weak_engine)
+        )
+        pika_wins, pika_draws = _run_gate_rung(
+            cfg, runner, evaluator, engine_mover(engine)
+        )
     finally:
-        engine.close()
+        try:
+            engine.close()
+        finally:
+            weak_engine.close()
     return {
-        "gate/win_rate_random": rand_wins / n,
-        "gate/draw_rate_random": rand_draws / n,
-        "gate/loss_rate_random": (n - rand_wins - rand_draws) / n,
         "gate/win_rate_greedy": greedy_wins / n,
         "gate/draw_rate_greedy": greedy_draws / n,
         "gate/loss_rate_greedy": (n - greedy_wins - greedy_draws) / n,
+        "gate/win_rate_pika_nodes": weak_wins / n,
+        "gate/draw_rate_pika_nodes": weak_draws / n,
+        "gate/loss_rate_pika_nodes": (n - weak_wins - weak_draws) / n,
+        "gate/pika_nodes": float(cfg.gate_pika_nodes),
         "gate/win_rate": pika_wins / n,
         "gate/draw_rate": pika_draws / n,
         "gate/loss_rate": (n - pika_wins - pika_draws) / n,

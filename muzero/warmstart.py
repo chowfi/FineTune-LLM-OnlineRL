@@ -19,8 +19,11 @@ _INFO_RE = re.compile(r"multipv (\d+) score (cp|mate) (-?\d+).* pv ([a-i]\d[a-i]
 
 
 class SimpleUciEngine:
-    def __init__(self, binary_path: str, movetime_ms: int, multipv: int):
+    def __init__(
+        self, binary_path: str, movetime_ms: int, multipv: int, nodes: int | None = None
+    ):
         self.movetime_ms = movetime_ms
+        self.nodes = nodes
         self.proc = subprocess.Popen(
             [binary_path],
             stdin=subprocess.PIPE,
@@ -28,11 +31,15 @@ class SimpleUciEngine:
             text=True,
             bufsize=1,
         )
-        self._cmd("uci")
-        self._wait("uciok")
-        self._cmd(f"setoption name MultiPV value {multipv}")
-        self._cmd("isready")
-        self._wait("readyok")
+        try:
+            self._cmd("uci")
+            self._wait("uciok")
+            self._cmd(f"setoption name MultiPV value {multipv}")
+            self._cmd("isready")
+            self._wait("readyok")
+        except Exception:
+            self.proc.kill()
+            raise
 
     def _cmd(self, line: str):
         self.proc.stdin.write(line + "\n")
@@ -48,10 +55,15 @@ class SimpleUciEngine:
             if line.startswith(token):
                 return lines
 
+    def _go_command(self) -> str:
+        if self.nodes is not None:
+            return f"go nodes {self.nodes}"
+        return f"go movetime {self.movetime_ms}"
+
     def search(self, fen: str) -> list:
         """Returns [(engine_uci, cp_side_to_move)] best-first, one per multipv."""
         self._cmd(f"position fen {fen}")
-        self._cmd(f"go movetime {self.movetime_ms}")
+        self._cmd(self._go_command())
         lines = self._wait("bestmove")
         best: dict = {}
         for line in lines:

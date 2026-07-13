@@ -112,6 +112,13 @@ class MuZeroConfig:
     gate_every_loops: int = 10
     gate_games: int = 20
     gate_movetime_ms: int = 10
+    # 2026-07-13: graded mid-rung — Pikafish limited to this many search
+    # nodes per move (the binary has no UCI_Elo/Skill Level; `go nodes N`
+    # needs no engine option and each halving is a roughly constant strength
+    # step). Bump protocol: if gate/win_rate_pika_nodes > ~0.85 for 3+
+    # consecutive gates, DOUBLE this and note it in a dated log (each change
+    # redefines the metric — never silent); if < ~0.15 for 3+ gates, halve.
+    gate_pika_nodes: int = 128
 
     # Misc
     device: str = "cuda"
