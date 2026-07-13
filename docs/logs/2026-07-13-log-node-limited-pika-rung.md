@@ -1,4 +1,4 @@
-# Feature / Experiment Log Template
+# Node-Limited Pikafish Gate Rung — rollout
 
 **Date:** 2026-07-13
 **Agent/Author:** Claude (muzero)
