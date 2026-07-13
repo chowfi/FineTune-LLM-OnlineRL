@@ -111,12 +111,18 @@ This project fine-tunes a Large Language Model (specifically `Qwen/Qwen2.5-7B-In
   `buffer_games` is 1500 (~18 iterations at 84 games/loop; the original
   5000 left value targets ~28 iterations stale — see
   `docs/logs/2026-07-05-log-metrics-audit-and-buffer-fix.md`). The gate
-  is a three-rung ladder per `run_gate` (2026-07-07): `gate/*_random` vs
-  a uniform-random legal mover, `gate/*_greedy` vs the capture-greedy
-  opponent in `gate_opponents.py` (the primary tactical-strength
-  instrument), and `gate/*` vs raw Pikafish at `gate_movetime_ms`;
-  `gate/seconds` records ladder cost (each rung is dominated by the
-  ally's own 800-sim search, so three rungs ≈ +50% gate time vs two).
+  is a three-rung ladder per `run_gate`: `gate/*_greedy` vs the
+  capture-greedy opponent in `gate_opponents.py` (the primary
+  tactical-strength instrument), `gate/*_pika_nodes` vs Pikafish limited
+  to `gate_pika_nodes` search nodes (2026-07-13, a graded mid-rung dial —
+  the binary exposes no `UCI_Elo`/`Skill Level`, so `go nodes N` stands
+  in; double/halve bump protocol documented in `config.py`, and
+  `gate/pika_nodes` logs the current dial value), and `gate/*` vs raw
+  Pikafish at `gate_movetime_ms`. The uniform-random rung was retired
+  2026-07-13 after saturating at 1.0 for ~300 iterations (from ~iter 30
+  on); its `gate/*_random` history remains in wandb. `gate/seconds`
+  records ladder cost (each rung is dominated by the ally's own 800-sim
+  search, so three rungs ≈ +50% gate time vs two).
   **Strength over time:** `maybe_archive_checkpoint` saves ally-weights
   snapshots to `checkpoints/muzero_xiangqi/archive/iter_NNNN.pt` every
   `checkpoint_archive_every=20` iterations (never overwrites, non-fatal
