@@ -45,6 +45,16 @@ uv run python -m muzero.train --resume checkpoints/muzero_xiangqi/latest.pt
 - Pre-change baseline: mate rate ~0.10 (spikes 0.179–0.202); greedy gate
   band 0.50–1.00 (mean 0.74); truncation_rate ~0.72; mean_plies ~100;
   Elo +180 at iter 260 (oldest-anchored); blunder ~0.25.
+- Post-change update 3 (iters 445–481, gates 13–16): steady-grind phase.
+  mate_win_rate ~0.20 mean (spikes 0.286/0.298), fully consolidated. All
+  losses now declining together (value 5.97→5.79, total →6.34, material
+  0.081 best, consistency −0.971 best) ~70 iters after the plateau. Greedy
+  gate 0.45, 0.55, 0.75, 0.80 — touched the ≤0.5 watch line once, did not
+  trigger (0.55 above line, then recovered); greedy draws now steady
+  0.10–0.20/gate (score-terms: 0.55/0.63/0.85/0.85). One isolated
+  repetition-draw spike 0.52 at iter 463 (threshold is SUSTAINED >0.45) —
+  noted, no action. Awaiting arena table through 440+ and user's web-UI
+  hanging-pieces verdict for the experiment #3 decision.
 - Post-change update 2 (iters 386–444, gates 7–12): mate_win_rate
   **confirmed** — ~0.18–0.19 sustained for ~60 iters, record 0.310 at
   iter 422. Greedy gate cooled off the honeymoon: 1.00 (389), then 0.65,
