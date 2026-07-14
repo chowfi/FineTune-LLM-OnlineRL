@@ -45,6 +45,13 @@ uv run python -m muzero.train --resume checkpoints/muzero_xiangqi/latest.pt
 - Pre-change baseline: mate rate ~0.10 (spikes 0.179–0.202); greedy gate
   band 0.50–1.00 (mean 0.74); truncation_rate ~0.72; mean_plies ~100;
   Elo +180 at iter 260 (oldest-anchored); blunder ~0.25.
+- Arena 2026-07-14 (through iter 480 + latest=483): 460→750, 480→617
+  (483 endpoint +678, 20 games, ignore). **Plateau CONFIRMED**: iters
+  380–480 read 769/708/688/771/750/617 — net zero-to-slightly-negative
+  over 100 iterations. The post-445 loss decline did NOT translate into
+  Elo. Protocol verdict: regime has taught what it can → proceed to
+  experiment #3 (decision pending user's web-UI hanging-pieces verdict);
+  restart with the node-limited rung meanwhile (measurement-only).
 - Arena 2026-07-13 (through iter 440 + latest=448): 340→487, 360→672,
   380→760, then **flat 380–440** (400→700, 420→680, 440→762 — steps within
   ±80 noise, net +2). Experiment-#2 climb (+386 across 320–380) banked and
