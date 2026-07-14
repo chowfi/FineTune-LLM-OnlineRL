@@ -153,6 +153,30 @@ def generate_warmstart_games(
     return {"plies": total_plies, "games": games}
 
 
+def generate_seed_games(
+    cfg: MuZeroConfig, buffer: ReplayBuffer, evaluator, n_games: int, rng
+) -> dict:
+    """Experiment #3 (2026-07-14): per-iteration expert-demonstration
+    trickle — n_games engine-vs-engine games into the buffer. Unlike
+    warmstart this runs every training loop, so the buffer permanently
+    holds ~seed_games_per_loop/84 expert data instead of washing it out."""
+    if n_games <= 0:
+        return {"games": 0, "plies": 0}
+    engine = SimpleUciEngine(
+        cfg.pikafish_bin, cfg.warmstart_movetime_ms, cfg.warmstart_multipv
+    )
+    total_plies = games = 0
+    try:
+        for _ in range(n_games):
+            history = play_engine_game(cfg, engine, evaluator, rng)
+            buffer.add(history)
+            total_plies += len(history)
+            games += 1
+    finally:
+        engine.close()
+    return {"games": games, "plies": total_plies}
+
+
 def _play_move(env: XiangqiEnv, history: GameHistory, move: str, multipv_lines) -> bool:
     if multipv_lines:
         idx = np.array(
