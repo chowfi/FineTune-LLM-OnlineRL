@@ -110,7 +110,18 @@ This project fine-tunes a Large Language Model (specifically `Qwen/Qwen2.5-7B-In
   `buffer_age` (logged as `buffer/mean_sampled_age` by the main loop).
   `buffer_games` is 1500 (~18 iterations at 84 games/loop; the original
   5000 left value targets ~28 iterations stale — see
-  `docs/logs/2026-07-05-log-metrics-audit-and-buffer-fix.md`). The gate
+  `docs/logs/2026-07-05-log-metrics-audit-and-buffer-fix.md`).
+  `warmstart.py` plays cold-start Pikafish-vs-Pikafish games into the
+  buffer before training begins; as of 2026-07-14 (experiment #3, spec
+  `docs/superpowers/specs/2026-07-14-engine-game-seeding-design.md`) it
+  exposes a shared `play_engine_game` (temperature-sampled among the
+  engine's top MultiPV lines for the first `temperature_moves` plies,
+  best line after) used by both that cold start and a new per-iteration
+  trickle, `generate_seed_games` (`seed_games_per_loop=4` engine
+  games/iteration, wired into the training loop via
+  `train.seed_engine_games`, logged as `buffer/seeded_games`); because
+  seeded games bypass the self-play summary path, `selfplay/*` metrics
+  stay model-play-only. The gate
   is a three-rung ladder per `run_gate`: `gate/*_greedy` vs the
   capture-greedy opponent in `gate_opponents.py` (the primary
   tactical-strength instrument), `gate/*_pika_nodes` vs Pikafish limited
