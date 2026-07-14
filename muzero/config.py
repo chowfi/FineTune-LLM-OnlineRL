@@ -47,6 +47,17 @@ class MuZeroConfig:
     truncation_symmetric: bool = True  # derived from self_play_mode in __post_init__
     promote_after_consecutive_wins: int = 3
     max_game_plies: int = 300
+    # 2026-07-14 experiment #3: engine-game seeding. Every iteration, this
+    # many Pikafish-vs-Pikafish games (warmstart strength: 50 ms/move,
+    # MultiPV 4; first temperature_moves plies sampled from the MultiPV
+    # softmax for variety) are added to the buffer as expert demonstrations
+    # (~5% of an 84-game loop). Targets the self-play echo chamber:
+    # refutation-blindness + endgame technique against resistance (spec:
+    # docs/superpowers/specs/2026-07-14-engine-game-seeding-design.md).
+    # 0 disables = the REVERT setting. Revert if loss/value or
+    # value_cp_correlation degrade sustained (~15+ iters beyond churn) or
+    # either engine-gate band falls below its pre-change band for 3+ gates.
+    seed_games_per_loop: int = 4
     # Red first moves in ENGINE UCI (rank 0 = bottom): central/edge cannon,
     # horses, elephants, pawn advances.
     opening_book: tuple = (

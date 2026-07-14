@@ -36,3 +36,7 @@ def test_self_play_mode_validation():
 
 def test_gate_pika_nodes_default():
     assert MuZeroConfig().gate_pika_nodes == 128
+
+
+def test_seed_games_per_loop_default():
+    assert MuZeroConfig().seed_games_per_loop == 4
