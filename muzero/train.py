@@ -259,6 +259,29 @@ def run_gate(cfg: MuZeroConfig, runner, evaluator) -> dict:
     }
 
 
+def seed_engine_games(cfg: MuZeroConfig, buffer, evaluator, iteration: int) -> float:
+    """Experiment #3 trickle (spec 2026-07-14). Never raises: an engine
+    outage degrades the iteration to self-play-only with a warning. The
+    per-iteration rng (cfg.seed + iteration) is reproducible without
+    repeating the same sampled engine games every loop."""
+    if cfg.seed_games_per_loop <= 0:
+        return 0.0
+    from muzero.warmstart import generate_seed_games
+
+    try:
+        stats = generate_seed_games(
+            cfg,
+            buffer,
+            evaluator,
+            cfg.seed_games_per_loop,
+            np.random.default_rng(cfg.seed + iteration),
+        )
+        return float(stats["games"])
+    except Exception as exc:
+        print(f"[seed] engine seeding failed this iteration: {exc!r}", flush=True)
+        return 0.0
+
+
 def load_checkpoint(path: str, ally, enemy, optimizer, device) -> dict:
     """Resume helper. Latest-mode checkpoints carry no "enemy" entry; fall
     back to the ally weights so a checkpoint from either mode loads in
@@ -395,6 +418,11 @@ def main():
         for t in threads:
             t.join()
         metrics = aggregate_game_summaries(results)
+
+        # -- seed: expert-demonstration trickle (experiment #3) --
+        metrics["buffer/seeded_games"] = seed_engine_games(
+            cfg, buffer, workers[0].evaluator, it
+        )
 
         # -- train: ~games_per_train_loop games' worth of positions --
         num_batches = max(

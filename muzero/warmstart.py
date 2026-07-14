@@ -18,6 +18,22 @@ from src.xiangqi_board import engine_uci_to_algebraic
 _INFO_RE = re.compile(r"multipv (\d+) score (cp|mate) (-?\d+).* pv ([a-i]\d[a-i]\d)")
 
 
+def _multipv_probs(lines) -> np.ndarray:
+    """Softmax over MultiPV centipawn scores (temperature 200 cp)."""
+    cps = np.array([cp for _, cp in lines], dtype=np.float64)
+    probs = np.exp((cps - cps.max()) / 200.0)
+    return (probs / probs.sum()).astype(np.float32)
+
+
+def _pick_move_index(lines, ply: int, temperature_moves: int, rng) -> int:
+    """Index of the move to PLAY: sampled from the MultiPV softmax for the
+    first temperature_moves plies (variety — a deterministic engine would
+    otherwise replay one game per opening line forever), best line after."""
+    if ply < temperature_moves and len(lines) > 1:
+        return int(rng.choice(len(lines), p=_multipv_probs(lines)))
+    return 0
+
+
 class SimpleUciEngine:
     def __init__(
         self, binary_path: str, movetime_ms: int, multipv: int, nodes: int | None = None
@@ -86,6 +102,32 @@ class SimpleUciEngine:
             self.proc.kill()
 
 
+def play_engine_game(cfg: MuZeroConfig, engine, evaluator, rng) -> GameHistory:
+    """One engine-vs-engine game through the standard env pipeline (same
+    referee, rewards, and targets as self-play games). Used by warmstart
+    (cold start) and by per-iteration seeding (experiment #3)."""
+    env = XiangqiEnv(cfg, evaluator)
+    env.reset(ally_side="w")
+    history = GameHistory()
+    opening = cfg.opening_book[int(rng.integers(len(cfg.opening_book)))]
+    done = _play_move(env, history, engine_uci_to_algebraic(opening), None)
+    while not done:
+        lines = engine.search(env.fen())
+        if not lines:
+            break
+        pick = _pick_move_index(lines, len(history), cfg.temperature_moves, rng)
+        move = engine_uci_to_algebraic(lines[pick][0])
+        done = _play_move(env, history, move, lines)
+    history.boards = [b.copy() for b in env.boards]
+    history.to_play_history = list(env.to_play_history)
+    history.rep_history = list(env.rep_history)
+    history.no_progress_history = list(env.no_progress_history)
+    history.truncated = env.truncated
+    history.ally_side = env.ally_side
+    history.result = env.result or "engine_aborted"
+    return history
+
+
 def generate_warmstart_games(
     cfg: MuZeroConfig, buffer: ReplayBuffer, evaluator
 ) -> dict:
@@ -97,24 +139,7 @@ def generate_warmstart_games(
     total_plies = games = 0
     try:
         while total_plies < cfg.warmstart_plies:
-            env = XiangqiEnv(cfg, evaluator)
-            env.reset(ally_side="w")
-            history = GameHistory()
-            opening = cfg.opening_book[int(rng.integers(len(cfg.opening_book)))]
-            done = _play_move(env, history, engine_uci_to_algebraic(opening), None)
-            while not done:
-                lines = engine.search(env.fen())
-                if not lines:
-                    break
-                move = engine_uci_to_algebraic(lines[0][0])
-                done = _play_move(env, history, move, lines)
-            history.boards = [b.copy() for b in env.boards]
-            history.to_play_history = list(env.to_play_history)
-            history.rep_history = list(env.rep_history)
-            history.no_progress_history = list(env.no_progress_history)
-            history.truncated = env.truncated
-            history.ally_side = env.ally_side
-            history.result = env.result or "engine_aborted"
+            history = play_engine_game(cfg, engine, evaluator, rng)
             buffer.add(history)
             total_plies += len(history)
             games += 1
@@ -128,16 +153,38 @@ def generate_warmstart_games(
     return {"plies": total_plies, "games": games}
 
 
+def generate_seed_games(
+    cfg: MuZeroConfig, buffer: ReplayBuffer, evaluator, n_games: int, rng
+) -> dict:
+    """Experiment #3 (2026-07-14): per-iteration expert-demonstration
+    trickle — n_games engine-vs-engine games into the buffer. Unlike
+    warmstart this runs every training loop, so the buffer permanently
+    holds ~seed_games_per_loop/84 expert data instead of washing it out."""
+    if n_games <= 0:
+        return {"games": 0, "plies": 0}
+    engine = SimpleUciEngine(
+        cfg.pikafish_bin, cfg.warmstart_movetime_ms, cfg.warmstart_multipv
+    )
+    total_plies = games = 0
+    try:
+        for _ in range(n_games):
+            history = play_engine_game(cfg, engine, evaluator, rng)
+            buffer.add(history)
+            total_plies += len(history)
+            games += 1
+    finally:
+        engine.close()
+    return {"games": games, "plies": total_plies}
+
+
 def _play_move(env: XiangqiEnv, history: GameHistory, move: str, multipv_lines) -> bool:
     if multipv_lines:
         idx = np.array(
             [move_to_index(engine_uci_to_algebraic(u)) for u, _ in multipv_lines],
             dtype=np.int64,
         )
-        cps = np.array([cp for _, cp in multipv_lines], dtype=np.float64)
-        probs = np.exp((cps - cps.max()) / 200.0)
-        probs = (probs / probs.sum()).astype(np.float32)
-        root_value = float(np.tanh(cps[0] / 600.0))  # mover perspective
+        probs = _multipv_probs(multipv_lines)
+        root_value = float(np.tanh(multipv_lines[0][1] / 600.0))  # mover perspective
     else:  # forced opening ply: one-hot
         idx = np.array([move_to_index(move)], dtype=np.int64)
         probs = np.array([1.0], dtype=np.float32)
