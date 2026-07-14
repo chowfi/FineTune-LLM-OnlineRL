@@ -123,3 +123,32 @@ def test_maybe_archive_checkpoint(tmp_path):
     before = (tmp_path / "archive" / "iter_0020.pt").read_bytes()
     assert maybe_archive_checkpoint(cfg, net, iteration=20) is None
     assert (tmp_path / "archive" / "iter_0020.pt").read_bytes() == before
+
+
+def test_seed_engine_games_paths(monkeypatch):
+    """Disabled -> 0.0 without calling the seeder; success -> game count;
+    engine outage -> 0.0 and no exception."""
+    import muzero.warmstart as warmstart
+    from muzero.train import seed_engine_games
+
+    calls = []
+
+    def fake_seeder(cfg, buffer, evaluator, n_games, rng):
+        calls.append(n_games)
+        return {"games": n_games, "plies": n_games * 100}
+
+    monkeypatch.setattr(warmstart, "generate_seed_games", fake_seeder)
+
+    disabled = replace(MuZeroConfig(), seed_games_per_loop=0)
+    assert seed_engine_games(disabled, None, None, iteration=7) == 0.0
+    assert calls == []  # seeder never invoked when disabled
+
+    enabled = replace(MuZeroConfig(), seed_games_per_loop=4)
+    assert seed_engine_games(enabled, None, None, iteration=7) == 4.0
+    assert calls == [4]
+
+    def dying_seeder(cfg, buffer, evaluator, n_games, rng):
+        raise RuntimeError("engine died")
+
+    monkeypatch.setattr(warmstart, "generate_seed_games", dying_seeder)
+    assert seed_engine_games(enabled, None, None, iteration=8) == 0.0  # no raise
